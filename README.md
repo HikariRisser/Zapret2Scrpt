@@ -1,12 +1,89 @@
-# Zapret2 Windows system controller
+# Zapret2 Windows / Linux system controller
 
 [Russian version](README.ru.md) · [Security audit](SECURITY.md) · [License](LICENSE)
 
-Windows controller for `bol-van/zapret2` (release v1.0.6): system-wide DPI
-desync for all applications, DoH-based DNS bypass, domain auto-learning and
-complete removal from the system.
+Controller for `bol-van/zapret2` (release v1.0.6): system-wide DPI desync for
+all applications, DoH-based DNS bypass, domain auto-learning and complete
+removal from the system.
 
-**The script's console UI is in Russian.**
+Two implementations with the same feature set:
+
+| Platform | File | Interception engine |
+|---|---|---|
+| Windows | [`Zapret2Windows.ps1`](Zapret2Windows.ps1) | `winws2` + WinDivert |
+| Linux | [`zapret2-linux.py`](zapret2-linux.py) | `nfqws2` + nftables/iptables |
+
+**Both console UIs are in Russian.**
+
+## Linux version
+
+```bash
+sudo python3 zapret2-linux.py            # interactive menu
+sudo python3 zapret2-linux.py -a install # install runtime
+python3 zapret2-linux.py -a check        # check requirements
+python3 zapret2-linux.py --help
+```
+
+The menu is the same as on Windows (10 items, with start/autostart toggles).
+
+### Linux requirements
+
+| Requirement | Value | Why |
+|---|---|---|
+| **OS** | Linux, kernel with NFQUEUE | interception goes through `nfqws2` |
+| **Architecture** | x86_64, aarch64, armv7, mips, riscv64 | prebuilt zapret2 binary is used |
+| **Python** | 3.8+ | script is Python, no third-party packages |
+| **Privileges** | root (via `sudo`) | firewall rules, `/opt`, `/etc/hosts`, systemd |
+| **Firewall** | `nftables` (preferred) or `iptables` | redirect to NFQUEUE |
+| **Kernel module** | `nfnetlink_queue` | loaded automatically |
+| **systemd** | for autostart (optional) | `zapret2win` service |
+| **Internet** | first install only | zapret2 release (~9.5 MB) from GitHub |
+
+Check everything at once: `python3 zapret2-linux.py -a check` or item **[5]**.
+
+### Differences from the Windows version
+
+| | Windows | Linux |
+|---|---|---|
+| Interception | WinDivert (kernel driver) | NFQUEUE (`nfqws2` + nftables) |
+| Engine | `winws2` directly | zapret2 init script (`/opt/zapret2/init.d/sysv/zapret2`) |
+| Location | `System32\Zapret2Windows` | `/opt/zapret2` (root-owned) |
+| Autostart | scheduled task (SYSTEM) | systemd service |
+| Domain lists | `lists\*.txt` | `/opt/zapret2/ipset/zapret-hosts-*.txt` |
+| DNS flush | `ipconfig /flushdns` | `resolvectl flush-caches` / `nscd -i hosts` |
+
+Strategy logic, profiles (HTTP, TLS, QUIC, Discord voice), DoH with working-IP
+verification, script self-update and uninstall are identical to Windows.
+
+### Archive permissions caveat
+
+Python's `zipfile` does **not** restore Unix permissions from the archive, so
+the installer explicitly marks all `*.sh`, `nfqws2`, `mdig`, `ip2net` and
+`init.d/sysv/zapret2` as executable. Without that the init script will not run.
+
+### Testing status of the Linux version
+
+Development happened on Windows, so, honestly:
+
+**Verified locally (Python 3.12):**
+- syntax (`py_compile`) — clean;
+- version comparison and `VERSION` marker extraction;
+- DoH resolution across all providers plus working-IP verification
+  (`www.instagram.com` → `57.145.12.34`, dead `31.13.72.174` rejected);
+- removal of the marked `hosts` block (ours and the older project's);
+- `config` and systemd unit generation;
+- correct refusal to run on non-Linux.
+
+**Not verified (requires a Linux run):**
+- actual `nfqws2` start through the init script;
+- nftables/iptables rule creation and absence of routing loops;
+- systemd service registration and operation;
+- package installation via `apt`/`dnf`/`pacman`;
+- real DPI bypass against a specific ISP.
+
+On the target machine start with item **[5]** (requirements), then **[1]**
+(install), then **[2]** (start) and **[4]** (diagnose). If `nfqws2` does not
+start, check `systemctl status zapret2win` and `dmesg`.
 
 ## Requirements
 
@@ -80,7 +157,7 @@ open** on any error — silent closes are gone.
 
 1. Clone the repository (or unpack the ZIP).
 2. Run `Zapret2Windows.cmd` **as Administrator**.
-3. Choose **[11]** to verify requirements.
+3. Choose **[5]** to verify requirements.
 4. Choose **[1]** to install. The zapret2 release is downloaded from GitHub
    automatically if it is not present next to the script.
 5. Choose **[2]** to start the system-wide bypass.
@@ -89,18 +166,65 @@ Menu items:
 
 | Item | Action |
 |---|---|
-| [1] | Install or update runtime |
-| [2] | Start system-wide bypass |
-| [3] | Stop |
+| [1] | Install or update zapret2 runtime |
+| [2] | Start / stop bypass *(toggle)* |
+| [3] | Autostart at logon: enable / disable *(toggle)* |
 | [4] | Diagnose resources |
-| [5] | Enable autostart at logon |
-| [6] | Disable autostart |
-| [7] | Show learned domains |
-| [8] | Open logs directory |
-| [9] | Uninstall from system (driver, task, runtime, hosts) |
-| [10] | Refresh DNS via DoH (hosts) |
-| [11] | Check requirements |
-| [12] | Install missing dependencies |
+| [5] | Check requirements |
+| [6] | Install missing dependencies |
+| [7] | Refresh DNS via DoH |
+| [8] | Learned domains and logs |
+| [9] | Update the script |
+| [10] | Uninstall from system |
+| [0] | Exit |
+
+Labels of **[2]** and **[3]** follow the actual state: when the bypass is
+running the item offers "Stop", otherwise "Start". Same for autostart. There is
+no separate "disable" item — one action covers both states.
+
+## Script update (item [9])
+
+Update source:
+
+```
+https://github.com/HikariRisser/Zapret2WinScrpt
+```
+
+The script downloads `Zapret2Windows.ps1` from the `main` branch (falling back
+to `master`), compares versions and offers an update.
+
+The version lives inside the script:
+
+```powershell
+$script:ScriptVersion='1.1.0'
+```
+
+Flow:
+
+1. the remote copy is downloaded and its version is extracted;
+2. content is compared with the local file (line endings and BOM normalised);
+3. if identical — "already up to date";
+4. if the remote version is newer — the update is offered;
+5. if it is **older** or carries **no version marker** — a rollback warning is
+   printed and explicit confirmation is required;
+6. a backup `Zapret2Windows.ps1.<timestamp>.bak` is created before writing;
+7. the new file is parsed by PowerShell; on a syntax error the backup is
+   restored automatically;
+8. after a successful replacement a restart is offered.
+
+Command line:
+
+```powershell
+.\Zapret2Windows.ps1 -Action Update          # with confirmations
+.\Zapret2Windows.ps1 -Action Update -Force   # no prompts
+```
+
+**Note:** only the script itself is updated. The zapret2 runtime, domain lists
+and the autostart task are untouched — use item **[1]** for those.
+
+If the repository holds a copy without the `ScriptVersion` marker, the script
+treats it as potentially outdated and requires explicit confirmation. This
+prevents rolling back a working version to an old copy.
 
 Installation copies the architecture-matched official `winws2`, WinDivert
 driver/DLL, Cygwin runtime, Lua libraries, hostlists, and official WinDivert
@@ -242,6 +366,28 @@ result into `hosts` as a marked block:
 Runs automatically on `Install`; manually via menu **[10]** or
 `-Action DohHosts`. Note that `hosts` matches exact names, so `www` variants
 are resolved separately. Removed completely by `Uninstall`.
+
+### Working-IP verification (important)
+
+DoH often returns a **dead edge address** — typical for Meta/Instagram:
+`31.13.72.174` does not answer while `57.145.12.34` works. Pinning the first
+returned address in `hosts` **breaks** the site even if it worked before.
+The address is therefore verified before writing:
+
+1. A records are collected from **all DoH providers** (Cloudflare, Google,
+   Quad9) — different CDN nodes return different addresses, some of them alive;
+2. CNAME targets are added (`www.instagram.com` →
+   `z-p42-instagram.c10r.instagram.com`);
+3. for `www.X` the parent `X` addresses are added;
+4. every candidate is checked with a **real TCP connection to port 443**;
+5. only a confirmed working address is written to `hosts`.
+
+If no address works, the domain is **not pinned** and stays with system DNS.
+That is better than hardcoding a dead IP.
+
+Such domains are reported as "no working IP" (e.g. `ytimg.com`, `twimg.com`,
+`githubassets.com` — they are usually served via CNAME and work without a
+separate entry).
 
 ## Important limits
 

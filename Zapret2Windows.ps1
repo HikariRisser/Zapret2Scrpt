@@ -14,7 +14,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Uninstall','Purge')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -39,6 +39,13 @@ $script:TaskName='Zapret2Windows'
 $script:DepsChecked=$false
 $script:BinSource=$null
 $script:Arch=$null
+
+# Версия скрипта и репозиторий для самообновления (пункт [9] меню).
+# Версию меняйте при каждом значимом изменении: по ней сравнивается
+# локальная копия с удалённой.
+$script:ScriptVersion='1.1.0'
+$script:UpdateRepo='HikariRisser/Zapret2WinScrpt'
+$script:UpdateBranch='main'
 
 function Test-Admin {
     $id=[Security.Principal.WindowsIdentity]::GetCurrent()
@@ -692,6 +699,212 @@ function Diagnose {
     if(Test-Path $err){Write-Host "Журнал: $err" -ForegroundColor DarkGray; Get-Content $err -Tail 12}
     Write-Host 'Важно: код 200 подтверждает только эти запросы и не доказывает, что работают все протоколы и приложения.' -ForegroundColor Yellow
 }
+# ============================================================================
+#  Самообновление скрипта из репозитория GitHub.
+#  Источник: $script:UpdateRepo. Обновляется только сам .ps1; среда zapret2
+#  и списки не трогаются (для них — пункт [1]).
+# ============================================================================
+
+function Get-ScriptVersionFromText {
+    param([string]$Text)
+    if($Text -match 'ScriptVersion\s*=\s*[''"]?([\w.\-]+)[''"]?'){
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Compare-VersionString {
+    <#
+      Возвращает -1/0/1. Версии вида 1.2.3 сравниваются по числам.
+      Нечисловые части сравниваются как строки — этого достаточно.
+    #>
+    param([string]$A,[string]$B)
+    $pa=@($A -split '[.\-+]'); $pb=@($B -split '[.\-+]')
+    $n=[Math]::Max($pa.Count,$pb.Count)
+    for($i=0;$i -lt $n;$i++){
+        $x=if($i -lt $pa.Count){$pa[$i]}else{'0'}
+        $y=if($i -lt $pb.Count){$pb[$i]}else{'0'}
+        $nx=0;$ny=0
+        if([int]::TryParse($x,[ref]$nx) -and [int]::TryParse($y,[ref]$ny)){
+            if($nx -lt $ny){return -1}
+            if($nx -gt $ny){return 1}
+        } else {
+            $c=[string]::CompareOrdinal($x,$y)
+            if($c -lt 0){return -1}
+            if($c -gt 0){return 1}
+        }
+    }
+    return 0
+}
+
+function Get-RemoteScript {
+    <#
+      Скачивает скрипт из репозитория обновлений.
+      Пробует указанную ветку, затем main/master.
+    #>
+    $branches=@($script:UpdateBranch,'main','master') | Select-Object -Unique
+    $lastMsg=''
+    foreach($b in $branches){
+        $url="https://raw.githubusercontent.com/$($script:UpdateRepo)/$b/Zapret2Windows.ps1"
+        try {
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $r=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            $text=$r.Content
+            # Invoke-WebRequest возвращает текст, начинающийся с символа BOM
+            # (U+FEFF). Если его не убрать, при записи добавится второй BOM
+            # и файл перестанет парситься. Снимаем все ведущие BOM.
+            $text=$text.TrimStart([char]0xFEFF)
+            # Защита от HTML-страницы ошибки вместо скрипта.
+            if($text -notmatch 'param\s*\(' -or $text -notmatch 'Zapret2Windows'){
+                $lastMsg="по адресу $url вернулся не скрипт"
+                continue
+            }
+            return [pscustomobject]@{ Text=$text; Url=$url; Branch=$b }
+        } catch {
+            $lastMsg=$_.Exception.Message
+        }
+    }
+    throw ("Не удалось скачать обновление из https://github.com/$($script:UpdateRepo).`n  " + $lastMsg)
+}
+
+function Update-Self {
+    <#
+      Обновляет сам скрипт. Перед заменой делает резервную копию,
+      проверяет, что скачался действительно скрипт, и сохраняет UTF-8 BOM
+      (без него PowerShell 5.1 ломает кириллицу).
+    #>
+    param([switch]$Force)
+
+    $self=Join-Path $script:AppRoot 'Zapret2Windows.ps1'
+    if(-not (Test-Path $self)){ throw "Не найден файл скрипта: $self" }
+
+    Write-Host ''
+    Write-Host '  Обновление скрипта' -ForegroundColor Cyan
+    Write-Host ("    источник: https://github.com/" + $script:UpdateRepo) -ForegroundColor DarkGray
+    Write-Host ("    текущая версия: " + $script:ScriptVersion) -ForegroundColor DarkGray
+    Write-Host ''
+
+    Write-Host '    Проверка обновлений...' -ForegroundColor DarkGray
+    $remote=Get-RemoteScript
+    $remoteVer=Get-ScriptVersionFromText $remote.Text
+    $curText=[IO.File]::ReadAllText($self,[Text.Encoding]::UTF8)
+
+    # Сравнение: сначала по версии, иначе по содержимому (старые копии
+    # без маркера версии иначе всегда считались бы «новыми»).
+    $norm={ param($s) (($s -replace "`r`n","`n") -replace "^\uFEFF",'').Trim() }
+    $sameText = (& $norm $curText) -eq (& $norm $remote.Text)
+
+    if($sameText){
+        Write-Host '    Уже установлена последняя версия.' -ForegroundColor Green
+        if($remoteVer){ Write-Host ("    Версия в репозитории: " + $remoteVer) -ForegroundColor DarkGray }
+        Write-Host ''
+        return
+    }
+
+    # Отдельно разбираем случай, когда в репозитории файл БЕЗ маркера версии:
+    # это, скорее всего, старая копия, и молча «обновлять» ею рабочий скрипт
+    # нельзя — получится откат.
+    $verdict='update'
+    if($remoteVer){
+        $cmp=Compare-VersionString $remoteVer $script:ScriptVersion
+        if($cmp -gt 0){ $verdict='update' }
+        elseif($cmp -eq 0){ $verdict='same-version-differs' }
+        else { $verdict='downgrade' }
+    } else {
+        $verdict='unversioned'
+    }
+
+    switch($verdict){
+        'update'              { Write-Host ('    Доступна версия: ' + $remoteVer) -ForegroundColor Green }
+        'same-version-differs'{
+            Write-Host ('    Версия совпадает (' + $remoteVer + '), но содержимое отличается.') -ForegroundColor Yellow
+            Write-Host '    Возможно, локальный файл правился вручную.' -ForegroundColor Yellow
+        }
+        'downgrade'           {
+            Write-Host ('    В репозитории версия ' + $remoteVer + ', у вас ' + $script:ScriptVersion + '.') -ForegroundColor Yellow
+            Write-Host '    Это ОТКАТ на более старую версию.' -ForegroundColor Red
+        }
+        'unversioned'         {
+            Write-Host '    В репозитории файл без маркера версии.' -ForegroundColor Yellow
+            Write-Host '    Скорее всего это старая копия: замена может откатить скрипт.' -ForegroundColor Red
+        }
+    }
+
+    if(-not $Force){
+        $prompt=if($verdict -eq 'update'){'    Установить обновление? (y/N)'}
+                else{'    Всё равно заменить локальный файл? (y/N)'}
+        $a=Read-Host $prompt
+        if($a -notmatch '^\s*[yYдД]'){ Write-Host '    Отменено.' -ForegroundColor Yellow; Write-Host ''; return }
+    }
+
+    # Резервная копия с отметкой времени
+    $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+    $bak="$self.$stamp.bak"
+    Copy-Item -LiteralPath $self -Destination $bak -Force
+    Write-Host ("    Резервная копия: " + (Split-Path -Leaf $bak)) -ForegroundColor DarkGray
+
+    # Запись с UTF-8 BOM — иначе PowerShell 5.1 сломает кириллицу.
+    try {
+        [IO.File]::WriteAllText($self,$remote.Text,(New-Object Text.UTF8Encoding $true))
+    } catch {
+        Copy-Item -LiteralPath $bak -Destination $self -Force
+        throw ("Не удалось записать обновление, восстановлена резервная копия.`n  " + $_.Exception.Message)
+    }
+
+    # Проверка синтаксиса нового файла до перезапуска.
+    $parseErrors=$null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($self,[ref]$null,[ref]$parseErrors)
+    if($parseErrors.Count){
+        Copy-Item -LiteralPath $bak -Destination $self -Force
+        throw ("Скачанный скрипт содержит синтаксические ошибки, восстановлена резервная копия:`n  " + $parseErrors[0].Message)
+    }
+
+    Write-Host ''
+    Write-Host '    Скрипт обновлён.' -ForegroundColor Green
+    Write-Host ("    Было: " + $script:ScriptVersion + " -> Стало: " + $(if($remoteVer){$remoteVer}else{'обновлённая версия'})) -ForegroundColor Green
+    Write-Host ("    Резервная копия: " + $bak) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '    Текущий процесс работает со старой версией в памяти.' -ForegroundColor Yellow
+    if(-not $Force){
+        $a=Read-Host '    Перезапустить скрипт сейчас? (y/N)'
+        if($a -match '^\s*[yYдД]'){
+            Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+                '-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $self),
+                '-ZapretRoot',('"{0}"' -f $ZapretRoot)
+            ) -Verb RunAs
+            exit
+        }
+    }
+    Write-Host '    Перезапустите скрипт вручную, чтобы применить обновление.' -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+# ============================================================================
+#  Переключатели: один пункт меню вместо двух парных.
+# ============================================================================
+
+function Toggle-Run {
+    $st=Get-Status
+    if($st.Running){
+        Stop-Zapret
+        Write-Host '  Обход остановлен.' -ForegroundColor Yellow
+    } else {
+        Start-Zapret
+    }
+}
+
+function Toggle-Autostart {
+    $on=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+    if($on){
+        Remove-Autostart
+        Write-Host '  Автозапуск при входе выключен.' -ForegroundColor Yellow
+    } else {
+        Install-Autostart
+        Write-Host '  Автозапуск при входе включён.' -ForegroundColor Green
+    }
+}
+
 function Show-Menu {
     # При первом запуске проверяем зависимости и предлагаем их поставить.
     if(-not $script:DepsChecked){
@@ -718,39 +931,55 @@ function Show-Menu {
     }
     while($true){
         Clear-Host
-        Write-Host 'Zapret2 Windows — системная DPI-десинхронизация' -ForegroundColor Cyan
-        Write-Host 'Релиз: bol-van/zapret2 v1.0.6; полный перехват портов через WinDivert' -ForegroundColor DarkGray
+        Write-Host '  Zapret2 Windows — системная DPI-десинхронизация' -ForegroundColor Cyan
+        Write-Host ('  Версия ' + $script:ScriptVersion + ' | zapret2 v1.0.6 | перехват WinDivert') -ForegroundColor DarkGray
         $st=Get-Status
-        Write-Host ('  winws2: ' + $(if($st.Running){"работает, PID $($st.Pid)"}else{'остановлен'}) + ' | автозапуск: ' + $(if($st.AutoStart){'включён'}else{'выключен'}) + " | выучено доменов: $($st.LearnedDomains)")
+        Write-Host ('  winws2: ' + $(if($st.Running){"работает (PID $($st.Pid))"}else{'остановлен'}) +
+                    ' | автозапуск: ' + $(if($st.AutoStart){'включён'}else{'выключен'}) +
+                    ' | доменов: ' + $st.LearnedDomains)
         Write-Host ''
-        Write-Host '[1] Установить или обновить среду'
-        Write-Host '[2] Запустить системный обход'
-        Write-Host '[3] Остановить'
-        Write-Host '[4] Диагностика ресурсов'
-        Write-Host '[5] Включить автозапуск при входе'
-        Write-Host '[6] Выключить автозапуск'
-        Write-Host '[7] Показать выученные домены'
-        Write-Host '[8] Открыть каталог журналов'
-        Write-Host '[9] Удалить из системы (драйвер, задача, среда, hosts)' -ForegroundColor Yellow
-        Write-Host '[10] Обновить DNS через DoH (hosts)'
-        Write-Host '[11] Проверить требования'
-        Write-Host '[12] Установить отсутствующие зависимости'
-        Write-Host '[0] Выход'
+        Write-Host ('  [1] ' + $(if($st.Runtime){'Обновить среду zapret2'}else{'Установить среду zapret2'}))
+        Write-Host ('  [2] ' + $(if($st.Running){'Остановить обход'}else{'Запустить обход'}))
+        Write-Host ('  [3] Автозапуск при входе: ' + $(if($st.AutoStart){'выключить'}else{'включить'}))
+        Write-Host '  [4] Диагностика ресурсов'
+        Write-Host '  [5] Проверить требования'
+        Write-Host '  [6] Установить отсутствующие зависимости'
+        Write-Host '  [7] Обновить DNS через DoH'
+        Write-Host '  [8] Выученные домены и журналы'
+        Write-Host ('  [9] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
+        Write-Host '  [10] Удалить из системы' -ForegroundColor Yellow
+        Write-Host '  [0] Выход'
         $choice=Read-Host '  Выбор'
         try {
             switch($choice){
                 '1' {Install-Runtime; Read-Host '  Нажмите Enter'}
-                '2' {Start-Zapret; Read-Host '  Нажмите Enter'}
-                '3' {Stop-Zapret; Read-Host '  Нажмите Enter'}
+                '2' {Toggle-Run; Read-Host '  Нажмите Enter'}
+                '3' {Toggle-Autostart; Read-Host '  Нажмите Enter'}
                 '4' {Diagnose; Read-Host '  Нажмите Enter'}
-                '5' {Install-Autostart; Write-Host 'Автозапуск включён.' -ForegroundColor Green; Read-Host '  Нажмите Enter'}
-                '6' {Remove-Autostart; Write-Host 'Автозапуск выключен.' -ForegroundColor Yellow; Read-Host '  Нажмите Enter'}
-                '7' { $f=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'; if(Test-Path $f){Get-Content $f}else{Write-Host 'Среда не установлена'}; Read-Host '  Нажмите Enter' }
-                '8' {if(Test-Path (Join-Path $script:TrustedRuntime 'logs')){Start-Process explorer.exe (Join-Path $script:TrustedRuntime 'logs')}else{Write-Host 'Сначала установите среду'}; Read-Host '  Нажмите Enter'}
-                '9' {Remove-All}
-                '10' {Update-DohHosts; Read-Host '  Нажмите Enter'}
-                '11' {Show-Check; Read-Host '  Нажмите Enter'}
-                '12' {Install-Dependencies -IncludeOptional; Read-Host '  Нажмите Enter'}
+                '5' {Show-Check; Read-Host '  Нажмите Enter'}
+                '6' {Install-Dependencies -IncludeOptional; Read-Host '  Нажмите Enter'}
+                '7' {Update-DohHosts; Read-Host '  Нажмите Enter'}
+                '8' {
+                    $f=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'
+                    Write-Host ''
+                    if(Test-Path $f){
+                        $learned=@(Get-Content $f | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+                        Write-Host ("  Выучено доменов: " + $learned.Count) -ForegroundColor Cyan
+                        $learned | Select-Object -First 30 | ForEach-Object { Write-Host ('    ' + $_) -ForegroundColor DarkGray }
+                        if($learned.Count -gt 30){ Write-Host ('    ... и ещё ' + ($learned.Count-30)) -ForegroundColor DarkGray }
+                    } else {
+                        Write-Host '  Среда не установлена — список пуст.' -ForegroundColor Yellow
+                    }
+                    $logs=Join-Path $script:TrustedRuntime 'logs'
+                    if(Test-Path $logs){
+                        Write-Host ''
+                        Write-Host ('  Журналы: ' + $logs) -ForegroundColor DarkGray
+                        Start-Process explorer.exe $logs
+                    }
+                    Read-Host '  Нажмите Enter'
+                }
+                '9' {Update-Self; if($script:ScriptVersion){Read-Host '  Нажмите Enter'}}
+                '10' {Remove-All}
                 '0' {return}
             }
         } catch {Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red; Read-Host '  Нажмите Enter'}
@@ -770,18 +999,28 @@ $script:DohProviders=@(
 )
 
 function Resolve-DohName {
-    param([string]$Name,[int]$TimeoutSec=6)
+    <#
+      Собирает A-записи домена со ВСЕХ DoH-провайдеров, а не с первого
+      ответившего. Это принципиально: разные провайдеры и разные edge-узлы
+      CDN отдают разные адреса, и среди них бывает мёртвый (типично для
+      Meta/Instagram: 31.13.72.174 не работает, 57.145.12.34 работает).
+      Если вернуть только первый ответ, рабочий адрес потеряется.
+    #>
+    param([string]$Name,[int]$TimeoutSec=6,[switch]$FirstProviderOnly)
+    $all=New-Object System.Collections.Generic.List[string]
     foreach($p in $script:DohProviders){
         try {
             $sep=if($p -match '\?'){'&'}else{'?'}
             $u="$p${sep}name=$Name&type=A"
             $r=Invoke-RestMethod -Uri $u -Headers @{accept='application/dns-json'} -TimeoutSec $TimeoutSec -ErrorAction Stop
-            $ips=@($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data } |
-                   Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
-            if($ips.Count){return $ips}
+            foreach($ip in @($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data } |
+                              Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })){
+                if(-not $all.Contains($ip)){ $all.Add($ip) }
+            }
+            if($FirstProviderOnly -and $all.Count){ break }
         } catch {}
     }
-    return @()
+    return @($all)
 }
 
 function Test-TcpQuick {
@@ -812,27 +1051,39 @@ function Resolve-DohCname {
 
 function Get-WorkingIPFor {
     <#
-      Возвращает первый РАБОЧИЙ IP домена.
-      DoH может вернуть мёртвый edge-IP (типично для Meta/Instagram):
-      пиннинг такого адреса в hosts ломает доступ, поэтому кандидаты
-      проверяются TCP-соединением, а при неудаче подтягиваются CNAME-алиасы.
+      Возвращает первый РАБОЧИЙ IP домена или $null.
+      DoH часто отдаёт мёртвый edge-IP (типично для Meta/Instagram), поэтому
+      все кандидаты проверяются реальным TCP-соединением на 443. Источники
+      кандидатов, по порядку:
+        1. A-записи самого домена (со всех DoH-провайдеров);
+        2. CNAME-цели и их A-записи (рабочие адреса часто лежат там);
+        3. A-записи родительского домена (www.X -> X).
+      Приоритет отдаётся адресам, полученным при опросе нескольких
+      провайдеров: именно так находится живой узел вместо мёртвого.
     #>
-    param([string]$Domain,[int]$MaxCandidates=5)
+    param([string]$Domain,[int]$MaxCandidates=8)
     $cands=New-Object System.Collections.Generic.List[string]
-
-    foreach($ip in @(Resolve-DohName -Name $Domain)){ if(-not $cands.Contains($ip)){$cands.Add($ip)} }
-
-    # CNAME-алиасы: рабочие адреса часто лежат именно там
-    foreach($cn in @(Resolve-DohCname -Name $Domain)){
-        foreach($ip in @(Resolve-DohName -Name $cn)){ if(-not $cands.Contains($ip)){$cands.Add($ip)} }
-        if($cands.Count -ge $MaxCandidates){break}
+    $add={
+        param($list)
+        foreach($ip in @($list)){ if($ip -and -not $cands.Contains($ip)){ [void]$cands.Add($ip) } }
     }
 
-    $tried=0
-    foreach($ip in $cands){
-        if($tried -ge $MaxCandidates){break}
-        $tried++
-        if(Test-TcpQuick -IP $ip -Port 443 -TimeoutMs 1200){ return $ip }
+    & $add (Resolve-DohName -Name $Domain)
+
+    foreach($cn in @(Resolve-DohCname -Name $Domain)){
+        & $add (Resolve-DohName -Name $cn)
+    }
+
+    # www.X -> X: у родительского имени набор узлов шире
+    if($Domain -match '^www\.(.+)$'){ & $add (Resolve-DohName -Name $Matches[1]) }
+
+    if(-not $cands.Count){ return $null }
+
+    # Последовательная проверка. Runspace-пул в PowerShell 5.1 ненадёжен
+    # внутри функций, а кандидатов обычно 2-6, так что это быстро.
+    $limit=[Math]::Min($cands.Count,$MaxCandidates)
+    for($i=0;$i -lt $limit;$i++){
+        if(Test-TcpQuick -IP $cands[$i] -Port 443 -TimeoutMs 1500){ return $cands[$i] }
     }
     return $null
 }
@@ -1050,6 +1301,7 @@ switch($Action){
     'Check' {Show-Check}
     'Deps' {Install-Dependencies -IncludeOptional -Yes:$Force}
     'DohHosts' {Update-DohHosts}
+    'Update' {Update-Self -Force:$Force}
     'Uninstall' {Remove-All -KeepLogs:$KeepLogs -Force:$Force}
     'Purge' {Remove-All -KeepLogs:$KeepLogs -IncludeProject:$IncludeProject -Force:$Force}
     'Menu' {Show-Menu}
