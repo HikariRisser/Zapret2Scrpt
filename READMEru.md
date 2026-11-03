@@ -243,31 +243,6 @@ UDP-медиапуть (STUN) для голосовых каналов Discord.
 `winws2.exe`, файлы WinDivert и библиотеки Lua **из одного и того же релиза**
 вместе: несовпадение версий ломает совместимость (`NFQWS2_COMPAT_VER`).
 
-## Публикация на GitHub
-
-Репозиторий уже подготовлен: есть `.gitignore`, `LICENSE`, документация и
-разделение кода и генерируемых файлов. Сборка zapret2 и каталог `runtime/`
-в git **не попадают** — они скачиваются/создаются при установке.
-
-```bash
-git init
-git add .
-git commit -m "Zapret2 Windows: системный контроллер DPI-десинхронизации"
-git branch -M main
-git remote add origin https://github.com/<пользователь>/<репозиторий>.git
-git push -u origin main
-```
-
-Что попадёт в репозиторий:
-
-```
-.gitignore  LICENSE  README.md  README.ru.md  SECURITY.md
-Zapret2Windows.cmd  Zapret2Windows.ps1  tools/probe-h2.js  tools/probe-voice.js
-```
-
-Что будет исключено автоматически: `runtime/`, `zapret2-v1.0.6/`, `*.log`,
-`*.zapret-backup`.
-
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE). zapret2 распространяется под MIT License,
