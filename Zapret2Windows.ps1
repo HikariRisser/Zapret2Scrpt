@@ -14,9 +14,9 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','DohHosts','Uninstall','Purge')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Uninstall','Purge')]
     [string]$Action='Menu',
-    [string]$ZapretRoot = (Join-Path $PSScriptRoot 'zapret2-v1.0.6'),
+    [string]$ZapretRoot = '',
     [switch]$NoAutostart,
     [switch]$KeepLogs,        # с Uninstall/Purge: сохранить копию логов
     [switch]$IncludeProject,  # с Uninstall/Purge: удалить и runtime рабочей папки
@@ -24,10 +24,19 @@ param(
 )
 $ErrorActionPreference='Stop'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch {}
-$script:AppRoot=$PSScriptRoot
+# Корень проекта. $PSScriptRoot может быть пустым (например, при запуске
+# через .cmd или из другого хоста), поэтому используем запасные варианты.
+$script:AppRoot=$(
+    if($PSScriptRoot){ $PSScriptRoot }
+    elseif($PSCommandPath){ Split-Path -Parent $PSCommandPath }
+    elseif($MyInvocation.MyCommand.Path){ Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { (Get-Location).Path }
+)
+if(-not $ZapretRoot){ $ZapretRoot = Join-Path $script:AppRoot 'zapret2-v1.0.6' }
 $script:Runtime=Join-Path $script:AppRoot 'runtime\winws2'
 $script:TrustedRuntime=Join-Path $env:SystemRoot 'System32\Zapret2Windows'
 $script:TaskName='Zapret2Windows'
+$script:DepsChecked=$false
 $script:BinSource=$null
 $script:Arch=$null
 
@@ -37,9 +46,12 @@ function Test-Admin {
 }
 function Ensure-Admin {
     if(Test-Admin){return}
-    $args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath),'-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
-    if($NoAutostart){$args+='-NoAutostart'}
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $args -Verb RunAs | Out-Null
+    $self=$PSCommandPath
+    if(-not $self){ $self = Join-Path $script:AppRoot 'Zapret2Windows.ps1' }
+    $argList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $self),
+               '-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
+    if($NoAutostart){$argList+='-NoAutostart'}
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
     exit
 }
 function Find-Source {
@@ -83,6 +95,12 @@ function Get-Upstream {
     #>
     param([string]$Version='v1.0.6')
     if(Test-Path $ZapretRoot){return}
+    # На чистой/старой системе TLS 1.2 может быть выключен — тогда загрузка
+    # с GitHub не работает. Включаем до скачивания.
+    if(-not (Test-Tls12Enabled)){
+        [void](Install-Tls12)
+        Write-Host '  Включён TLS 1.2 для скачивания.' -ForegroundColor DarkGray
+    }
     $dl=Join-Path $script:AppRoot 'runtime\download'
     New-Item -ItemType Directory -Path $dl -Force | Out-Null
     $zip=Join-Path $dl "zapret2-$Version.zip"
@@ -285,6 +303,344 @@ function Get-Status {
         LearnedDomains=if(Test-Path (Join-Path $script:TrustedRuntime 'lists\autohostlist.txt')){@(Get-Content (Join-Path $script:TrustedRuntime 'lists\autohostlist.txt')|Where-Object {$_ -and $_ -notmatch '^\s*#'}).Count}else{0}
     }
 }
+# ============================================================================
+#  Зависимости: определение отсутствующих и их установка.
+#
+#  Что можно поставить автоматически:
+#    * .NET Framework 4.x  — winget/choco, иначе прямая загрузка установщика
+#    * TLS 1.2 для .NET    — ключи реестра (чинится без переустановки)
+#    * Node.js (опция)     — только для диагностики в tools/
+#    * сборка zapret2      — скачивается с GitHub
+#  Что поставить нельзя:
+#    * Windows PowerShell 5.1 — скрипт исполняется ИМ ЖЕ (курица и яйцо);
+#      WMF 5.1 снят с сайта Microsoft, нужен ручной шаг.
+#    * права администратора — выдаёт пользователь через UAC.
+# ============================================================================
+
+function Get-PackageManager {
+    foreach($c in @('winget','choco')){
+        $g=Get-Command $c -ErrorAction SilentlyContinue
+        if($g){ return @{ Name=$c; Path=$g.Source } }
+    }
+    return $null
+}
+
+function Get-DotNetRelease {
+    foreach($k in @(
+        'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\NET Framework Setup\NDP\v4\Full')){
+        $v=(Get-ItemProperty $k -Name Release -ErrorAction SilentlyContinue).Release
+        if($v){ return [int]$v }
+    }
+    return 0
+}
+
+function Test-Tls12Enabled {
+    # 1) системный флаг .NET
+    foreach($k in @('HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319',
+                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319')){
+        $v=(Get-ItemProperty $k -Name SchUseStrongCrypto -ErrorAction SilentlyContinue).SchUseStrongCrypto
+        if($v -eq 1){ return $true }
+    }
+    # 2) явные ключи SCHANNEL
+    $base='HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2'
+    $c=(Get-ItemProperty "$base\Client" -Name Enabled,DisabledByDefault -ErrorAction SilentlyContinue)
+    if($c -and $c.Enabled -eq 1 -and $c.DisabledByDefault -eq 0){ return $true }
+    # 3) современная сборка Windows 10/11 включает TLS 1.2 по умолчанию
+    $build=[int](Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber
+    return ($build -ge 17763)
+}
+
+function Get-DependencyReport {
+    <#
+      Возвращает список проверок. Каждый элемент:
+        Name, Detail, Status (OK/FAIL/WARN), Required, Fixable
+    #>
+    $r=New-Object System.Collections.Generic.List[object]
+    $os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $build=if($os){[int]$os.BuildNumber}else{0}
+
+    $r.Add([pscustomobject]@{
+        Name='Windows 10/11'; Required=$true; Fixable=$false
+        Status=$(if($build -ge 10240){'OK'}else{'FAIL'})
+        Detail=$(if($os){"$($os.Caption) (build $build)"}else{'не удалось определить'})
+    })
+
+    $r.Add([pscustomobject]@{
+        Name='Разрядность x64'; Required=$true; Fixable=$false
+        Status=$(if([Environment]::Is64BitOperatingSystem){'OK'}else{'FAIL'})
+        Detail=$(if([Environment]::Is64BitOperatingSystem){'x64'}else{'32-битная Windows не поддерживается'})
+    })
+
+    $psv=$PSVersionTable.PSVersion
+    $r.Add([pscustomobject]@{
+        Name='PowerShell 5.1+'; Required=$true; Fixable=$false
+        Status=$(if($psv.Major -ge 5 -and $psv.Minor -ge 1){'OK'}else{'FAIL'})
+        Detail="$psv"
+    })
+
+    $rel=Get-DotNetRelease
+    $r.Add([pscustomobject]@{
+        Name='.NET Framework 4.x'; Required=$true; Fixable=$true
+        Status=$(if($rel -ge 378389){'OK'}else{'FAIL'})
+        Detail=$(if($rel -ge 528040){"4.8 (release $rel)"}
+                 elseif($rel -ge 378389){"4.x (release $rel)"}
+                 elseif($rel -gt 0){"устаревшая версия (release $rel)"}
+                 else{'не установлен'})
+    })
+
+    $tls=Test-Tls12Enabled
+    $r.Add([pscustomobject]@{
+        Name='TLS 1.2 для .NET'; Required=$true; Fixable=$true
+        Status=$(if($tls){'OK'}else{'FAIL'})
+        Detail=$(if($tls){'включён'}else{'выключен — скачивание релиза не сработает'})
+    })
+
+    $r.Add([pscustomobject]@{
+        Name='Права администратора'; Required=$true; Fixable=$false
+        Status=$(if(Test-Admin){'OK'}else{'WARN'})
+        Detail=$(if(Test-Admin){'есть'}else{'нет — потребуется подтверждение UAC'})
+    })
+
+    $r.Add([pscustomobject]@{
+        Name='Сборка zapret2'; Required=$true; Fixable=$true
+        Status=$(if(Test-Path $ZapretRoot){'OK'}else{'FAIL'})
+        Detail=$(if(Test-Path $ZapretRoot){$ZapretRoot}else{'нет — скачается при установке'})
+    })
+
+    $pm=Get-PackageManager
+    $nodeOk=[bool](Get-Command node -ErrorAction SilentlyContinue)
+    $r.Add([pscustomobject]@{
+        Name='Node.js (диагностика)'; Required=$false; Fixable=$true
+        Status=$(if($nodeOk){'OK'}else{'WARN'})
+        Detail=$(if($nodeOk){'есть'}else{'нет — необязательно, нужен только для tools/'})
+    })
+
+    $r.Add([pscustomobject]@{
+        Name='Менеджер пакетов'; Required=$false; Fixable=$false
+        Status=$(if($pm){'OK'}else{'WARN'})
+        Detail=$(if($pm){"$($pm.Name): $($pm.Path)"}else{'winget/choco нет — установка через прямой загрузчик'})
+    })
+
+    return $r
+}
+
+function Install-Tls12 {
+    <#
+      Включает TLS 1.2 для .NET и Schannel. Нужны права администратора.
+      Применяется без перезагрузки, но часть приложений увидит изменение
+      только после перезапуска.
+    #>
+    $changed=$false
+    foreach($k in @('HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319',
+                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319')){
+        try {
+            if(-not (Test-Path $k)){New-Item -Path $k -Force | Out-Null}
+            $cur=(Get-ItemProperty $k -Name SchUseStrongCrypto -ErrorAction SilentlyContinue).SchUseStrongCrypto
+            if($cur -ne 1){
+                Set-ItemProperty -Path $k -Name SchUseStrongCrypto -Value 1 -Type DWord -Force
+                $changed=$true
+            }
+        } catch {}
+    }
+    $base='HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2'
+    foreach($side in @('Client','Server')){
+        $k="$base\$side"
+        try {
+            if(-not (Test-Path $k)){New-Item -Path $k -Force | Out-Null}
+            Set-ItemProperty -Path $k -Name Enabled -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $k -Name DisabledByDefault -Value 0 -Type DWord -Force
+            $changed=$true
+        } catch {}
+    }
+    # Включаем TLS 1.2 в текущем процессе тоже.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {}
+    return $changed
+}
+
+function Install-DotNet {
+    <#
+      Устанавливает .NET Framework 4.8: сначала менеджером пакетов,
+      иначе прямым загрузчиком Microsoft. Возвращает $true при успехе.
+    #>
+    $pm=Get-PackageManager
+    if($pm -and $pm.Name -eq 'winget'){
+        Write-Host '    Установка через winget...' -ForegroundColor DarkGray
+        & winget install --id Microsoft.DotNet.Framework.DeveloperPack_4 -e `
+            --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Null
+        if((Get-DotNetRelease) -ge 378389){return $true}
+        & winget install --id Microsoft.DotNet.Framework.Runtime --silent `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+        if((Get-DotNetRelease) -ge 378389){return $true}
+    }
+    if($pm -and $pm.Name -eq 'choco'){
+        Write-Host '    Установка через chocolatey...' -ForegroundColor DarkGray
+        & choco install dotnetfx -y --no-progress 2>&1 | Out-Null
+        if((Get-DotNetRelease) -ge 378389){return $true}
+    }
+    # Прямая загрузка официального установщика .NET Framework 4.8
+    Write-Host '    Прямая загрузка установщика .NET Framework 4.8...' -ForegroundColor DarkGray
+    $exe=Join-Path $env:TEMP 'ndp48-installer.exe'
+    $url='https://go.microsoft.com/fwlink/?linkid=2088631'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+    } catch {
+        Write-Host ('    Не удалось скачать: ' + $_.Exception.Message) -ForegroundColor Red
+        return $false
+    }
+    Write-Host '    Тихая установка (может занять несколько минут)...' -ForegroundColor DarkGray
+    $proc=Start-Process -FilePath $exe -ArgumentList '/q','/norestart' -Wait -PassThru
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    # 0 - успех, 3010 - нужна перезагрузка (тоже успех установки)
+    if($proc.ExitCode -in @(0,3010)){
+        if($proc.ExitCode -eq 3010){
+            Write-Host '    Требуется перезагрузка Windows для завершения.' -ForegroundColor Yellow
+        }
+        return $true
+    }
+    return $false
+}
+
+function Install-Node {
+    $pm=Get-PackageManager
+    if(-not $pm){ return $false }
+    if($pm.Name -eq 'winget'){
+        & winget install --id OpenJS.NodeJS.LTS -e --silent `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+    } else {
+        & choco install nodejs-lts -y --no-progress 2>&1 | Out-Null
+    }
+    # Обновляем PATH текущего процесса, иначе node не виден до перелогина
+    $env:Path=[Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+               [Environment]::GetEnvironmentVariable('Path','User')
+    return [bool](Get-Command node -ErrorAction SilentlyContinue)
+}
+
+function Install-Dependencies {
+    <#
+      Ставит отсутствующие зависимости. Спрашивает подтверждение,
+      если не указан -Yes. Ничего не перезагружает автоматически.
+    #>
+    param([switch]$IncludeOptional,[switch]$Yes)
+
+    Ensure-Admin
+    $report=Get-DependencyReport
+    $missing=@($report | Where-Object { $_.Status -eq 'FAIL' -and $_.Fixable })
+    $manual=@($report | Where-Object { $_.Status -eq 'FAIL' -and -not $_.Fixable })
+
+    Write-Host ''
+    Write-Host '  Установка зависимостей' -ForegroundColor Cyan
+    Write-Host ''
+
+    if(-not $missing.Count -and -not $manual.Count){
+        Write-Host '  Все обязательные зависимости уже на месте.' -ForegroundColor Green
+        if($IncludeOptional){
+            $opt=@($report | Where-Object { -not $_.Required -and $_.Status -ne 'OK' -and $_.Fixable })
+            if($opt.Count -and $Yes){
+                Write-Host '  Установка необязательных компонентов...' -ForegroundColor Yellow
+                foreach($o in $opt){
+                    if($o.Name -like 'Node.js*' -and (Install-Node)){Write-Host '    Node.js установлен' -ForegroundColor Green}
+                }
+            }
+        }
+        Write-Host ''
+        return $true
+    }
+
+    Write-Host '  Отсутствует:' -ForegroundColor Yellow
+    foreach($m in $missing){ Write-Host ('    - ' + $m.Name + ': ' + $m.Detail) -ForegroundColor DarkGray }
+    foreach($m in $manual){ Write-Host ('    - ' + $m.Name + ': ' + $m.Detail + ' (нужен ручной шаг)') -ForegroundColor DarkGray }
+    Write-Host ''
+
+    if(-not $Yes){
+        $a=Read-Host '  Установить автоматически? (y/N)'
+        if($a -notmatch '^\s*[yYдД]'){ Write-Host '  Отменено.' -ForegroundColor Yellow; return $false }
+    }
+
+    $ok=$true
+    foreach($m in $missing){
+        Write-Host ('  [' + $m.Name + ']') -ForegroundColor Cyan
+        switch -Wildcard ($m.Name){
+            '.NET Framework*' {
+                if(Install-DotNet){ Write-Host '    Готово.' -ForegroundColor Green }
+                else { Write-Host '    Не удалось установить автоматически.' -ForegroundColor Red; $ok=$false }
+            }
+            'TLS 1.2*' {
+                [void](Install-Tls12)
+                if(Test-Tls12Enabled){ Write-Host '    Готово.' -ForegroundColor Green }
+                else { Write-Host '    Не удалось применить настройки.' -ForegroundColor Red; $ok=$false }
+            }
+            'Сборка zapret2*' {
+                try { Get-Upstream; Write-Host '    Готово.' -ForegroundColor Green }
+                catch { Write-Host ('    ' + $_.Exception.Message) -ForegroundColor Red; $ok=$false }
+            }
+            default { Write-Host '    Пропущено (нет автоматического способа).' -ForegroundColor DarkGray }
+        }
+    }
+
+    if($IncludeOptional -and $Yes){
+        if(-not (Get-Command node -ErrorAction SilentlyContinue)){
+            Write-Host '  [Node.js]' -ForegroundColor Cyan
+            if(Install-Node){ Write-Host '    Готово.' -ForegroundColor Green }
+            else { Write-Host '    Необязательно — пропущено.' -ForegroundColor DarkGray }
+        }
+    }
+
+    Write-Host ''
+    if($manual.Count){
+        Write-Host '  Требуют ручного вмешательства:' -ForegroundColor Yellow
+        foreach($m in $manual){
+            Write-Host ('    - ' + $m.Name + ': ' + $m.Detail) -ForegroundColor Yellow
+            if($m.Name -like 'PowerShell*'){
+                Write-Host '      Windows PowerShell 5.1 нельзя поставить из него самого.' -ForegroundColor DarkGray
+                Write-Host '      Обновите Windows или поставьте Windows Management Framework 5.1.' -ForegroundColor DarkGray
+            }
+        }
+        Write-Host ''
+    }
+    return $ok
+}
+function Show-Check {
+    <#
+      Проверка требований. Единый источник данных — Get-DependencyReport,
+      поэтому здесь видны те же зависимости, что ставит Install-Dependencies.
+    #>
+    $report=Get-DependencyReport
+    Write-Host ''
+    Write-Host '  Проверка требований Zapret2 Windows' -ForegroundColor Cyan
+    Write-Host ''
+    $ok=0; $warn=0; $fail=0
+    foreach($d in $report){
+        $mark=switch($d.Status){'OK'{[char]0x2714}'WARN'{'!'}default{[char]0x2718}}
+        $color=switch($d.Status){'OK'{'Green'}'WARN'{'Yellow'}default{'Red'}}
+        if($d.Status -eq 'OK'){$ok++}elseif($d.Status -eq 'WARN'){$warn++}else{$fail++}
+        $suffix=''
+        if($d.Status -ne 'OK'){
+            $suffix=if($d.Fixable){' [можно установить автоматически]'}else{' [нужен ручной шаг]'}
+        }
+        Write-Host ('  {0} {1,-32} {2}{3}' -f $mark,$d.Name,$d.Detail,$suffix) -ForegroundColor $color
+    }
+    Write-Host ''
+    Write-Host ("  Итог: успешно $ok, предупреждений $warn, ошибок $fail") `
+        -ForegroundColor $(if($fail){'Red'}elseif($warn){'Yellow'}else{'Green'})
+    if($fail){
+        $fixable=@($report | Where-Object { $_.Status -eq 'FAIL' -and $_.Fixable }).Count
+        if($fixable){
+            Write-Host ("  Часть проблем исправляется автоматически (пункт [12]): $fixable") -ForegroundColor Yellow
+        }
+        Write-Host '  Остальное требует ручного вмешательства — см. пометки выше.' -ForegroundColor Red
+    } elseif($warn){
+        Write-Host '  Запуск возможен, но учтите предупреждения.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  Всё готово. Можно выполнять установку (пункт [1]).' -ForegroundColor Green
+    }
+    Write-Host ''
+}
 function Show-Status {
     <#
       Русские подписи состояния (вместо Format-List с английскими именами полей).
@@ -337,6 +693,29 @@ function Diagnose {
     Write-Host 'Важно: код 200 подтверждает только эти запросы и не доказывает, что работают все протоколы и приложения.' -ForegroundColor Yellow
 }
 function Show-Menu {
+    # При первом запуске проверяем зависимости и предлагаем их поставить.
+    if(-not $script:DepsChecked){
+        $script:DepsChecked=$true
+        $rep=Get-DependencyReport
+        $miss=@($rep | Where-Object { $_.Status -eq 'FAIL' -and $_.Fixable })
+        $hard=@($rep | Where-Object { $_.Status -eq 'FAIL' -and -not $_.Fixable })
+        if($miss.Count -or $hard.Count){
+            Clear-Host
+            Write-Host ''
+            Write-Host '  Обнаружены отсутствующие зависимости' -ForegroundColor Yellow
+            Write-Host ''
+            foreach($m in $miss){ Write-Host ('    - ' + $m.Name + ': ' + $m.Detail) -ForegroundColor DarkGray }
+            foreach($m in $hard){ Write-Host ('    - ' + $m.Name + ': ' + $m.Detail + ' (ручной шаг)') -ForegroundColor DarkGray }
+            Write-Host ''
+            if($miss.Count){
+                $a=Read-Host '  Установить автоматически сейчас? (y/N)'
+                if($a -match '^\s*[yYдД]'){ [void](Install-Dependencies -IncludeOptional -Yes) }
+            }
+            Write-Host ''
+            Write-Host '  Нажмите Enter для продолжения...' -ForegroundColor DarkGray
+            [void](Read-Host)
+        }
+    }
     while($true){
         Clear-Host
         Write-Host 'Zapret2 Windows — системная DPI-десинхронизация' -ForegroundColor Cyan
@@ -354,6 +733,8 @@ function Show-Menu {
         Write-Host '[8] Открыть каталог журналов'
         Write-Host '[9] Удалить из системы (драйвер, задача, среда, hosts)' -ForegroundColor Yellow
         Write-Host '[10] Обновить DNS через DoH (hosts)'
+        Write-Host '[11] Проверить требования'
+        Write-Host '[12] Установить отсутствующие зависимости'
         Write-Host '[0] Выход'
         $choice=Read-Host '  Выбор'
         try {
@@ -368,6 +749,8 @@ function Show-Menu {
                 '8' {if(Test-Path (Join-Path $script:TrustedRuntime 'logs')){Start-Process explorer.exe (Join-Path $script:TrustedRuntime 'logs')}else{Write-Host 'Сначала установите среду'}; Read-Host '  Нажмите Enter'}
                 '9' {Remove-All}
                 '10' {Update-DohHosts; Read-Host '  Нажмите Enter'}
+                '11' {Show-Check; Read-Host '  Нажмите Enter'}
+                '12' {Install-Dependencies -IncludeOptional; Read-Host '  Нажмите Enter'}
                 '0' {return}
             }
         } catch {Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red; Read-Host '  Нажмите Enter'}
@@ -401,6 +784,59 @@ function Resolve-DohName {
     return @()
 }
 
+function Test-TcpQuick {
+    param([string]$IP,[int]$Port=443,[int]$TimeoutMs=1200)
+    try {
+        $c=[Net.Sockets.TcpClient]::new()
+        $ar=$c.BeginConnect($IP,$Port,$null,$null)
+        $ok=$ar.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if($ok){ $c.EndConnect($ar) }
+        $c.Dispose()
+        return $ok
+    } catch { return $false }
+}
+
+function Resolve-DohCname {
+    param([string]$Name,[int]$TimeoutSec=5)
+    foreach($p in $script:DohProviders){
+        try {
+            $sep=if($p -match '\?'){'&'}else{'?'}
+            $r=Invoke-RestMethod -Uri "$p${sep}name=$Name&type=CNAME" `
+                 -Headers @{accept='application/dns-json'} -TimeoutSec $TimeoutSec -ErrorAction Stop
+            $c=@($r.Answer | Where-Object { $_.type -eq 5 } | ForEach-Object { $_.data -replace '\.$','' })
+            if($c.Count){ return $c }
+        } catch {}
+    }
+    return @()
+}
+
+function Get-WorkingIPFor {
+    <#
+      Возвращает первый РАБОЧИЙ IP домена.
+      DoH может вернуть мёртвый edge-IP (типично для Meta/Instagram):
+      пиннинг такого адреса в hosts ломает доступ, поэтому кандидаты
+      проверяются TCP-соединением, а при неудаче подтягиваются CNAME-алиасы.
+    #>
+    param([string]$Domain,[int]$MaxCandidates=5)
+    $cands=New-Object System.Collections.Generic.List[string]
+
+    foreach($ip in @(Resolve-DohName -Name $Domain)){ if(-not $cands.Contains($ip)){$cands.Add($ip)} }
+
+    # CNAME-алиасы: рабочие адреса часто лежат именно там
+    foreach($cn in @(Resolve-DohCname -Name $Domain)){
+        foreach($ip in @(Resolve-DohName -Name $cn)){ if(-not $cands.Contains($ip)){$cands.Add($ip)} }
+        if($cands.Count -ge $MaxCandidates){break}
+    }
+
+    $tried=0
+    foreach($ip in $cands){
+        if($tried -ge $MaxCandidates){break}
+        $tried++
+        if(Test-TcpQuick -IP $ip -Port 443 -TimeoutMs 1200){ return $ip }
+    }
+    return $null
+}
+
 function Update-DohHosts {
     param([switch]$Quiet)
     Ensure-Admin
@@ -430,13 +866,15 @@ function Update-DohHosts {
     foreach($d in $domains){
         $i++
         if(-not $Quiet){Write-Host ("    [{0}/{1}] {2,-34} " -f $i,$domains.Count,$d) -NoNewline}
-        $ips=@(Resolve-DohName -Name $d)
-        if($ips.Count){
-            $resolved.Add(("{0}`t{1}" -f $ips[0],$d))
-            if(-not $Quiet){Write-Host $ips[0] -ForegroundColor Green}
+        $ip=Get-WorkingIPFor -Domain $d
+        if($ip){
+            $resolved.Add(("{0}`t{1}" -f $ip,$d))
+            if(-not $Quiet){Write-Host $ip -ForegroundColor Green}
         } else {
+            # DoH дал адреса, но ни один не отвечает. Пиннинг мёртвого IP
+            # только сломал бы доступ — оставляем домен системному DNS.
             $failed.Add($d)
-            if(-not $Quiet){Write-Host 'нет ответа' -ForegroundColor DarkGray}
+            if(-not $Quiet){Write-Host 'нет рабочего IP' -ForegroundColor DarkGray}
         }
     }
 
@@ -456,7 +894,7 @@ function Update-DohHosts {
     Write-Host ''
     Write-Host ("  Записано в hosts: {0}, не разрешилось: {1}" -f $resolved.Count,$failed.Count) -ForegroundColor Green
     if($failed.Count){
-        Write-Host ("  Без DoH-ответа: {0}" -f ($failed -join ', ')) -ForegroundColor DarkGray
+        Write-Host ("  Без рабочего IP: {0}" -f ($failed -join ', ')) -ForegroundColor DarkGray
     }
     Write-Host '  Откат: -Action Uninstall (блок удаляется полностью).' -ForegroundColor DarkGray
 }
@@ -602,14 +1040,33 @@ function Remove-All {
     Write-Host '  Для повторной установки: -Action Install' -ForegroundColor DarkGray
 }
 
+try {
 switch($Action){
     'Install' {Install-Runtime}
     'Start' {Start-Zapret}
     'Stop' {Stop-Zapret}
     'Status' {Show-Status}
     'Diagnose' {Diagnose}
+    'Check' {Show-Check}
+    'Deps' {Install-Dependencies -IncludeOptional -Yes:$Force}
     'DohHosts' {Update-DohHosts}
     'Uninstall' {Remove-All -KeepLogs:$KeepLogs -Force:$Force}
     'Purge' {Remove-All -KeepLogs:$KeepLogs -IncludeProject:$IncludeProject -Force:$Force}
     'Menu' {Show-Menu}
+}
+} catch {
+    Write-Host ''
+    Write-Host '  ОШИБКА ЗАПУСКА' -ForegroundColor Red
+    Write-Host ('  ' + $_.Exception.Message) -ForegroundColor Red
+    Write-Host ''
+    Write-Host ('  Скрипт: ' + $script:AppRoot) -ForegroundColor DarkGray
+    Write-Host ('  Действие: ' + $Action) -ForegroundColor DarkGray
+    Write-Host ('  Релиз zapret2: ' + $ZapretRoot + ' (' + $(if(Test-Path $ZapretRoot){'найден'}else{'НЕ НАЙДЕН'}) + ')') -ForegroundColor DarkGray
+    Write-Host ('  Права администратора: ' + $(if(Test-Admin){'есть'}else{'НЕТ'})) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Подробности:' -ForegroundColor Yellow
+    Write-Host ('  ' + $_.ScriptStackTrace) -ForegroundColor DarkGray
+    Write-Host ''
+    if($Host.Name -eq 'ConsoleHost'){ [void](Read-Host '  Нажмите Enter для выхода') }
+    exit 1
 }
