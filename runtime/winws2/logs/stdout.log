@@ -1,0 +1,16 @@
+github version v1.0.6 (221d7dff24bfec0cd5ac0a5070b8acef2008af3d) lua_compat_ver 6
+
+we have 4 user defined desync profile(s) and default low priority profile 0
+we have 0 user defined desync template(s)
+Loading hostlist /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/exclude.txt
+loading plain text list
+Loaded 3 hosts from /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/exclude.txt
+Loading hostlist /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/autohostlist.txt
+loading plain text list
+Loaded 4 hosts from /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/autohostlist.txt
+Loading hostlist /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/blocked.txt
+loading plain text list
+Loaded 37 hosts from /cygdrive/c/HarnessWorkspace/runtime/winws2/lists/blocked.txt
+windivert initialized. capture is started.
+LUA v5.1 LuaJIT 2.1.1756211046 OpenResty
+JIT: ON SSE3 SSE4.1 BMI2 fold cse dce fwd dse narrow loop abc sink fuse

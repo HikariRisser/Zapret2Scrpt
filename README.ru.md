@@ -1,0 +1,274 @@
+# Zapret2 Windows — системный контроллер
+
+[English version](README.md) · [Аудит безопасности](SECURITY.md) · [Лицензия](LICENSE)
+
+Windows-контроллер для `bol-van/zapret2` (релиз v1.0.6): системная
+DPI-десинхронизация для всех приложений, обход DNS-блокировок через DoH,
+автообучение доменов и полное удаление из системы.
+
+Интерфейс скрипта — на русском языке.
+
+## Быстрый старт
+
+1. Клонируйте репозиторий.
+2. Запустите `Zapret2Windows.cmd` **от имени администратора**.
+3. Выберите пункт **[1]** — установка. Сборка zapret2 скачается с GitHub
+   автоматически, если её нет рядом со скриптом.
+4. Выберите пункт **[2]** — запуск системного обхода.
+
+Пункты меню:
+
+| Пункт | Действие |
+|---|---|
+| [1] | Установить или обновить среду |
+| [2] | Запустить системный обход |
+| [3] | Остановить |
+| [4] | Диагностика ресурсов |
+| [5] | Включить автозапуск при входе |
+| [6] | Выключить автозапуск |
+| [7] | Показать выученные домены |
+| [8] | Открыть каталог журналов |
+| [9] | Удалить из системы (драйвер, задача, среда, hosts) |
+| [10] | Обновить DNS через DoH (hosts) |
+
+Установка копирует архитектурно подходящие официальные `winws2`, драйвер и DLL
+WinDivert, runtime Cygwin, библиотеки Lua, списки хостов и официальные
+фрагменты WinDivert-фильтров в `runtime\winws2` и в защищённый каталог
+`C:\Windows\System32\Zapret2Windows`.
+
+Запуск включает системный перехват через WinDivert. Это не браузерный прокси:
+под перехват попадает TCP/UDP-трафик **всех** приложений.
+
+Эквиваленты в командной строке:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Install
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Start
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Status
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Diagnose
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action DohHosts
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Stop
+powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Uninstall
+```
+
+## Удаление из системы
+
+Пункт меню **[9]** (или `-Action Uninstall`) полностью удаляет проект из
+системы за пять шагов:
+
+| Шаг | Что удаляется |
+|---|---|
+| 1/5 | процесс `winws2` |
+| 2/5 | задача планировщика `Zapret2Windows` (автозапуск) |
+| 3/5 | служба ядра `WinDivert` |
+| 4/5 | защищённый каталог `C:\Windows\System32\Zapret2Windows` |
+| 5/5 | размеченный блок в `hosts` (наш и от прежней версии проекта) |
+
+После удаления печатается проверка остатков по каждому компоненту. Команда
+идемпотентна — повторный запуск безопасен. Перед правкой `hosts` создаётся
+резервная копия `hosts.zapret-backup`.
+
+Полезные варианты:
+
+```powershell
+# удалить и рабочий каталог проекта
+.\Zapret2Windows.ps1 -Action Purge -IncludeProject
+
+# сохранить копию логов перед удалением
+.\Zapret2Windows.ps1 -Action Uninstall -KeepLogs
+
+# без запроса подтверждения
+.\Zapret2Windows.ps1 -Action Uninstall -Force
+```
+
+**Не затрагивается:** хранилище сертификатов, прочие файлы `System32`,
+посторонние записи `hosts`, рабочая папка проекта (если не указан
+`-IncludeProject`).
+
+## DNS через DoH
+
+DPI-десинхронизация не помогает, если провайдер **вообще не отдаёт IP**
+(DNS-блок): `youtube.com` и `rutracker.org` в такой ситуации просто не
+резолвятся. Поэтому контроллер разрешает имена через DoH (Cloudflare, Google,
+Quad9) и записывает результат в `hosts` размеченным блоком:
+
+```
+# --- Zapret2Windows DoH begin ---
+172.67.182.196	rutracker.org
+...
+# --- Zapret2Windows DoH end ---
+```
+
+Запускается автоматически при `Install`, вручную — пункт **[10]** или
+`-Action DohHosts`. Учитывайте, что `hosts` сопоставляет точное имя, поэтому
+`www`-варианты разрешаются отдельно. Полностью удаляется командой `Uninstall`.
+
+
+## Что реализовано
+
+- выбор официального релиза x64/x86 по разрядности Windows;
+- полный перехват портов WinDivert для TCP 80/443 и UDP 443 в обе стороны;
+- официальные `zapret-lib.lua` и `zapret-antidpi.lua` из того же релиза;
+- стратегия для HTTP: `fake + multisplit`;
+- стратегия для TLS: `fake + multidisorder` с включённой реассемблированием
+  ClientHello;
+- стратегия для QUIC: `fake` на `quic_initial`;
+- **профиль голоса/медиа Discord**: `fake` на `discord_ip_discovery`, `stun`,
+  `wireguard_initiation`, `wireguard_cookie` (официальная схема zapret2 из
+  `init.d/custom.d.examples.*/50-discord-media`, `50-stun4all`, `50-wg4all`);
+- официальные raw-фильтры WinDivert для медиа Discord, STUN и WireGuard;
+- статический список хостов плюс автообучаемый autohostlist zapret2;
+- **DNS через DoH** для обхода DNS-блокировок (размеченный блок в `hosts`,
+  полностью удаляется командой `Uninstall`);
+- **полное удаление из системы** (процесс, задача, служба ядра, каталог, hosts);
+- логи, отслеживание PID, безопасная остановка, статус, диагностика и
+  автозапуск;
+- никакого TLS-MITM, никакого корневого сертификата, никакой
+  браузер-специфичной настройки.
+
+Runtime стартует с консервативного начального списка. Autohostlist zapret2
+выучивает домены, когда детектор сбоев видит ретрансмиссии, RST или
+недостаточные ответы. Выученный список хранится здесь:
+
+```text
+C:\Windows\System32\Zapret2Windows\lists\autohostlist.txt
+```
+
+## Голосовые каналы Discord
+
+Голос использует другой транспорт, чем веб-клиент: UDP-медиапуть плюс
+WebSocket-шлюз для сигнализации. Поэтому у контроллера есть отдельный
+4-й профиль, который десинхронизирует `discord_ip_discovery`, `stun` и
+WireGuard-payload, а в захват WinDivert включены официальные фрагменты для
+медиа/UDP.
+
+Проверено на этой машине:
+
+| проверка | результат |
+|---|---|
+| HTTPS API (`/api/v9/gateway`) | 200 |
+| HTTPS API (`/api/v9/voice/regions`) | 401 (доступен; нужен вход в аккаунт) |
+| WSS voice-шлюз `gateway.discord.gg` | Hello `op=10`, heartbeat есть |
+| UDP STUN binding (Google / Cloudflare) | `0x0101` success, mapped-адрес получен |
+| Профиль на `discord_ip_discovery` (debug) | `profile 4 matches` → `fake_4_1 desync` |
+| Профиль на `stun` (debug) | `fake_4_1 : payload_type 'stun' satisfy filter` |
+
+Отладочная трассировка синтетического 74-байтного IP-discovery пакета на
+порт 50000:
+
+```text
+UDP: len=74 : 00 01 00 46 ...
+packet contains discord_ip_discovery payload
+discovered l7 protocol
+desync profile 4 (noname) matches
+* lua 'fake_4_1' : payload_type 'discord_ip_discovery' satisfy filter
+* lua 'fake_4_1' : desync
+```
+
+**Ограничение:** полный голосовой сеанс (вход в канал и двусторонний звук)
+нельзя проверить без авторизованного клиента Discord — реальный voice-endpoint
+выдаётся только после входа в аккаунт. Проверены все измеримые транспорты:
+сигнализация (WSS), API и UDP-медиапуть, плюс факт срабатывания профиля.
+
+## Безопасность
+
+Боевые ресурсы (`Lua`, списки, фильтры и драйвер ядра) размещаются в
+`C:\Windows\System32\Zapret2Windows`, где обычные пользователи имеют только
+чтение. Это сделано намеренно: рабочая папка проекта может быть доступна на
+запись другим пользователям, а `winws2` исполняет Lua внутри процесса с
+правами администратора/SYSTEM и доступом к драйверу ядра. Подробный разбор
+угроз, что устранено и что осталось — в [SECURITY.md](SECURITY.md).
+
+Перед включением автозапуска перенесите сам скрипт `Zapret2Windows.ps1` в
+каталог, недоступный на запись обычным пользователям, — иначе задача от
+SYSTEM остаётся вектором эскалации привилегий.
+
+## Важные ограничения
+
+Это системный контроллер DPI-десинхронизации, **а не VPN**. Он справляется с
+трафиком, который достижим на уровне IP/TCP, но подвергается вмешательству
+DPI. Он не может восстановить маршрут, когда фильтруются все IP-адреса
+назначения, и не может превратить локальный SOCKS-прокси в прозрачный
+системный туннель. Для полных IP/маршрутизационных блокировок и произвольных
+UDP-сервисов нужен внешний системный маршрут: WireGuard, Wintun/TUN или
+другой VPN-endpoint.
+
+HTTP/2 намеренно не переписывается. Релиз поддерживает реассемблирование
+TLS ClientHello для десинхронизации, но штатный `tls_mod` не умеет менять
+ALPN. Небезопасная подмена пакетов через Lua может нарушить TCP
+sequence/reassembly и сломать TLS.
+
+Скрипт не обещает, что заработает «всё и всегда»: его диагностика разделяет
+доступность TCP, результат HTTP и ошибки запуска WinDivert. Код `200` на один
+HTTP-запрос не доказывает, что работают все native-приложения, WebSocket,
+QUIC или UDP-медиапотоки.
+
+## Структура проекта
+
+```
+zapret2-windows/
+├── Zapret2Windows.ps1   — контроллер (установка, запуск, диагностика, удаление)
+├── Zapret2Windows.cmd   — лаунчер с запросом прав администратора
+├── README.md            — документация (английская)
+├── README.ru.md         — документация (русская)
+├── SECURITY.md          — аудит безопасности: угрозы и что устранено
+├── LICENSE              — MIT
+├── .gitignore
+├── tools/               — необязательная диагностика
+│   ├── probe-h2.js      — HTTP/2 против HTTP/1.1
+│   └── probe-voice.js   — транспорт голоса Discord
+├── runtime/             — создаётся при установке (в git не входит)
+└── zapret2-v1.0.6/      — сборка upstream, скачивается при установке (в git не входит)
+```
+
+## Диагностика (tools/)
+
+Необязательные скрипты для Node.js — помогают понять, на каком уровне сбой:
+
+```bash
+node tools/probe-h2.js discord.com rutracker.org www.youtube.com
+node tools/probe-voice.js
+```
+
+`probe-h2.js` сравнивает HTTP/2 и HTTP/1.1 — показывает, ломается ли конкретно
+HTTP/2. `probe-voice.js` проверяет сигнализацию (HTTPS API, WSS-шлюз) и
+UDP-медиапуть (STUN) для голосовых каналов Discord.
+
+## Источник и релиз
+
+Репозиторий upstream: <https://github.com/bol-van/zapret2>
+
+Сборка zapret2 **не хранится в репозитории** — она скачивается с официального
+релиза при установке (или кладётся вручную в `zapret2-v1.0.6/`). Держите
+`winws2.exe`, файлы WinDivert и библиотеки Lua **из одного и того же релиза**
+вместе: несовпадение версий ломает совместимость (`NFQWS2_COMPAT_VER`).
+
+## Публикация на GitHub
+
+Репозиторий уже подготовлен: есть `.gitignore`, `LICENSE`, документация и
+разделение кода и генерируемых файлов. Сборка zapret2 и каталог `runtime/`
+в git **не попадают** — они скачиваются/создаются при установке.
+
+```bash
+git init
+git add .
+git commit -m "Zapret2 Windows: системный контроллер DPI-десинхронизации"
+git branch -M main
+git remote add origin https://github.com/<пользователь>/<репозиторий>.git
+git push -u origin main
+```
+
+Что попадёт в репозиторий:
+
+```
+.gitignore  LICENSE  README.md  README.ru.md  SECURITY.md
+Zapret2Windows.cmd  Zapret2Windows.ps1  tools/probe-h2.js  tools/probe-voice.js
+```
+
+Что будет исключено автоматически: `runtime/`, `zapret2-v1.0.6/`, `*.log`,
+`*.zapret-backup`.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE). zapret2 распространяется под MIT License,
+Copyright (c) 2016-2026 bol-van.
