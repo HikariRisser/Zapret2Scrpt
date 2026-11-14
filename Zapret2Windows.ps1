@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.2'
+$script:ScriptVersion='1.4.3'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1542,6 +1542,7 @@ function Set-WarpError {
     # Запоминает причину сбоя: её видно в меню WARP, а не только в момент запуска.
     param([string]$Message,[string[]]$Details=@())
     $p=Get-WarpPaths
+    if($script:WarpTraceLast -and $Message -match 'узел|трафик'){ $Details=@("Проверка туннеля: $($script:WarpTraceLast)")+$Details }
     Write-Host "  $Message" -ForegroundColor Red
     foreach($l in $Details){ Write-Host "    $l" -ForegroundColor DarkGray }
     try {
@@ -1565,20 +1566,40 @@ function Wait-LocalPort {
     return $false
 }
 
+$script:WarpTraceLast=''   # чем закончилась последняя проверка туннеля
+
 function Invoke-WarpTrace {
-    # Запрос https://1.1.1.1/cdn-cgi/trace через локальный прокси sing-box.
-    # Возвращает время ответа в мс или -1. "warp=on" подтверждает туннель.
+    <#
+      Запрос cdn-cgi/trace к 1.1.1.1 через локальный прокси sing-box.
+      Возвращает время ответа в мс или -1. "warp=on" подтверждает туннель.
+      Сначала https (1.1.1.1 на 80-м порту может ответить перенаправлением),
+      затем http; прокси используется для обоих.
+    #>
     param([int]$Port,[int]$TimeoutMs=5000)
-    try {
-        $req=[Net.HttpWebRequest]::Create('http://1.1.1.1/cdn-cgi/trace')
-        $req.Proxy=New-Object Net.WebProxy("http://127.0.0.1:$Port")
-        $req.Timeout=$TimeoutMs; $req.ReadWriteTimeout=$TimeoutMs; $req.KeepAlive=$false
-        $sw=[Diagnostics.Stopwatch]::StartNew()
-        $resp=$req.GetResponse()
-        $text=(New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
-        $resp.Close(); $sw.Stop()
-        if($text -match 'warp=(on|plus)'){ return [int]$sw.ElapsedMilliseconds }
-    } catch {}
+    $proto=[Net.SecurityProtocolType]::Tls12
+    try { $proto=$proto -bor [Net.SecurityProtocolType]'Tls13' } catch {}
+    [Net.ServicePointManager]::SecurityProtocol=$proto
+    foreach($url in @('https://1.1.1.1/cdn-cgi/trace','http://1.1.1.1/cdn-cgi/trace')){
+        try {
+            $req=[Net.HttpWebRequest]::Create($url)
+            $req.Proxy=New-Object Net.WebProxy("http://127.0.0.1:$Port")
+            $req.Timeout=$TimeoutMs; $req.ReadWriteTimeout=$TimeoutMs; $req.KeepAlive=$false
+            $sw=[Diagnostics.Stopwatch]::StartNew()
+            $resp=$req.GetResponse()
+            $text=(New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
+            $resp.Close(); $sw.Stop()
+            if($text -match 'warp=(on|plus)'){
+                $script:WarpTraceLast="${url}: warp=$($Matches[1])"
+                return [int]$sw.ElapsedMilliseconds
+            }
+            $w=if($text -match 'warp=(\w+)'){ "warp=$($Matches[1])" } else { 'без поля warp' }
+            $script:WarpTraceLast="${url}: ответ получен, но $w - трафик идёт не через WARP"
+        } catch {
+            $script:WarpTraceLast="${url}: " + $_.Exception.Message
+            # Туннель не отвечает - второй адрес не поможет.
+            if($_.Exception.Message -match 'timed out|время ожидания|тайм-аут'){ break }
+        }
+    }
     return -1
 }
 
