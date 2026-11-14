@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -649,6 +649,13 @@ DISABLE_IPV6=0
 FLOWOFFLOAD=donttouch
 INIT_APPLY_FW=1
 FILTER_TTL_EXPIRED_ICMP=1
+
+# Обязательно задавать в config: common/nft.sh подставляет DESYNC_MARK при
+# загрузке, раньше, чем init-скрипт назначает значение по умолчанию. Без
+# этих строк правила nftables получаются с синтаксической ошибкой и
+# перехват не создаётся (nfqws2 запущен, но не получает ни одного пакета).
+DESYNC_MARK=0x40000000
+DESYNC_MARK_POSTNAT=0x20000000
 """
 
 
@@ -741,6 +748,12 @@ def start_bypass():
         if nfqws2_running():
             break
         time.sleep(0.25)
+    if nfqws2_running() and re.search(r"(?m)^Error:|syntax error", out or ""):
+        errs = [ln for ln in out.splitlines() if ln.startswith("Error:")][:3]
+        run_init("stop")
+        raise RuntimeError(
+            "nfqws2 запущен, но правила перехвата не создались — обход не работал бы.\n"
+            + "\n".join(errs) + f"\nПолный журнал: {os.path.join(ZAPRET_TARGET, 'init.log')}")
     if nfqws2_running():
         ok("Обход запущен, nfqws2 работает")
         if warp_enabled():
