@@ -16,7 +16,7 @@
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — один файл | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) и [`Zapret2Windows.ps1`](Zapret2Windows.ps1) | `winws2` + WinDivert |
 
-Версия скриптов — 1.7.0. Интерфейс — на русском языке.
+Версия скриптов — 1.7.1. Интерфейс — на русском языке.
 
 ## Содержание
 

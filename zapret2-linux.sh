@@ -201,7 +201,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -578,6 +578,32 @@ def run_init(action, timeout=120):
             return rc, f.read().strip()
     except OSError:
         return rc, ""
+
+
+def cmdline_running(prefix):
+    """Есть ли процесс, чья командная строка начинается с prefix."""
+    rc, _, _ = run(["pgrep", "-f", "^" + re.escape(prefix)], timeout=10)
+    return rc == 0
+
+
+def kill_by_cmdline(*prefixes, wait=4.0):
+    """
+    Завершает процессы, чья командная строка НАЧИНАЕТСЯ с одного из prefixes,
+    и ждёт их выхода; не вышедшие за wait секунд завершает принудительно.
+    Совпадение только с начала строки: иначе под шаблон попал бы любой
+    процесс, в аргументах которого встречается этот путь.
+    """
+    pats = ["^" + re.escape(p) for p in prefixes]
+    for pat in pats:
+        run(["pkill", "-f", pat], timeout=10)
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        if not any(run(["pgrep", "-f", pat], timeout=10)[0] == 0 for pat in pats):
+            return
+        time.sleep(0.2)
+    for pat in pats:
+        run(["pkill", "-9", "-f", pat], timeout=10)
+    time.sleep(0.3)
 
 
 def nfqws2_running():
@@ -967,7 +993,7 @@ def stop_bypass():
     time.sleep(1)
     if nfqws2_running():
         # Крайний случай: добиваем процесс и чистим правила
-        run(["pkill", "-f", nfqws2_path()])
+        kill_by_cmdline(nfqws2_path())
         time.sleep(1)
     ok("Обход остановлен")
 
@@ -1936,11 +1962,14 @@ def uninstall(assume_yes=False):
     print()
     print("  Будет удалено:")
     print("    - процесс nfqws2 и правила файрвола")
+    print("    - туннель: процессы sing-box и xray-core, профили и ключи серверов")
     print("    - службы systemd (автозапуск, туннель)")
-    print(f"    - каталог {ZAPRET_TARGET}")
+    print(f"    - каталог {ZAPRET_TARGET} со списками доменов")
     n_marked = count_marked()
     if n_marked:
         print(f"    - {n_marked} строк в {HOSTS_PATH} (блок DoH)")
+    if os.path.isfile(HOSTS_BACKUP):
+        print(f"    - резервная копия {HOSTS_BACKUP}")
     print("  Не затрагивается:")
     print("    - прочие записи hosts, системные пакеты, настройки сети")
     print()
@@ -1959,7 +1988,7 @@ def uninstall(assume_yes=False):
     head("[1/4] Остановка обхода...")
     if runtime_installed():
         run_init("stop")
-    run(["pkill", "-f", nfqws2_path()])
+    kill_by_cmdline(nfqws2_path())
     time.sleep(1)
 
     stop_tunnel(quiet=True)
@@ -1967,13 +1996,9 @@ def uninstall(assume_yes=False):
 
     head("[2/4] Удаление службы...")
     run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
-    try:
-        os.remove(XRAY_UNIT_PATH)
-    except OSError:
-        pass
-    if os.path.isfile(TUNNEL_UNIT_PATH):
+    for unit in (XRAY_UNIT_PATH, TUNNEL_UNIT_PATH):
         try:
-            os.remove(TUNNEL_UNIT_PATH)
+            os.remove(unit)
         except OSError:
             pass
     run(["systemctl", "disable", SERVICE_NAME], timeout=60)
@@ -1994,14 +2019,26 @@ def uninstall(assume_yes=False):
     if removed:
         write_hosts(lines)
         flush_dns()
+    try:
+        os.remove(HOSTS_BACKUP)     # копия hosts до первой правки больше не нужна
+    except OSError:
+        pass
 
     print()
     head("Проверка результата:")
+    units = [UNIT_PATH, TUNNEL_UNIT_PATH, XRAY_UNIT_PATH] + \
+            [f"/etc/systemd/system/{u}.service" for u in LEGACY_WARP_UNITS]
+    rc_nft = 1
+    if which("nft"):
+        rc_nft, _, _ = run(["nft", "list", "table", "inet", "zapret2"], timeout=15)
     checks = [
         ("процесс nfqws2", not nfqws2_running()),
-        ("служба systemd", not service_enabled() and not os.path.isfile(UNIT_PATH)),
+        ("процессы туннеля", not cmdline_running(f"{singbox_path()} run")
+                             and not cmdline_running(f"{xray_path()} run")),
+        ("правила файрвола", rc_nft != 0),
+        ("службы systemd", not service_enabled() and not any(os.path.isfile(u) for u in units)),
         ("каталог среды", not os.path.isdir(ZAPRET_TARGET)),
-        ("записи hosts", count_marked() == 0),
+        ("записи hosts", count_marked() == 0 and not os.path.isfile(HOSTS_BACKUP)),
     ]
     all_ok = True
     for name, good in checks:
@@ -2166,8 +2203,8 @@ def cleanup_legacy_warp():
             run(["systemctl", "daemon-reload"], timeout=60)
     if os.path.isdir(old_dir):
         # Только свои процессы: шаблон «каталог/» задел бы и чужие команды.
-        run(["pkill", "-f", os.path.join(old_dir, "sing-box") + " run"])
-        run(["pkill", "-f", os.path.join(old_dir, "usque") + " -c"])
+        kill_by_cmdline(os.path.join(old_dir, "sing-box") + " run",
+                        os.path.join(old_dir, "usque") + " -c", wait=2.0)
         os.makedirs(tunnel_dir(), exist_ok=True)
         old_sb = os.path.join(old_dir, "sing-box")
         if os.path.isfile(old_sb) and not os.path.isfile(singbox_path()):
@@ -3817,8 +3854,7 @@ def stop_tunnel(quiet=False):
         run(["systemctl", "stop", TUNNEL_SERVICE], timeout=60)
     if os.path.isfile(XRAY_UNIT_PATH):
         run(["systemctl", "stop", XRAY_SERVICE], timeout=60)
-    run(["pkill", "-f", f"{singbox_path()} run"])
-    run(["pkill", "-f", f"{xray_path()} run"])
+    kill_by_cmdline(f"{singbox_path()} run", f"{xray_path()} run")
     if not quiet:
         ok("Туннель остановлен")
 

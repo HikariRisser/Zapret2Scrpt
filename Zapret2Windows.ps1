@@ -47,7 +47,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.7.0'
+$script:ScriptVersion='1.7.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -3406,17 +3406,24 @@ function Remove-All {
     Write-Host '  Проверка результата:' -ForegroundColor Cyan
     $proc=@(Get-CimInstance Win32_Process -Filter "Name='winws2.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -eq (Join-Path $script:TrustedRuntime 'winws2.exe') }).Count
+    $tunDir=Join-Path $script:TrustedRuntime 'tunnel'
+    $tunProc=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe' OR Name='xray.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($tunDir,[StringComparison]::OrdinalIgnoreCase) }).Count
+    $nrpt=0
+    try { $nrpt=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq $script:TunnelNrptComment }).Count } catch {}
     $task=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
     $drv=[bool](Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue)
     $dir=Test-Path (Join-Path $env:SystemRoot 'System32\Zapret2Windows')
     $hostsLeft=Remove-HostsEntries -CountOnly
     Write-Host ("    процесс winws2:        {0}" -f $(if($proc -eq 0){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if($proc -eq 0){'Green'}else{'Red'})
+    Write-Host ("    процессы туннеля:      {0}" -f $(if($tunProc -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($tunProc -eq 0){'Green'}else{'Red'})
+    Write-Host ("    правила DNS туннеля:   {0}" -f $(if($nrpt -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($nrpt -eq 0){'Green'}else{'Red'})
     Write-Host ("    задача автозапуска:    {0}" -f $(if(-not $task){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $task){'Green'}else{'Red'})
     Write-Host ("    служба WinDivert:      {0}" -f $(if(-not $drv){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $drv){'Green'}else{'Red'})
     Write-Host ("    каталог в System32:    {0}" -f $(if(-not $dir){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if(-not $dir){'Green'}else{'Red'})
     Write-Host ("    записи hosts:          {0}" -f $(if($hostsLeft -eq 0){'очищены'}else{"осталось $hostsLeft"})) -ForegroundColor $(if($hostsLeft -eq 0){'Green'}else{'Yellow'})
     Write-Host ''
-    if($proc -eq 0 -and -not $task -and -not $drv -and -not $dir -and $hostsLeft -eq 0){
+    if($proc -eq 0 -and $tunProc -eq 0 -and $nrpt -eq 0 -and -not $task -and -not $drv -and -not $dir -and $hostsLeft -eq 0){
         Write-Host '  Удаление завершено полностью.' -ForegroundColor Green
     } else {
         Write-Host '  Часть компонентов осталась. Закройте приложения, использующие WinDivert,' -ForegroundColor Yellow
