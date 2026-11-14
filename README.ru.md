@@ -138,6 +138,19 @@ Windows (PowerShell-парсер недоступен).
 ## Linux-версия
 
 ```bash
+./zapret2-linux.sh                       # меню (лаунчер сам запросит root)
+./zapret2-linux.sh install               # любое действие: install, start, warp-on...
+./zapret2-linux.sh check                 # проверка требований без root
+```
+
+Лаунчер `zapret2-linux.sh` находит Python 3.8+ (если его нет — предлагает
+установить), сам запрашивает права (sudo, doas, pkexec или su), при запуске
+двойным щелчком открывает терминал и не закрывает окно при ошибке. Если
+после скачивания ZIP файл не исполняемый: `chmod +x zapret2-linux.sh`.
+
+Напрямую через Python:
+
+```bash
 sudo python3 zapret2-linux.py            # интерактивное меню
 sudo python3 zapret2-linux.py -a install # установить среду
 python3 zapret2-linux.py -a check        # проверить требования
@@ -559,6 +572,8 @@ QUIC или UDP-медиапотоки.
 zapret2-windows/
 ├── Zapret2Windows.ps1   — контроллер (установка, запуск, диагностика, удаление)
 ├── Zapret2Windows.cmd   — лаунчер с запросом прав администратора
+├── zapret2-linux.py     — контроллер для Linux
+├── zapret2-linux.sh     — лаунчер для Linux (Python, права root, терминал)
 ├── README.md            — документация (английская)
 ├── README.ru.md         — документация (русская)
 ├── SECURITY.md          — аудит безопасности: угрозы и что устранено

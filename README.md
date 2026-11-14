@@ -85,6 +85,18 @@ Run the DoH update ([7]) while the bypass is running.
 ## Linux version
 
 ```bash
+./zapret2-linux.sh                       # menu (the launcher asks for root itself)
+./zapret2-linux.sh install               # any action: install, start, warp-on...
+./zapret2-linux.sh check                 # requirements check, no root
+```
+
+The `zapret2-linux.sh` launcher finds Python 3.8+ (offers to install it),
+elevates via sudo/doas/pkexec/su, opens a terminal when double-clicked and
+keeps it open on errors. After a ZIP download: `chmod +x zapret2-linux.sh`.
+
+Directly via Python:
+
+```bash
 sudo python3 zapret2-linux.py            # interactive menu
 sudo python3 zapret2-linux.py -a install # install runtime
 python3 zapret2-linux.py -a check        # check requirements
