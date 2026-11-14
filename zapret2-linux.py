@@ -23,6 +23,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -36,7 +37,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1522,6 +1523,11 @@ def collect_report():
     for name in ("probe-usque.log", "probe.log", "start.log"):
         lines.append(f"--- {name}")
         lines.extend(file_tail(warp_path(name), 60) or ["<пусто>"])
+    cmd(["sh", "-c", f"resolvectl status {WARP_TUN} 2>&1 | head -12"])
+    cmd(["sh", "-c", "ip rule 2>&1 | head -12; ip route get 198.18.0.1 2>&1"])
+    for d in list_entries(warp_list_path())[:3]:
+        cmd(["sh", "-c", f"resolvectl query {shlex.quote(d)} 2>&1 | head -4"])
+        lines.append(f"через TUN {d}: {_probe_tls(d, 4)}")
     for svc in (USQUE_SERVICE, WARP_SERVICE):
         cmd(["journalctl", "-u", svc, "-n", "40", "--no-pager", "-o", "cat"])
 
@@ -2060,6 +2066,79 @@ def write_warp_rules():
     doms = list_entries(warp_list_path()) or ["warp.invalid"]
     write_json(warp_path("rules-warp.json"),
                {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
+    write_warp_dns_script()
+    if warp_tun_exists():
+        apply_warp_dns()
+
+
+WARP_TUN = "zapret2warp"
+
+
+def warp_dns_script_path():
+    return warp_path("dns-setup.sh")
+
+
+def write_warp_dns_script():
+    """
+    Скрипт, который направляет DNS-запросы доменов из списка WARP в sing-box.
+
+    Системный резолвер (systemd-resolved) сам в TUN не ходит: он шлёт запросы
+    DNS-серверу сетевой карты, и домены WARP получали обычные адреса вместо
+    FakeIP — в туннель ничего не попадало, сайты не открывались. Здесь для
+    интерфейса TUN задаются DNS-сервер sing-box и «маршрутные домены»
+    (~домен): запросы только этих доменов и их поддоменов идут в sing-box,
+    остальной DNS не меняется. Выполняется и службой (ExecStartPost), чтобы
+    настройка переживала перезагрузку.
+    """
+    script = f"""#!/bin/sh
+# Сгенерировано zapret2-linux: DNS доменов WARP -> sing-box (FakeIP)
+IF={WARP_TUN}
+LIST='{warp_list_path()}'
+command -v resolvectl >/dev/null 2>&1 || exit 0
+i=0
+while [ $i -lt 30 ] && ! ip link show "$IF" >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
+ip link show "$IF" >/dev/null 2>&1 || exit 0
+DOMS=$(grep -v '^[[:space:]]*#' "$LIST" 2>/dev/null | tr -d ' \\t\\r' | grep . | sed 's/^/~/' | tr '\\n' ' ')
+resolvectl dns "$IF" 172.19.0.2 || exit 0
+if [ -n "$DOMS" ]; then resolvectl domain "$IF" $DOMS; else resolvectl domain "$IF" ""; fi
+resolvectl default-route "$IF" false 2>/dev/null
+resolvectl flush-caches 2>/dev/null
+exit 0
+"""
+    os.makedirs(warp_dir(), exist_ok=True)
+    with open(warp_dns_script_path(), "w", encoding="utf-8") as f:
+        f.write(script)
+    os.chmod(warp_dns_script_path(), 0o755)
+
+
+def warp_tun_exists():
+    return os.path.isdir(f"/sys/class/net/{WARP_TUN}")
+
+
+def apply_warp_dns():
+    if which("resolvectl"):
+        run(["/bin/sh", warp_dns_script_path()], timeout=40)
+
+
+def check_warp_dns():
+    """Проверяет, что домен из списка WARP действительно получает FakeIP."""
+    doms = list_entries(warp_list_path())
+    if not doms:
+        return
+    try:
+        ips = {i[4][0] for i in socket.getaddrinfo(doms[0], 443, socket.AF_INET, socket.SOCK_STREAM)}
+    except OSError as e:
+        ips = set()
+        warn(f"DNS: {doms[0]} не разрешается ({e})")
+    if any(ip.startswith(("198.18.", "198.19.")) for ip in ips):
+        ok(f"DNS доменов WARP идёт в туннель ({doms[0]} -> {sorted(ips)[0]})")
+        return
+    warn(f"DNS: {doms[0]} получает обычный адрес ({', '.join(sorted(ips)) or 'нет'}), "
+         "а не адрес туннеля 198.18.x.x — сайт пойдёт мимо WARP.")
+    if not which("resolvectl"):
+        info("В системе нет systemd-resolved: автоматическая настройка DNS для WARP не поддерживается.")
+    else:
+        info(f"Проверьте: resolvectl status {WARP_TUN}; запись домена в /etc/hosts.")
 
 
 # --- WARP через MASQUE (usque) ---------------------------------------------
@@ -2482,6 +2561,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={singbox_path()} run -c {warp_path('config.json')}
+ExecStartPost=-/bin/sh {warp_dns_script_path()}
 Restart=on-failure
 RestartSec=5
 
@@ -2619,8 +2699,10 @@ def start_warp():
             run(["systemctl", "enable", USQUE_SERVICE], timeout=60)
         else:
             run(["systemctl", "disable", USQUE_SERVICE], timeout=60)
+    apply_warp_dns()
     flush_dns()
     ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
+    check_warp_dns()
 
 
 def warp_starter_pid():
@@ -2817,6 +2899,10 @@ def update_warp_routes():
         remove_hosts_domains(move)
         flush_dns()
         ok("Перенесено в WARP: " + ", ".join(move))
+        time.sleep(1)   # sing-box перечитывает список
+        check_warp_dns()
+        info("Перезапустите браузер: он помнит старые адреса сайтов. Если в браузере включён "
+             "«Безопасный DNS» (DNS через HTTPS), отключите его — иначе он обходит WARP.")
     if dead:
         info("Не открываются и через WARP (нет сайта на корне домена, геоблок или сбой): "
              + ", ".join(dead))
