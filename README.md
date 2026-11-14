@@ -15,6 +15,36 @@ Two implementations with the same feature set:
 
 **Both console UIs are in Russian.**
 
+## WARP for sites zapret can't open (1.3.0)
+
+Menu item **[11]**. For sites that are IP-blocked or otherwise beyond DPI
+desync, the script brings up **Cloudflare WARP** via
+[sing-box](https://github.com/SagerNet/sing-box) v1.14.4 (downloaded on first use).
+
+- sing-box creates a TUN adapter but routes **only the FakeIP range**
+  (`198.18.0.0/15`) into it; all other traffic bypasses sing-box and keeps
+  going through zapret at full speed.
+- sing-box answers system DNS: domains from the WARP list get FakeIPs and go
+  into the WireGuard tunnel; their real addresses are resolved via `1.1.1.1`
+  inside the tunnel.
+- **Automatic Cloudflare node selection**: a probe tunnel to candidates in the
+  WARP subnets on official ports (2408, 500, 1701, 4500), latency measured via
+  `1.1.1.1/cdn-cgi/trace`; the node is re-verified on every start and
+  replaced if dead.
+- **Automatic zapret-vs-WARP split**: WARP → [3] checks every domain in the
+  zapret lists directly (reading 64 KB to catch the "16 KB" cut); those that
+  fail but work through WARP are moved to `lists\warp.txt`.
+- Free WARP device registration (protocol from wgcf); if it fails, import a
+  WireGuard config from wgcf/WarpGen (WARP → [5]).
+
+Actions: Windows `-Action WarpOn|WarpOff|WarpScan|WarpRoutes|WarpImport`,
+Linux `--action warp-on|warp-off|warp-scan|warp-routes|warp-import`.
+
+Limits: WARP often exits via Russian Cloudflare PoPs, so service-side
+geo-blocks are not reliably bypassed. Configs pass `sing-box check` with the
+real 1.14.4 binary and FakeIP behaviour was verified; WARP registration, the
+WireGuard tunnel and the Windows part were not tested in the sandbox.
+
 ## What's new in 1.2.0: speed and coverage
 
 **Speed**
@@ -233,7 +263,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.2.0'
+$script:ScriptVersion='1.3.0'
 ```
 
 Flow:
