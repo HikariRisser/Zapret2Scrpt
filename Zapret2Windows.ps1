@@ -14,7 +14,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -23,7 +23,8 @@ param(
     [switch]$Force,           # с Uninstall/Purge: без запроса подтверждения
     [string]$TunnelConfig = '',  # с TunnelImport: путь к файлу (WireGuard .conf, JSON, список ссылок)
     [string]$TunnelLink = '',    # с TunnelImport: ссылка на сервер или адрес подписки
-    [switch]$Proton              # с TunnelImport: это конфиг Proton VPN Free
+    [switch]$Proton,             # с TunnelImport: это конфиг Proton VPN Free
+    [string]$TunnelProfile = ''  # с TunnelUse: номер или имя профиля; auto - выбрать автоматически
 )
 $ErrorActionPreference='Stop'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch {}
@@ -46,7 +47,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.5.0'
+$script:ScriptVersion='1.6.0'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -254,6 +255,7 @@ function Ensure-Admin {
     if($TunnelConfig){$argList+=@('-TunnelConfig',('"{0}"' -f $TunnelConfig))}
     if($TunnelLink){$argList+=@('-TunnelLink',('"{0}"' -f $TunnelLink))}
     if($Proton){$argList+='-Proton'}
+    if($TunnelProfile){$argList+=@('-TunnelProfile',('"{0}"' -f $TunnelProfile))}
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
     exit
 }
@@ -411,6 +413,7 @@ function Install-Runtime {
     $null=Merge-ListFile (Join-Path $lists 'exclude.txt') $script:SeedExclude
     Remove-LegacyWarp
     $null=Merge-ListFile (Join-Path $lists 'tunnel.txt') $script:SeedTunnel
+    $null=Merge-ListFile (Join-Path $lists 'tunnel-geo.txt') $script:SeedGeo
     $n=Merge-ListFile (Join-Path $lists 'ipset-hosting.txt') $script:SeedHostingIpset
     if($n){Write-Host "  Добавлено подсетей хостингов: $n" -ForegroundColor DarkGray}
     $auto=Join-Path $lists 'autohostlist.txt'
@@ -1181,6 +1184,7 @@ function Toggle-Autostart {
     } else {
         Install-Autostart
         Write-Host '  Автозапуск при входе включён.' -ForegroundColor Green
+        if((Get-TunnelStatus).Enabled){ Write-Host '  Туннель будет запускаться вместе с обходом.' -ForegroundColor Green }
     }
 }
 
@@ -1216,7 +1220,22 @@ $script:TunnelFake4='10.249.0.0/16'
 $script:TunnelFake4Prefix='10.249.'
 $script:TunnelFake6='fd7a:7a70:fa4e::/64'
 $script:TunnelNrptComment='Zapret2Tunnel'
-$script:SupportedFormats='конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; несколько ссылок или подписка (адрес https://... либо base64); JSON sing-box (outbound или целый конфиг)'
+$script:SupportedFormats='конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; несколько ссылок или подписка (адрес https://... либо base64); JSON sing-box (outbound или целый конфиг); JSON Xray (outbound или целый конфиг). Транспорт XHTTP и конфиги Xray работают через xray-core, остальное - через sing-box'
+# xray-core: только для профилей, которые sing-box не умеет (транспорт XHTTP,
+# конфиги Xray). Работает локальным прокси, в который sing-box отправляет трафик.
+$script:XrayPort=40482
+$script:XrayProbePort=40483
+# Сайты, по которым проверяется, пускает ли сервис с адреса профиля.
+$script:SeedGeo=@(
+    '# Сайты с региональными ограничениями: по ним выбирается профиль туннеля.',
+    '# По домену в строке. Профиль, с которого открывается больше сайтов, - лучший.',
+    'claude.ai',
+    'chatgpt.com',
+    'gemini.google.com'
+)
+# Признаки отказа по региону: в адресе перенаправления или в тексте страницы.
+$script:GeoRegex='(?i)app-unavailable-in-region|unavailable[-_ ]in[-_ ](your[-_ ])?(region|country)|unsupported[-_ ](country|region)|country[-_ ]not[-_ ]supported|not[-_ ](available|supported)[-_ ]in[-_ ]your[-_ ](country|region|location)|region[-_ ](restricted|blocked)|geo[-_ ]?(block|restrict)|недоступ\w+ в ваш\w+ (стране|регионе)'
+$script:GeoLabel=@{ ok='открывается'; challenge='отвечает (проверка браузера)'; geo='отказ по региону'; deny='отказ (403)'; fail='нет ответа' }
 $script:TunnelTraceLast=''       # чем закончилась последняя проверка туннеля
 $script:TunnelExit=@{}           # откуда туннель выходит в интернет: loc, ip
 
@@ -1225,6 +1244,12 @@ function Get-TunnelPaths {
     [pscustomobject]@{
         Dir=$d
         Exe=Join-Path $d 'sing-box.exe'
+        Xray=Join-Path $d 'xray.exe'
+        XrayConfig=Join-Path $d 'xray.json'
+        XrayProbe=Join-Path $d 'probe-xray.json'
+        XrayLog=Join-Path $script:TrustedRuntime 'logs\xray.log'
+        XrayProbeLog=Join-Path $script:TrustedRuntime 'logs\xray-probe.log'
+        Geo=Join-Path $script:TrustedRuntime 'lists\tunnel-geo.txt'
         Profiles=Join-Path $d 'profiles.json'
         State=Join-Path $d 'state.json'
         ExitInfo=Join-Path $d 'exit.json'
@@ -1351,10 +1376,45 @@ function Install-SingBox {
     Write-Host "  sing-box установлен: $($p.Exe)" -ForegroundColor Green
 }
 
+function Install-Xray {
+    # Скачивает официальную сборку xray-core с GitHub (один раз).
+    $ErrorActionPreference='Continue'
+    $p=Get-TunnelPaths
+    if(Test-Path $p.Xray){ return }
+    New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
+    $arch=$env:PROCESSOR_ARCHITEW6432; if(-not $arch){ $arch=$env:PROCESSOR_ARCHITECTURE }
+    $xa=switch($arch){ 'AMD64' {'64'} 'ARM64' {'arm64-v8a'} 'x86' {'32'} default {'64'} }
+    $url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-$xa.zip"
+    $tmp=Join-Path $env:TEMP ("xray-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        Write-Host '  Скачивание xray-core (нужен для профилей с XHTTP и конфигов Xray)...' -ForegroundColor Yellow
+        Write-Host "    $url" -ForegroundColor DarkGray
+        [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+        $zip=Join-Path $tmp 'xray.zip'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
+        if(-not (Test-Path (Join-Path $tmp 'xray.exe'))){ throw "В архиве нет xray.exe: $url" }
+        Copy-Item (Join-Path $tmp 'xray.exe') $p.Xray -Force
+    } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host "  xray-core установлен: $($p.Xray)" -ForegroundColor Green
+}
+
+function Copy-ToOrdered {
+    # Копия объекта (словарь или объект из JSON) в упорядоченный словарь.
+    param($Object)
+    $o=[ordered]@{}
+    if($Object -is [System.Collections.IDictionary]){ foreach($k in @($Object.Keys)){ $o[$k]=$Object[$k] } }
+    elseif($Object){ foreach($prop in $Object.PSObject.Properties){ $o[$prop.Name]=$prop.Value } }
+    return $o
+}
+
 # --- разбор конфигов и ссылок -------------------------------------------------
 #
 # Профиль: name, source ('proton' | 'custom'), type, endpoint ($true для
 # WireGuard), outbound (объект sing-box без tag).
+# Профиль для xray-core дополнительно: engine='xray', xray (outbound Xray),
+# server (хост, порт); его outbound - SOCKS на локальный xray.
 
 function ConvertFrom-AnyBase64 {
     # Base64 в любом варианте (обычный/URL-safe, с выравниванием и без).
@@ -1461,16 +1521,63 @@ function New-TransportBlock {
             if($h){ $tr.host=$h }
             return $tr
         }
-        { $_ -in @('xhttp','splithttp') } {
-            throw 'транспорт XHTTP (SplitHTTP) sing-box не поддерживает - нужен другой транспорт на сервере (TCP/Reality, WS, gRPC)'
-        }
         default { throw "транспорт '$net' не поддерживается sing-box" }
     }
+}
+
+function Test-XhttpQuery {
+    param($Q)
+    $net="$($Q['type'])".ToLowerInvariant(); if(-not $net){ $net="$($Q['net'])".ToLowerInvariant() }
+    return ($net -eq 'xhttp' -or $net -eq 'splithttp')
+}
+
+function New-XrayLinkOutbound {
+    # Профиль для xray-core из ссылки vless/vmess/trojan с транспортом XHTTP.
+    param([string]$Proto,[string]$HostName,[int]$Port,$Q,[string]$Uuid='',[string]$Password='',[string]$Security='auto',[int]$AlterId=0)
+    $sec="$($Q['security'])".ToLowerInvariant()
+    if(-not $sec){ $sec=$(if($Proto -eq 'trojan'){'tls'}else{'none'}) }
+    $sni=$Q['sni']; if(-not $sni){ $sni=$Q['peer'] }
+    if(-not $sni -and -not (Test-IpLiteral $HostName)){ $sni=$HostName }
+    $fp=$Q['fp']; if(-not $fp){ $fp=$Q['fingerprint'] }
+    $xh=[ordered]@{ path=$(if($Q['path']){"$($Q['path'])"}else{'/'}) }
+    if($Q['host']){ $xh.host="$($Q['host'])" }
+    if($Q['mode']){ $xh.mode="$($Q['mode'])" }
+    if($Q['extra']){
+        try { $xh.extra=("$($Q['extra'])" | ConvertFrom-Json) } catch { throw 'параметр extra в ссылке XHTTP - не JSON' }
+    }
+    $ss=[ordered]@{ network='xhttp'; xhttpSettings=$xh }
+    if($sec -eq 'reality'){
+        if(-not $Q['pbk']){ throw 'в ссылке Reality нет открытого ключа (pbk)' }
+        $ss.security='reality'
+        $ss.realitySettings=[ordered]@{ serverName="$sni"; fingerprint=$(if($fp){"$fp"}else{'chrome'}); publicKey="$($Q['pbk'])"; shortId="$($Q['sid'])"; spiderX="$($Q['spx'])" }
+    } elseif($sec -eq 'tls' -or $sec -eq 'xtls'){
+        $tls=[ordered]@{ serverName="$sni" }
+        if($fp){ $tls.fingerprint="$fp" }
+        if($Q['alpn']){ $tls.alpn=@("$($Q['alpn'])" -split ',' | Where-Object { $_ }) }
+        if((Test-Truthy $Q['allowInsecure']) -or (Test-Truthy $Q['insecure'])){ $tls.allowInsecure=$true }
+        $ss.security='tls'; $ss.tlsSettings=$tls
+    } else { $ss.security='none' }
+    if($Proto -eq 'trojan'){
+        $settings=[ordered]@{ servers=@([ordered]@{ address=$HostName; port=$Port; password=$Password }) }
+    } else {
+        $u=[ordered]@{ id=$Uuid }
+        if($Proto -eq 'vless'){
+            $u.encryption=$(if($Q['encryption']){"$($Q['encryption'])"}else{'none'})
+            if($Q['flow']){ $u.flow="$($Q['flow'])" }
+        } else { $u.security=$Security; $u.alterId=$AlterId }
+        $settings=[ordered]@{ vnext=@([ordered]@{ address=$HostName; port=$Port; users=@($u) }) }
+    }
+    return [ordered]@{ type="$Proto+xhttp"; _xray=[ordered]@{ protocol=$Proto; settings=$settings; streamSettings=$ss }; _server=@($HostName,$Port) }
 }
 
 function New-Profile {
     param([string]$Name,$Outbound,[string]$Source)
     if(-not $Name){ $Name="$($Outbound.type)" }
+    if($Outbound -is [System.Collections.IDictionary] -and $Outbound.Contains('_xray')){
+        return [pscustomobject]@{ name=$Name.Trim(); source=$Source; type="$($Outbound.type)"; endpoint=$false; engine='xray'
+                                  xray=$Outbound['_xray']; server=@($Outbound['_server'])
+                                  outbound=[ordered]@{ type='socks'; server='127.0.0.1'; server_port=$script:XrayPort; version='5' } }
+    }
     [pscustomobject]@{ name=$Name.Trim(); source=$Source; type="$($Outbound.type)"; endpoint=("$($Outbound.type)" -eq 'wireguard'); outbound=$Outbound }
 }
 
@@ -1528,6 +1635,9 @@ function ConvertFrom-ServerLink {
     switch($scheme){
         'vless' {
             $l=Split-ServerLink $Link; Assert-Server $l
+            if(Test-XhttpQuery $l.Q){
+                return ,@($(if($l.Name){$l.Name}else{"VLESS $($l.Host)"}),(New-XrayLinkOutbound -Proto 'vless' -HostName $l.Host -Port $l.Port -Q $l.Q -Uuid $l.User))
+            }
             $ob=[ordered]@{ type='vless'; server=$l.Host; server_port=$l.Port; uuid=$l.User; packet_encoding='xudp' }
             if($l.Q['flow']){ $ob.flow=$l.Q['flow'] }
             $tls=New-TlsBlock $l.Q $l.Host; if($tls){ $ob.tls=$tls }
@@ -1557,12 +1667,18 @@ function ConvertFrom-ServerLink {
                 $ob=[ordered]@{ type='vmess'; server=$h; server_port=$port; uuid="$($j.id)"; security=$(if($j.scy){"$($j.scy)"}else{'auto'}); alter_id=$aid }
                 $tls=New-TlsBlock $q $(if($q['host']){$q['host']}else{$h})
             }
+            if(Test-XhttpQuery $q){
+                return ,@($(if($name){$name}else{"VMess $h"}),(New-XrayLinkOutbound -Proto 'vmess' -HostName "$($ob.server)" -Port ([int]$ob.server_port) -Q $q -Uuid "$($ob.uuid)" -Security "$($ob.security)" -AlterId ([int]$ob.alter_id)))
+            }
             if($tls){ $ob.tls=$tls }
             $tr=New-TransportBlock $q; if($tr){ $ob.transport=$tr }
             return ,@($(if($name){$name}else{"VMess $h"}),$ob)
         }
         'trojan' {
             $l=Split-ServerLink $Link; Assert-Server $l
+            if(Test-XhttpQuery $l.Q){
+                return ,@($(if($l.Name){$l.Name}else{"Trojan $($l.Host)"}),(New-XrayLinkOutbound -Proto 'trojan' -HostName $l.Host -Port $l.Port -Q $l.Q -Password $l.User))
+            }
             $ob=[ordered]@{ type='trojan'; server=$l.Host; server_port=$l.Port; password=$l.User }
             if("$($l.Q['security'])".ToLowerInvariant() -ne 'none'){ $ob.tls=New-TlsBlock $l.Q $l.Host -Force }
             $tr=New-TransportBlock $l.Q; if($tr){ $ob.transport=$tr }
@@ -1645,13 +1761,49 @@ function ConvertFrom-ServerLink {
     }
 }
 
+function ConvertFrom-XrayJson {
+    # Конфиг Xray (целый или один outbound): массив профилей либо $null.
+    param($J,[string]$Source)
+    $items=$null
+    if($J -is [array]){
+        if($J.Count -and -not @($J | Where-Object { -not ($_ -and $_.PSObject.Properties['protocol']) }).Count){ $items=@($J) }
+    } elseif($J.PSObject.Properties['outbounds'] -and @($J.outbounds | Where-Object { $_ -and $_.PSObject.Properties['protocol'] }).Count){
+        $items=@($J.outbounds)
+    } elseif($J.PSObject.Properties['protocol'] -and -not $J.PSObject.Properties['type']){ $items=@($J) }
+    if($null -eq $items){ return $null }
+    $out=New-Object System.Collections.Generic.List[object]
+    foreach($it in $items){
+        if(-not $it -or (@('freedom','blackhole','dns','loopback') -contains "$($it.protocol)")){ continue }
+        $s=$it.settings; $h=''; $port=$null
+        foreach($key in @('vnext','servers','peers')){
+            if($h -or -not $s -or -not $s.PSObject.Properties[$key]){ continue }
+            $first=@($s.$key)[0]
+            if($first -and $first.address){ $h="$($first.address)"; $port=$first.port }
+            elseif($first -and $first.endpoint -and "$($first.endpoint)" -match '^\[?(.+?)\]?:(\d+)$'){ $h=$Matches[1]; $port=[int]$Matches[2] }
+        }
+        if(-not $h -and $s -and $s.address){ $h="$($s.address)"; $port=$s.port }
+        if(-not $h){ continue }
+        $ob=Copy-ToOrdered $it
+        foreach($k in @('tag','proxySettings','sendThrough')){ if($ob.Contains($k)){ $ob.Remove($k) } }
+        $net='tcp'
+        if($it.streamSettings){
+            if($it.streamSettings.network){ $net="$($it.streamSettings.network)" }
+            # цепочки на другие outbound не переносим
+            if($it.streamSettings.sockopt -and $it.streamSettings.sockopt.PSObject.Properties['dialerProxy']){ $it.streamSettings.sockopt.PSObject.Properties.Remove('dialerProxy') }
+        }
+        $name="$($it.tag)"; if(-not $name){ $name="$($it.protocol) $h" }
+        $out.Add((New-Profile $name ([ordered]@{ type="$($it.protocol)+$net (xray)"; _xray=$ob; _server=@($h,$port) }) $Source))
+    }
+    if(-not $out.Count){ throw 'в конфиге Xray нет ни одного сервера (outbound с адресом)' }
+    return ,$out.ToArray()
+}
+
 function ConvertFrom-SingBoxJson {
     # Outbound/endpoint sing-box или целый конфиг: берём все серверы из него.
     param([string]$Text,[string]$Source)
     try { $j=$Text | ConvertFrom-Json } catch { throw ("JSON не разбирается: " + $_.Exception.Message) }
-    if($Text -match '"vnext"' -or ($Text -match '"inbounds"' -and $Text -match '"routing"')){
-        throw 'это конфиг Xray/V2Ray, а не sing-box. Возьмите ссылку на сервер (vless://...) или экспортируйте конфиг в формате sing-box'
-    }
+    $xray=ConvertFrom-XrayJson $j $Source
+    if($null -ne $xray){ return ,$xray }
     $items=@()
     if($j -is [array]){ $items=@($j) }
     elseif($j.PSObject.Properties['outbounds'] -or $j.PSObject.Properties['endpoints']){ $items=@($j.endpoints)+@($j.outbounds) }
@@ -1721,6 +1873,11 @@ function Get-ProfileServer {
     # Хост и порт сервера профиля.
     param($Prof)
     $ob=$Prof.outbound
+    if($Prof.engine -eq 'xray'){
+        $net=''; if($Prof.xray.streamSettings){ $net="$($Prof.xray.streamSettings.network)" }
+        $udp=(@('kcp','quic','hysteria') -contains $net) -or (@('wireguard','hysteria') -contains "$($Prof.xray.protocol)")
+        return [pscustomobject]@{ Host="$(@($Prof.server)[0])"; Port=@($Prof.server)[1]; Udp=$udp }
+    }
     if($Prof.endpoint){
         $peer=@($ob.peers)[0]
         return [pscustomobject]@{ Host="$($peer.address)"; Port=$peer.port; Udp=$true }
@@ -1765,21 +1922,61 @@ function Update-TunnelServers {
 
 function Get-ProfileParts {
     # endpoints и outbounds для конфига sing-box (профиль получает tag 'tunnel').
-    param($Prof)
-    $ob=[ordered]@{}
+    param($Prof,[switch]$Probe)
     # Только что разобранный профиль - словарь, прочитанный из файла - объект.
-    if($Prof.outbound -is [System.Collections.IDictionary]){ foreach($k in @($Prof.outbound.Keys)){ $ob[$k]=$Prof.outbound[$k] } }
-    else { foreach($prop in $Prof.outbound.PSObject.Properties){ $ob[$prop.Name]=$prop.Value } }
+    $ob=Copy-ToOrdered $Prof.outbound
     $ob['tag']='tunnel'
+    if($Prof.engine -eq 'xray'){ $ob['server_port']=$(if($Probe){$script:XrayProbePort}else{$script:XrayPort}) }
     if($Prof.endpoint){ return [pscustomobject]@{ Endpoints=@($ob); Outbounds=@() } }
     return [pscustomobject]@{ Endpoints=@(); Outbounds=@($ob) }
 }
 
+function New-XrayConfig {
+    # Конфиг xray-core: локальный SOCKS -> сервер профиля.
+    param($Prof,[int]$Port)
+    $ob=Copy-ToOrdered $Prof.xray
+    $ob['tag']='proxy'
+    return [ordered]@{
+        log=[ordered]@{ loglevel='warning' }
+        inbounds=@([ordered]@{ tag='socks-in'; listen='127.0.0.1'; port=$Port; protocol='socks'; settings=[ordered]@{ auth='noauth'; udp=$true } })
+        outbounds=@($ob)
+    }
+}
+
+function Start-XrayProcess {
+    # Запускает xray-core с конфигом и ждёт локальный порт. Процесс или $null.
+    param($Prof,[int]$Port,[string]$ConfigPath,[string]$LogPath)
+    Install-Xray
+    $p=Get-TunnelPaths
+    Write-JsonFile $ConfigPath (New-XrayConfig $Prof $Port)
+    $proc=Start-Process -FilePath $p.Xray -ArgumentList @('run','-c',"`"$ConfigPath`"") -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $LogPath -RedirectStandardError "$LogPath.err"
+    $null=$proc.Handle
+    if(-not (Wait-LocalPort $Port 10000 $proc)){
+        $script:TunnelTraceLast='xray-core не запустился: ' + ((@(Get-FileTail $LogPath 3) + @(Get-FileTail "$LogPath.err" 3)) -join ' | ')
+        if(-not $proc.HasExited){ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+        return $null
+    }
+    return $proc
+}
+
 function Test-ProfileConfig {
-    # Проверяет профиль настоящим sing-box. Возвращает '' или текст ошибки.
+    # Проверяет профиль настоящим sing-box или xray-core. Возвращает '' или текст ошибки.
     param($Prof)
     $ErrorActionPreference='Continue'
     $p=Get-TunnelPaths
+    if($Prof.engine -eq 'xray'){
+        try { Install-Xray } catch { return ('xray-core не скачался: ' + $_.Exception.Message) }
+        $vf=Join-Path $p.Dir 'validate-xray.json'
+        Write-JsonFile $vf (New-XrayConfig $Prof $script:XrayProbePort)
+        $out=& $p.Xray run -test -c $vf 2>&1
+        $rc=$LASTEXITCODE
+        Remove-Item $vf -Force -ErrorAction SilentlyContinue
+        if($rc -eq 0){ return '' }
+        $msg=@($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() })
+        if($msg.Count){ return $msg[-1] }
+        return 'ошибка конфигурации'
+    }
     $parts=Get-ProfileParts $Prof
     $cfg=[ordered]@{
         log=[ordered]@{ level='error' }
@@ -1811,7 +2008,7 @@ function Import-TunnelProfiles {
     foreach($e in $parsed.Errors){ $errors.Add($e) }
     foreach($pr in $parsed.Profiles){
         $why=Test-ProfileConfig $pr
-        if(-not $why){ $good.Add($pr) } else { $errors.Add("$($pr.name) - sing-box не принял профиль: $why") }
+        if(-not $why){ $good.Add($pr) } else { $errors.Add("$($pr.name) - $(if($pr.engine -eq 'xray'){'xray-core'}else{'sing-box'}) не принял профиль: $why") }
     }
     foreach($e in $errors){ Write-Host "  ! $e" -ForegroundColor Yellow }
     if(-not $good.Count){ throw 'ни один профиль не подошёл' }
@@ -1839,7 +2036,10 @@ function Import-TunnelProfiles {
         Stop-Zapret -Quiet
         Start-Zapret
     }
-    Remove-Item $p.State -Force -ErrorAction SilentlyContinue     # выбрать лучший профиль заново
+    $st=Read-JsonFile $p.State
+    if(-not ($st -and $st.pinned -and (Find-TunnelProfile "$($st.active)"))){
+        Remove-Item $p.State -Force -ErrorAction SilentlyContinue     # выбрать лучший профиль заново
+    }
 }
 
 function Read-UserInput {
@@ -2034,11 +2234,100 @@ function Measure-TunnelPing {
     return $best
 }
 
+function Test-GeoSite {
+    <#
+      Пускает ли сайт с адреса туннеля. Запрос идёт через локальный прокси.
+      'ok' - открывается; 'geo' - отказ по региону (код 451, перенаправление
+      или страница с таким текстом); 'challenge' - сайт отвечает, но требует
+      проверку браузера (по ней регион не определить); 'deny' - отказ 403 без
+      объяснения (часто так закрывают адреса VPN); 'fail' - нет ответа.
+    #>
+    param([string]$Domain,[int]$Port,[int]$TimeoutMs=10000)
+    $proto=[Net.SecurityProtocolType]::Tls12
+    try { $proto=$proto -bor [Net.SecurityProtocolType]'Tls13' } catch {}
+    [Net.ServicePointManager]::SecurityProtocol=$proto
+    $url="https://$Domain/"
+    for($i=0;$i -lt 4;$i++){
+        $resp=$null
+        try {
+            $req=[Net.HttpWebRequest]::Create($url)
+            $req.Proxy=New-Object Net.WebProxy("http://127.0.0.1:$Port")
+            $req.AllowAutoRedirect=$false
+            $req.Timeout=$TimeoutMs; $req.ReadWriteTimeout=$TimeoutMs; $req.KeepAlive=$false
+            $req.UserAgent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+            $req.Accept='text/html,application/xhtml+xml,*/*;q=0.8'
+            $req.Headers.Add('Accept-Language','en-US,en;q=0.9')
+            try { $resp=$req.GetResponse() }
+            catch [Net.WebException] { $resp=$_.Exception.Response; if(-not $resp){ return 'fail' } }
+            $code=[int]$resp.StatusCode
+            $location="$($resp.Headers['Location'])"
+            $mitigated="$($resp.Headers['cf-mitigated'])"
+            $body=''
+            try {
+                $sr=New-Object IO.StreamReader($resp.GetResponseStream())
+                $buf=New-Object char[] 65536
+                $n=$sr.ReadBlock($buf,0,$buf.Length)
+                $body=[string]::new($buf,0,$n)
+            } catch {}
+        } catch { return 'fail' }
+        finally { if($resp){ $resp.Close() } }
+        if($code -eq 451){ return 'geo' }
+        if($code -ge 300 -and $code -lt 400 -and $location){
+            $next=([uri]::new([uri]$url,$location)).AbsoluteUri
+            if($next -match $script:GeoRegex){ return 'geo' }
+            if($next -notmatch '^(?i)https://'){ return 'ok' }
+            $url=$next
+            continue
+        }
+        $headText=$(if($body.Length -gt 20000){ $body.Substring(0,20000) } else { $body })
+        if($code -ge 400 -and $headText -match $script:GeoRegex){ return 'geo' }
+        if($mitigated -ieq 'challenge'){ return 'challenge' }
+        if($code -eq 403){ if($body -match $script:GeoRegex){ return 'geo' }; return 'deny' }
+        if($body.Length -lt 20000 -and $body -match $script:GeoRegex){ return 'geo' }
+        if($code -lt 500){ return 'ok' }
+        return 'fail'
+    }
+    return 'ok'
+}
+
+function Get-GeoCheck {
+    # Проверка всех сайтов из списка региональных ограничений: словарь сайт -> статус.
+    param([int]$Port)
+    $geo=[ordered]@{}
+    foreach($d in @(Get-ListEntries (Get-TunnelPaths).Geo)){ $geo[$d]=Test-GeoSite $d $Port }
+    return $geo
+}
+
+function Get-GeoPairs {
+    # Результат проверки (словарь или объект из state.json) -> список пар сайт/статус.
+    param($Geo)
+    $pairs=@()
+    if($Geo -is [System.Collections.IDictionary]){ foreach($k in @($Geo.Keys)){ $pairs+=[pscustomobject]@{ Site="$k"; Status="$($Geo[$k])" } } }
+    elseif($Geo){ foreach($prop in $Geo.PSObject.Properties){ $pairs+=[pscustomobject]@{ Site=$prop.Name; Status="$($prop.Value)" } } }
+    return $pairs
+}
+
+function Get-GeoScore {
+    # Сколько сайтов пускают с этого адреса (проверка браузера - не отказ).
+    param($Geo)
+    return @((Get-GeoPairs $Geo) | Where-Object { $_.Status -eq 'ok' -or $_.Status -eq 'challenge' }).Count
+}
+
+function Get-GeoSummary {
+    param($Geo)
+    $pairs=@(Get-GeoPairs $Geo)
+    if(-not $pairs.Count){ return '' }
+    $bad=@($pairs | Where-Object { $_.Status -ne 'ok' -and $_.Status -ne 'challenge' } | ForEach-Object { "$($_.Site): $($script:GeoLabel[$_.Status])" })
+    $s="сайты $(Get-GeoScore $Geo)/$($pairs.Count)"
+    if($bad.Count){ $s+=" ($($bad -join '; '))" }
+    return $s
+}
+
 function Test-TunnelProfile {
-    # Пробный запуск профиля. Возвращает объект: Ms (-1 при неудаче) и Loc.
+    # Пробный запуск профиля. Возвращает объект: Ms (-1 при неудаче), Loc и Geo.
     param($Prof)
     $p=Get-TunnelPaths
-    $fail=[pscustomobject]@{ Ms=-1; Loc=$null }
+    $fail=[pscustomobject]@{ Ms=-1; Loc=$null; Geo=[ordered]@{} }
     $srv=Get-ProfileServer $Prof
     # Быстрый отсев: если TCP-порт сервера не отвечает, туннель не поднимется.
     if($srv.Host -and $srv.Port -and -not $srv.Udp){
@@ -2055,7 +2344,13 @@ function Test-TunnelProfile {
             return $fail
         }
     }
-    $parts=Get-ProfileParts $Prof
+    $xproc=$null
+    if($Prof.engine -eq 'xray'){
+        try { $xproc=Start-XrayProcess $Prof $script:XrayProbePort $p.XrayProbe $p.XrayProbeLog }
+        catch { $script:TunnelTraceLast='xray-core: ' + $_.Exception.Message }
+        if(-not $xproc){ return $fail }
+    }
+    $parts=Get-ProfileParts $Prof -Probe
     $cfg=[ordered]@{
         log=[ordered]@{ level='info' }
         dns=[ordered]@{ servers=@([ordered]@{ type='local'; tag='local' }) }
@@ -2072,19 +2367,23 @@ function Test-TunnelProfile {
         if((Invoke-TunnelTrace $script:TunnelProbePort 6000) -lt 0){ return $fail }
         $loc=$script:TunnelExit['loc']
         $ping=Measure-TunnelPing $script:TunnelProbePort
-        if($ping -ge 2){ return [pscustomobject]@{ Ms=$ping; Loc=$loc } }
-        $t=Invoke-TunnelTrace $script:TunnelProbePort 6000
-        return [pscustomobject]@{ Ms=$t; Loc=$loc }
+        if($ping -lt 2){ $ping=Invoke-TunnelTrace $script:TunnelProbePort 6000 }
+        if($ping -lt 0){ return [pscustomobject]@{ Ms=-1; Loc=$loc; Geo=[ordered]@{} } }
+        return [pscustomobject]@{ Ms=$ping; Loc=$loc; Geo=(Get-GeoCheck $script:TunnelProbePort) }
     } finally {
         if(-not $proc.HasExited){ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
         $proc.WaitForExit(3000) | Out-Null
+        if($xproc -and -not $xproc.HasExited){ Stop-Process -Id $xproc.Id -Force -ErrorAction SilentlyContinue }
     }
 }
 
 function Select-TunnelProfile {
-    # Проверяет все профили и выбирает рабочий с наименьшей задержкой.
+    # Проверяет все профили и выбирает лучший: сначала тот, с которого
+    # открывается больше сайтов из списка региональных ограничений, затем
+    # зарубежный выход, затем наименьшая задержка. Снимает ручное закрепление.
     param([string[]]$Skip=@(),[switch]$NoAutostart)
     $p=Get-TunnelPaths
+    $null=Merge-ListFile $p.Geo $script:SeedGeo
     $profiles=@(Get-TunnelProfiles)
     if(-not $profiles.Count){
         Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.'
@@ -2101,16 +2400,17 @@ function Select-TunnelProfile {
         Write-Host ("    {0,-40} " -f $shown) -NoNewline
         $r=Test-TunnelProfile $pr
         if($r.Ms -ge 0){
-            $results.Add([pscustomobject]@{ name=$pr.name; ms=[int]$r.Ms; loc="$($r.Loc)"; ru=[int]("$($r.Loc)" -eq 'RU') })
-            Write-Host ("{0} мс, выход: {1}{2}" -f $r.Ms,$r.Loc,$(if("$($r.Loc)" -eq 'RU'){' (Россия!)'}else{''})) -ForegroundColor Green
+            $results.Add([pscustomobject]@{ name=$pr.name; ms=[int]$r.Ms; loc="$($r.Loc)"; ru=[int]("$($r.Loc)" -eq 'RU'); geo=$r.Geo; geo_ok=[int](Get-GeoScore $r.Geo) })
+            $gs=Get-GeoSummary $r.Geo
+            Write-Host ("{0} мс, выход: {1}{2}{3}" -f $r.Ms,$r.Loc,$(if("$($r.Loc)" -eq 'RU'){' (Россия!)'}else{''}),$(if($gs){", $gs"}else{''})) -ForegroundColor Green
         } else {
             Write-Host 'нет ответа' -ForegroundColor DarkGray
             $lastFail=@("Профиль '$($pr.name)': $($script:TunnelTraceLast)")+@(Get-FileTail $p.ProbeLog 6)
         }
     }
-    # Зарубежный выход важнее скорости: с российским адресом сервисы,
-    # закрытые для России, не откроются.
-    $ranked=@($results | Sort-Object ru,ms)
+    # Доступ к сайтам с региональными ограничениями важнее всего, затем
+    # зарубежный выход, затем скорость.
+    $ranked=@($results | Sort-Object @{Expression='geo_ok';Descending=$true},@{Expression='ru'},@{Expression='ms'})
     if(-not $ranked.Count){
         Set-TunnelError 'Ни один профиль туннеля не ответил.' $lastFail
         Write-Host '  Сервер недоступен или его протокол блокируется провайдером.' -ForegroundColor Yellow
@@ -2118,15 +2418,58 @@ function Select-TunnelProfile {
         return $null
     }
     $best=$ranked[0]
-    Write-JsonFile $p.State ([ordered]@{ active=$best.name; ranked=@($ranked); tested=(Get-Date).ToString('s') })
+    Write-JsonFile $p.State ([ordered]@{ active=$best.name; pinned=$false; ranked=@($ranked); tested=(Get-Date).ToString('s') })
     Clear-TunnelError
-    Write-Host ("  Лучший профиль: {0} (задержка {1} мс, выход: {2})" -f $best.name,$best.ms,$best.loc) -ForegroundColor Green
+    $gs=Get-GeoSummary $best.geo
+    Write-Host ("  Лучший профиль: {0} (задержка {1} мс, выход: {2}{3})" -f $best.name,$best.ms,$best.loc,$(if($gs){", $gs"}else{''})) -ForegroundColor Green
+    if(@(Get-GeoPairs $best.geo).Count -gt $best.geo_ok){
+        Write-Host '  ! Ни с одного профиля не открываются все сайты из списка региональных ограничений.' -ForegroundColor Yellow
+    }
     if(-not $NoAutostart){
         if($wasRunning -or ((Get-TunnelStatus).Enabled -and (Get-Status).Running)){ Start-Tunnel }
         elseif((Get-TunnelStatus).Enabled){ Write-Host '  Туннель запустится вместе с обходом (пункт [2] главного меню).' -ForegroundColor DarkGray }
         else { Write-Host '  Туннель выключен: включите его в меню туннеля, пункт [1].' -ForegroundColor DarkGray }
     }
     return $best.name
+}
+
+function Use-TunnelProfile {
+    # Ручной выбор: номер или имя профиля закрепляет его (автовыбор его не
+    # сменит); 'auto' снимает закрепление и выбирает лучший заново.
+    param([string]$Ref)
+    Ensure-Admin
+    $Ref="$Ref".Trim()
+    if($Ref -ieq 'auto' -or $Ref -ieq 'авто'){ return (Select-TunnelProfile) }
+    $profiles=@(Get-TunnelProfiles)
+    $prof=$null; $idx=0
+    if([int]::TryParse($Ref,[ref]$idx) -and $idx -ge 1 -and $idx -le $profiles.Count){ $prof=$profiles[$idx-1] }
+    if(-not $prof){ $prof=$profiles | Where-Object { $_.name -eq $Ref } | Select-Object -First 1 }
+    if(-not $prof -and $Ref){ $prof=$profiles | Where-Object { $_.name.ToLowerInvariant().Contains($Ref.ToLowerInvariant()) } | Select-Object -First 1 }
+    if(-not $prof){ throw "профиль не найден: $Ref" }
+    $p=Get-TunnelPaths
+    $old=Read-JsonFile $p.State
+    $wasRunning=(Get-TunnelStatus).Running
+    $st=[ordered]@{ active=$prof.name; pinned=$true }
+    if($old -and $old.ranked){ $st.ranked=@($old.ranked); $st.tested=$old.tested }
+    Write-JsonFile $p.State $st
+    Write-Host "  Выбран профиль '$($prof.name)'. Он закреплён: автовыбор его не сменит." -ForegroundColor Green
+    if($wasRunning -or ((Get-TunnelStatus).Enabled -and (Get-Status).Running)){ Start-Tunnel }
+    elseif(-not (Get-TunnelStatus).Enabled){ Write-Host '  Туннель выключен: включите его в меню туннеля, пункт [1].' -ForegroundColor DarkGray }
+    return $prof.name
+}
+
+function Test-TunnelGeo {
+    # Проверка сайтов с региональными ограничениями через работающий туннель.
+    $p=Get-TunnelPaths
+    $null=Merge-ListFile $p.Geo $script:SeedGeo
+    if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
+    Write-Host '  Проверка региональных ограничений через активный профиль...' -ForegroundColor Yellow
+    $geo=Get-GeoCheck $script:TunnelMixedPort
+    foreach($pair in (Get-GeoPairs $geo)){
+        $good=($pair.Status -eq 'ok' -or $pair.Status -eq 'challenge')
+        Write-Host ("    {0,-28} {1}" -f $pair.Site,$script:GeoLabel[$pair.Status]) -ForegroundColor $(if($good){'Green'}else{'Red'})
+    }
+    Write-Host "  Список сайтов: $($p.Geo) (можно править вручную)." -ForegroundColor DarkGray
 }
 
 # --- запуск и остановка --------------------------------------------------------
@@ -2150,6 +2493,7 @@ function Get-TunnelStatus {
         Running=[bool]$proc.Count
         Starting=[bool](Get-TunnelStarterProcess)
         Active=$(if($st){$st.active}else{$null})
+        Pinned=[bool]($st -and $st.pinned)
         Loc=$(if($ex){$ex.loc}else{$null})
         Profiles=@(Get-TunnelProfiles).Count
         Domains=@(Get-ListEntries $p.List).Count
@@ -2177,6 +2521,15 @@ function Start-TunnelProcess {
         return 'crash'
     }
     foreach($f in @($p.Log,$p.ErrLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    if($Prof.engine -eq 'xray'){
+        $xproc=$null
+        try { $xproc=Start-XrayProcess $Prof $script:XrayPort $p.XrayConfig $p.XrayLog }
+        catch { $script:TunnelTraceLast='xray-core: ' + $_.Exception.Message }
+        if(-not $xproc){
+            Set-TunnelError 'xray-core не запустился.' @($script:TunnelTraceLast)
+            return 'crash'
+        }
+    }
     $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Config)`"") -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru `
               -RedirectStandardError $p.ErrLog -RedirectStandardOutput "$($p.ErrLog).out"
     $null=$proc.Handle   # без этого ExitCode после завершения бывает пустым
@@ -2229,7 +2582,9 @@ function Start-Tunnel {
     if(-not $prof){ return }
     Write-Host "  Запуск туннеля (профиль '$($prof.name)')..." -ForegroundColor Yellow
     $r=Start-TunnelProcess $prof
-    if($r -eq 'notunnel' -and @(Get-TunnelProfiles).Count -gt 1){
+    if($r -eq 'notunnel' -and $st -and $st.pinned){
+        Write-Host '  Профиль выбран вручную, поэтому на другой не переключаюсь. Автовыбор: меню туннеля, пункт [5].' -ForegroundColor Yellow
+    } elseif($r -eq 'notunnel' -and @(Get-TunnelProfiles).Count -gt 1){
         Write-Host '  Профиль не отвечает, проверяю остальные...' -ForegroundColor Yellow
         Stop-Tunnel -Quiet
         $name=Select-TunnelProfile -Skip @($prof.name) -NoAutostart
@@ -2287,8 +2642,8 @@ function Stop-Tunnel {
         Remove-Item $p.StarterPid -Force -ErrorAction SilentlyContinue
     }
     for($i=0;$i -lt 10;$i++){
-        $procs=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ExecutablePath -eq $p.Exe })
+        $procs=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe' OR Name='xray.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.ExecutablePath -eq $p.Exe -or $_.ExecutablePath -eq $p.Xray })
         if(-not $procs.Count){ break }
         $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 300
@@ -2304,6 +2659,7 @@ function Enable-Tunnel {
     $p=Get-TunnelPaths
     New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
     if(-not (Test-Path $p.List)){ $null=Merge-ListFile $p.List $script:SeedTunnel }
+    $null=Merge-ListFile $p.Geo $script:SeedGeo
     if(-not @(Get-TunnelProfiles).Count){
         Write-Host '  Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).' -ForegroundColor Red
         return
@@ -2472,14 +2828,22 @@ function Test-TunnelSites {
 function Show-TunnelProfiles {
     $profiles=@(Get-TunnelProfiles)
     if(-not $profiles.Count){ Write-Host '  Профилей нет.' -ForegroundColor DarkGray; return $profiles }
-    $active=(Get-TunnelStatus).Active
+    $w=Get-TunnelStatus
+    $st=Read-JsonFile (Get-TunnelPaths).State
     $i=0
     foreach($pr in $profiles){
         $i++
         $s=Get-ProfileServer $pr
         $src=$(if($pr.source -eq 'proton'){'Proton'}else{'свой'})
-        $mark=$(if($pr.name -eq $active){' <- активный'}else{''})
-        Write-Host ("    [{0}] {1}  [{2}, {3}]  {4}:{5}{6}" -f $i,$pr.name,$pr.type,$src,$s.Host,$s.Port,$mark)
+        $mark=''
+        if($pr.name -eq $w.Active){ $mark=' <- активный' + $(if($w.Pinned){', выбран вручную'}else{''}) }
+        $res=''
+        if($st -and $st.ranked){
+            $r=@($st.ranked) | Where-Object { $_.name -eq $pr.name } | Select-Object -First 1
+            if($r){ $gs=Get-GeoSummary $r.geo; $res="  $($r.ms) мс, выход $($r.loc)" + $(if($gs){", $gs"}else{''}) }
+            else { $res='  при проверке не ответил' }
+        }
+        Write-Host ("    [{0}] {1}  [{2}, {3}]  {4}:{5}{6}{7}" -f $i,$pr.name,$pr.type,$src,$s.Host,$s.Port,$res,$mark)
     }
     return $profiles
 }
@@ -2489,7 +2853,7 @@ function Show-TunnelMenu {
         $w=Get-TunnelStatus
         Write-Host ''
         Write-Host ('  Туннель: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
-                    $(if($w.Running){"работает, профиль '$($w.Active)'"}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
+                    $(if($w.Running){"работает, профиль '$($w.Active)'" + $(if($w.Pinned){' (выбран вручную)'}else{''})}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
                     ' | профилей: ' + $w.Profiles + ' | сайтов в списке: ' + $w.Domains +
                     $(if($w.Running -and $w.Loc){" | выход: $($w.Loc)"}else{''})) -ForegroundColor Cyan
         if($w.Enabled -and -not $w.Running -and -not $w.Starting){
@@ -2502,11 +2866,13 @@ function Show-TunnelMenu {
         Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить туннель'}else{'Включить туннель'}))
         Write-Host '  [2] Proton VPN Free: импортировать конфиг WireGuard'
         Write-Host '  [3] Свой сервер: импортировать конфиг, ссылку или подписку'
-        Write-Host '  [4] Проверить профили и выбрать лучший'
-        Write-Host '  [5] Проверить сайты и перенести в туннель те, что не открываются через zapret'
-        Write-Host '  [6] Добавить домен в туннель вручную'
-        Write-Host '  [7] Проверить сайты из списка туннеля (как в браузере)'
-        Write-Host '  [8] Профили: показать / удалить'
+        Write-Host '  [4] Выбрать профиль вручную'
+        Write-Host '  [5] Проверить профили и выбрать лучший автоматически'
+        Write-Host '  [6] Проверить сайты и перенести в туннель те, что не открываются через zapret'
+        Write-Host '  [7] Добавить домен в туннель вручную'
+        Write-Host '  [8] Проверить сайты из списка туннеля (как в браузере)'
+        Write-Host '  [9] Профили: показать / удалить'
+        Write-Host '  [10] Региональные ограничения: проверить сайты через активный профиль'
         Write-Host '  [0] Назад'
         $choice=Read-Host '  Выбор'
         if($choice -eq '0'){ return }
@@ -2532,9 +2898,16 @@ function Show-TunnelMenu {
                 $v=Read-Host '  Ссылка, путь к файлу или адрес подписки'
                 if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'custom'; [void](Select-TunnelProfile) }
             }
-            '4' { [void](Select-TunnelProfile) }
-            '5' { Update-TunnelRoutes }
-            '6' {
+            '4' {
+                if(@(Show-TunnelProfiles).Count){
+                    $n=(Read-Host '  Номер профиля (a - выбрать автоматически, Enter - отмена)').Trim()
+                    if($n){ [void](Use-TunnelProfile $(if($n -ieq 'a' -or $n -ieq 'а'){'auto'}else{$n})) }
+                }
+            }
+            '5' { [void](Select-TunnelProfile) }
+            '6' { Update-TunnelRoutes }
+            '10' { Test-TunnelGeo }
+            '7' {
                 $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
                 if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
                     Add-TunnelDomains @($d)
@@ -2542,8 +2915,8 @@ function Show-TunnelMenu {
                     if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
                 } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
             }
-            '7' { Test-TunnelSites }
-            '8' {
+            '8' { Test-TunnelSites }
+            '9' {
                 $profiles=@(Show-TunnelProfiles)
                 if($profiles.Count){
                     $n=Read-Host '  Номер профиля для удаления (Enter - ничего не удалять)'
@@ -3059,6 +3432,11 @@ switch($Action){
         [void](Select-TunnelProfile)
     }
     'TunnelSelect' {Ensure-Admin; [void](Select-TunnelProfile)}
+    'TunnelUse' {
+        if($TunnelProfile){ [void](Use-TunnelProfile $TunnelProfile) }
+        else { [void](Show-TunnelProfiles); Write-Host '  Укажите -TunnelProfile <номер | имя | auto>.' -ForegroundColor DarkGray }
+    }
+    'TunnelGeo' {Test-TunnelGeo}
     'TunnelRoutes' {Update-TunnelRoutes}
     'TunnelTest' {Test-TunnelSites}
     'TunnelList' {[void](Show-TunnelProfiles)}

@@ -15,7 +15,7 @@ Two implementations with the same feature set:
 
 **Both console UIs are in Russian.**
 
-## Tunnel for sites zapret can't open (1.5.0)
+## Tunnel for sites zapret can't open (1.6.0)
 
 Menu item **[11]**. For sites that are IP-blocked or that refuse Russian
 visitors, the script runs a [sing-box](https://github.com/SagerNet/sing-box)
@@ -31,7 +31,14 @@ WARP exits through Russian Cloudflare nodes.)
   with `sing-box check`.
 - Only the FakeIP range is routed into the TUN; DNS for listed domains goes to
   sing-box (systemd-resolved routing domains on Linux, NRPT on Windows).
-- All profiles are probed; a foreign exit is preferred, then the lowest latency.
+- 1.6.0: XHTTP links and Xray JSON configs run through xray-core, used as a
+  local proxy behind sing-box (downloaded only for such profiles).
+- 1.6.0: all profiles are probed against a list of region-restricted sites
+  (`tunnel-geo` list: claude.ai, chatgpt.com, gemini.google.com by default);
+  the profile that opens the most sites wins, then a foreign exit, then latency.
+- 1.6.0: manual profile choice (`tunnel-use --profile N|name|auto`,
+  `-Action TunnelUse -TunnelProfile ...`); a manually chosen profile is pinned.
+- 1.6.0: bypass autostart also starts the tunnel.
 
 Actions: Windows `-Action TunnelOn|TunnelOff|TunnelImport|TunnelSelect|TunnelRoutes|TunnelTest|TunnelList`,
 Linux `--action tunnel-on|tunnel-off|tunnel-import|tunnel-select|tunnel-routes|tunnel-test|tunnel-list`.
@@ -269,7 +276,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.5.0'
+$script:ScriptVersion='1.6.0'
 ```
 
 Flow:
