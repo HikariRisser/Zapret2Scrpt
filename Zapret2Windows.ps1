@@ -14,7 +14,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','WarpOn','WarpOff','WarpScan','WarpRoutes','WarpImport')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','WarpOn','WarpOff','WarpScan','WarpRoutes','WarpImport','WarpStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.3.1'
+$script:ScriptVersion='1.3.2'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -533,9 +533,7 @@ function Start-Zapret {
     [IO.File]::WriteAllText((Join-Path $script:TrustedRuntime 'winws2.pid'),[string]$p.Id,[Text.Encoding]::ASCII)
     Write-Host "winws2 запущен, PID $($p.Id). WinDivert обрабатывает сетевой трафик системы." -ForegroundColor Green
     Write-Host 'Автосписок включён: домен добавится после сигналов неуспешного доступа.' -ForegroundColor DarkGray
-    if((Get-WarpStatus).Enabled){
-        try { Start-Warp } catch { Write-Host ('  WARP не запущен: ' + $_.Exception.Message) -ForegroundColor Yellow }
-    }
+    if((Get-WarpStatus).Enabled){ Start-WarpBackground }
 }
 function Stop-Zapret {
     param([switch]$Quiet)
@@ -1206,6 +1204,8 @@ function Get-WarpPaths {
         Rules=Join-Path $d 'rules-warp.json'
         Cache=Join-Path $d 'cache.db'
         Pid=Join-Path $d 'sing-box.pid'
+        StarterPid=Join-Path $d 'starting.pid'
+        StartLog=Join-Path $script:TrustedRuntime 'logs\warp-start.log'
         Enabled=Join-Path $d 'enabled'
         Log=Join-Path $script:TrustedRuntime 'logs\sing-box.log'
         ErrLog=Join-Path $script:TrustedRuntime 'logs\sing-box-stderr.log'
@@ -1558,6 +1558,7 @@ function Get-WarpStatus {
         Enabled=(Test-Path $p.Enabled)
         Installed=(Test-Path $p.Exe) -and (Test-Path $p.Account)
         Running=[bool]$proc.Count
+        Starting=[bool](Get-WarpStarterProcess)
         Endpoint=if($st){$st.best}else{$null}
         Domains=@(Get-ListEntries $p.List).Count
     }
@@ -1645,9 +1646,45 @@ function Start-Warp {
     Write-Host "  WARP работает через узел $ep. Сайтов в списке WARP: $((Get-WarpStatus).Domains)" -ForegroundColor Green
 }
 
+function Get-WarpStarterProcess {
+    # Фоновый запуск WARP, если он ещё идёт.
+    $p=Get-WarpPaths
+    if(-not (Test-Path $p.StarterPid)){ return $null }
+    try { return (Get-Process -Id ([int](Get-Content $p.StarterPid -Raw)) -ErrorAction Stop) } catch { return $null }
+}
+
+function Start-WarpBackground {
+    <#
+      WARP запускается следом за zapret, не задерживая сам обход: проверка
+      узла (а при необходимости и подбор нового) идёт в отдельном скрытом
+      процессе PowerShell. Ход запуска - в logs\warp-start.log.
+    #>
+    $p=Get-WarpPaths
+    if(Get-WarpStarterProcess){ Write-Host '  WARP уже запускается в фоне.' -ForegroundColor DarkGray; return }
+    $ps=Join-Path $PSHOME 'powershell.exe'
+    $argsList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Action','WarpStart')
+    $proc=Start-Process -FilePath $ps -ArgumentList $argsList -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $p.StartLog -RedirectStandardError "$($p.StartLog).err"
+    [IO.File]::WriteAllText($p.StarterPid,[string]$proc.Id,[Text.Encoding]::ASCII)
+    Write-Host '  WARP запускается в фоне - статус в меню [11].' -ForegroundColor DarkGray
+}
+
+function Invoke-WarpStartAction {
+    # Действие WarpStart: запуск WARP, если он включён (так его запускает обход).
+    try { if((Get-WarpStatus).Enabled){ Start-Warp } else { Write-Host 'WARP выключен.' } }
+    finally { Remove-Item (Get-WarpPaths).StarterPid -Force -ErrorAction SilentlyContinue }
+}
+
 function Stop-Warp {
     param([switch]$Quiet)
     $p=Get-WarpPaths
+    # Остановка обхода во время фонового запуска WARP: прерываем и запуск,
+    # иначе он поднимет sing-box уже после остановки. Себя не трогаем.
+    $starter=Get-WarpStarterProcess
+    if($starter -and $starter.Id -ne $PID){
+        Stop-Process -Id $starter.Id -Force -ErrorAction SilentlyContinue
+        Remove-Item $p.StarterPid -Force -ErrorAction SilentlyContinue
+    }
     for($i=0;$i -lt 10;$i++){
         $procs=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" -ErrorAction SilentlyContinue |
                  Where-Object { $_.ExecutablePath -eq $p.Exe })
@@ -1795,9 +1832,9 @@ function Show-WarpMenu {
         $w=Get-WarpStatus
         Write-Host ''
         Write-Host ('  WARP: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
-                    $(if($w.Running){"работает, узел $($w.Endpoint)"}else{'не запущен'}) +
+                    $(if($w.Running){"работает, узел $($w.Endpoint)"}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
                     ' | сайтов в списке: ' + $w.Domains) -ForegroundColor Cyan
-        if($w.Enabled -and -not $w.Running){
+        if($w.Enabled -and -not $w.Running -and -not $w.Starting){
             $le=Get-FileTail (Get-WarpPaths).LastError 6
             if($le.Count){
                 Write-Host '  Последняя ошибка:' -ForegroundColor Red
@@ -1868,7 +1905,7 @@ function Show-Menu {
                     ' | доменов: ' + $st.LearnedDomains)
         $w=Get-WarpStatus
         if($w.Enabled -or $w.Installed){
-            Write-Host ('  WARP: ' + $(if($w.Running){"работает (узел $($w.Endpoint))"}else{'не запущен'}) + ' | сайтов в WARP: ' + $w.Domains)
+            Write-Host ('  WARP: ' + $(if($w.Running){"работает (узел $($w.Endpoint))"}elseif($w.Starting){'запускается...'}else{'не запущен'}) + ' | сайтов в WARP: ' + $w.Domains)
         }
         Write-Host ''
         Write-Host ('  [1] ' + $(if($st.Runtime){'Обновить среду zapret2'}else{'Установить среду zapret2'}))
@@ -2319,6 +2356,7 @@ switch($Action){
     'WarpOff' {Disable-Warp}
     'WarpScan' {Ensure-Admin; [void](Find-WarpEndpoint)}
     'WarpRoutes' {Update-WarpRoutes}
+    'WarpStart' {Ensure-Admin; Invoke-WarpStartAction}
     'WarpImport' {Ensure-Admin; Import-WarpConfig -Path $WarpConfig; if((Get-WarpStatus).Enabled){Start-Warp}}
     'Menu' {Show-Menu}
 }

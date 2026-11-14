@@ -24,6 +24,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -35,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -391,6 +392,29 @@ def nfqws2_path():
 #  Процесс nfqws2 и состояние
 # ----------------------------------------------------------------------------
 
+def run_init(action, timeout=120):
+    """
+    Запуск init-скрипта zapret2. Вывод — в файл, а не в PIPE: init запускает
+    nfqws2 в фоне («nfqws2 ... >/dev/null &»), и тот наследует stderr.
+    С PIPE subprocess ждал бы закрытия потока — то есть до тайм-аута.
+    """
+    log = os.path.join(ZAPRET_TARGET, "init.log")
+    try:
+        with open(log, "w", encoding="utf-8") as f:
+            p = subprocess.run([init_script(), action], stdin=subprocess.DEVNULL,
+                               stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError as e:
+        return 127, str(e)
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            return rc, f.read().strip()
+    except OSError:
+        return rc, ""
+
+
 def nfqws2_running():
     rc, out, _ = run(["pgrep", "-f", nfqws2_path()])
     return rc == 0 and bool(out.strip())
@@ -712,19 +736,19 @@ def start_bypass():
         return
 
     head("Запуск системного обхода...")
-    rc, out, errout = run([init_script(), "start"], timeout=120)
-    time.sleep(2)
+    rc, out = run_init("start")
+    for _ in range(20):
+        if nfqws2_running():
+            break
+        time.sleep(0.25)
     if nfqws2_running():
         ok("Обход запущен, nfqws2 работает")
         if warp_enabled():
-            try:
-                start_warp()
-            except Exception as e:
-                warn(f"WARP не запущен: {e}")
+            start_warp_background()
     else:
         raise RuntimeError(
             "nfqws2 не запустился.\n"
-            + (errout or out or "нет вывода")
+            + (out or "нет вывода")
             + "\nПроверьте: systemctl status, dmesg, наличие nfnetlink_queue"
         )
 
@@ -736,7 +760,7 @@ def stop_bypass():
         return
     head("Остановка обхода...")
     stop_warp(quiet=True)
-    run([init_script(), "stop"], timeout=120)
+    run_init("stop")
     time.sleep(1)
     if nfqws2_running():
         # Крайний случай: добиваем процесс и чистим правила
@@ -1497,7 +1521,7 @@ def uninstall(assume_yes=False):
     print()
     head("[1/4] Остановка обхода...")
     if runtime_installed():
-        run([init_script(), "stop"], timeout=120)
+        run_init("stop")
     run(["pkill", "-f", nfqws2_path()])
     time.sleep(1)
 
@@ -1969,7 +1993,7 @@ def warp_enabled():
 def warp_unit_content():
     return f"""[Unit]
 Description=Zapret2 WARP (sing-box) for sites zapret can't open
-After=network-online.target
+After=network-online.target {SERVICE_NAME}.service
 Wants=network-online.target
 
 [Service]
@@ -2093,7 +2117,63 @@ def start_warp():
     ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
 
 
+def warp_starter_pid():
+    """PID фонового запуска WARP, если он ещё идёт."""
+    try:
+        with open(warp_path("starting.pid")) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def start_warp_background():
+    """
+    Запуск WARP следом за zapret, не задерживая сам обход: проверка узла
+    (а при необходимости и подбор нового) идёт в отдельном процессе.
+    """
+    if warp_starter_pid():
+        info("WARP уже запускается в фоне")
+        return
+    log = warp_path("start.log")
+    os.makedirs(warp_dir(), exist_ok=True)
+    with open(log, "w", encoding="utf-8") as f:
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--action", "warp-start"],
+                             stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    with open(warp_path("starting.pid"), "w") as f:
+        f.write(str(p.pid))
+    info(f"WARP запускается в фоне — статус в меню [11], журнал: {log}")
+
+
+def warp_start_action():
+    """Действие warp-start: запуск WARP, если он включён (используется фоном)."""
+    try:
+        if warp_enabled():
+            start_warp()
+        else:
+            info("WARP выключен")
+    finally:
+        try:
+            os.remove(warp_path("starting.pid"))
+        except OSError:
+            pass
+
+
 def stop_warp(quiet=False):
+    # Остановка во время фонового запуска WARP: прерываем и запуск, иначе он
+    # поднимет sing-box уже после остановки обхода. Себя не трогаем.
+    pid = warp_starter_pid()
+    if pid and pid != os.getpid():
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            os.remove(warp_path("starting.pid"))
+        except OSError:
+            pass
     if os.path.isfile(WARP_UNIT_PATH):
         run(["systemctl", "stop", WARP_SERVICE], timeout=60)
     run(["pkill", "-f", f"{singbox_path()} run"])
@@ -2234,8 +2314,12 @@ def update_warp_routes():
 
 def warp_status_line():
     st = read_json(warp_path("state.json")) or {}
-    state = (_c(C.GREEN, f"работает, узел {st.get('best')}") if warp_running()
-             else _c(C.GRAY, "не запущен"))
+    if warp_running():
+        state = _c(C.GREEN, f"работает, узел {st.get('best')}")
+    elif warp_starter_pid():
+        state = _c(C.YELLOW, "запускается...")
+    else:
+        state = _c(C.GRAY, "не запущен")
     print(f"  WARP: {'включён' if warp_enabled() else 'выключен'} | {state} | "
           f"сайтов в списке: {len(list_entries(warp_list_path()))}")
 
@@ -2245,7 +2329,7 @@ def warp_menu():
         print()
         warp_status_line()
         en = warp_enabled()
-        if en and not warp_running():
+        if en and not warp_running() and not warp_starter_pid():
             le = file_tail(warp_path("last-error.txt"), 6)
             if le:
                 print(_c(C.RED, "  Последняя ошибка:"))
@@ -2459,6 +2543,7 @@ ACTIONS = {
     "warp-scan": None,
     "warp-routes": None,
     "warp-import": None,
+    "warp-start": None,
 }
 
 
@@ -2489,6 +2574,7 @@ def main():
   warp-scan    подобрать лучший узел Cloudflare WARP
   warp-routes  проверить сайты и перенести неоткрывающиеся в WARP
   warp-import  импортировать WireGuard-конфиг WARP (--warp-config <файл>)
+  warp-start   запустить WARP, если он включён (так обход запускает его следом)
 
 Примеры:
   sudo python3 zapret2-linux.py
@@ -2528,6 +2614,7 @@ def main():
         "warp-scan": lambda: (ensure_root(sys.argv), find_warp_endpoint()),
         "warp-routes": update_warp_routes,
         "warp-import": lambda: (ensure_root(sys.argv), warp_import(args.warp_config)),
+        "warp-start": lambda: (ensure_root(sys.argv), warp_start_action()),
     }
     if action in warp_actions:
         try:

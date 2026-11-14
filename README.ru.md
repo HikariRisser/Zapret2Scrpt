@@ -59,6 +59,13 @@ DPI-десинхронизация для всех приложений, обх�
 | Импорт конфига | `-Action WarpImport -WarpConfig wgcf.conf` | `--action warp-import --warp-config wgcf.conf` |
 | Процесс | `sing-box.exe`, запускается вместе с обходом | служба `zapret2win-warp` (нужен systemd) |
 
+**Запуск вместе с обходом.** Если WARP включён, он запускается следом за
+zapret автоматически, в фоне: сам обход стартует сразу, а проверка узла
+Cloudflare (и при необходимости подбор нового) идёт отдельно. Пока это
+происходит, меню показывает «WARP: запускается...»; ход запуска — в
+`logs\warp-start.log` (Linux: `/opt/zapret2/warp/start.log`). Остановка
+обхода останавливает и WARP.
+
 **Если WARP включён, но не запускается**, причина показывается сразу и
 остаётся в меню WARP («Последняя ошибка»). Журналы: Windows —
 `C:\Windows\System32\Zapret2Windows\logs\sing-box*.log`, Linux —
@@ -345,7 +352,7 @@ https://github.com/HikariRisser/Zapret2Scrpt
 Версия хранится в самом скрипте:
 
 ```powershell
-$script:ScriptVersion='1.3.1'
+$script:ScriptVersion='1.3.2'
 ```
 
 Порядок работы:
