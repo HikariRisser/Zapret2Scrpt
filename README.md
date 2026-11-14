@@ -39,6 +39,10 @@ WARP exits through Russian Cloudflare nodes.)
 - 1.6.0: manual profile choice (`tunnel-use --profile N|name|auto`,
   `-Action TunnelUse -TunnelProfile ...`); a manually chosen profile is pinned.
 - 1.6.0: bypass autostart also starts the tunnel.
+- 1.6.1: browsers with their own DNS-over-HTTPS bypassed the tunnel and hung.
+  The tunnel now answers NXDOMAIN for Firefox's canary domain (disables
+  default-on DoH) and zapret keeps handling tunnel-list domains that still go
+  direct; tunnel-bound traffic is excluded by the FakeIP range instead.
 
 Actions: Windows `-Action TunnelOn|TunnelOff|TunnelImport|TunnelSelect|TunnelRoutes|TunnelTest|TunnelList`,
 Linux `--action tunnel-on|tunnel-off|tunnel-import|tunnel-select|tunnel-routes|tunnel-test|tunnel-list`.
@@ -276,7 +280,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.6.0'
+$script:ScriptVersion='1.6.1'
 ```
 
 Flow:

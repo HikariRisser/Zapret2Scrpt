@@ -38,7 +38,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -568,10 +568,13 @@ def build_config():
     hosting = os.path.join(ipd, HOSTING_IPSET_FILE)
     sni = WHITE_SNI
     # Домены, переведённые в туннель, zapret не трогает: их трафик идёт на сервер.
-    wx = f"--hostlist-exclude={os.path.join(ipd, TUNNEL_LIST_FILE)}"
-    # Соединение с самим сервером туннеля zapret тоже не трогает.
-    if list_entries(tunnel_servers_path()):
-        wx += f" --ipset-exclude={tunnel_servers_path()}"
+    # zapret не трогает трафик, идущий в туннель (диапазон FakeIP), и
+    # соединение с самим сервером туннеля - оба исключаются по адресу.
+    # Домены из списка туннеля по имени НЕ исключаются: если браузер обошёл
+    # DNS туннеля (свой DNS через HTTPS, старый адрес в памяти) и пошёл на
+    # сайт напрямую, zapret остаётся запасным путём, как до переноса.
+    ensure_tunnel_ipset()
+    wx = f"--ipset-exclude={tunnel_servers_path()}"
     # Порты серверов WireGuard: zapret маскирует их рукопожатие.
     wg_ports = "".join("," + p for p in tunnel_wg_ports()
                        if p not in ("443", "3478", "51820", "88", "1224", "500", "4500"))
@@ -2701,6 +2704,17 @@ def save_profiles(profiles):
     update_tunnel_servers(profiles)
 
 
+def tunnel_ipset_header():
+    return ["# Адреса, которые zapret не трогает: трафик в туннель (FakeIP) и серверы туннеля.",
+            "# Файл создаётся автоматически.", TUNNEL_FAKE4, TUNNEL_FAKE6]
+
+
+def ensure_tunnel_ipset():
+    """Файл исключений zapret всегда содержит диапазоны FakeIP."""
+    os.makedirs(ipset_dir(), exist_ok=True)
+    merge_list_file(tunnel_servers_path(), tunnel_ipset_header())
+
+
 def update_tunnel_servers(profiles):
     """
     Адреса серверов туннеля — в файл исключений zapret: соединение с самим
@@ -2724,8 +2738,7 @@ def update_tunnel_servers(profiles):
                 ips.append(ip)
     os.makedirs(ipset_dir(), exist_ok=True)
     with open(tunnel_servers_path(), "w", encoding="utf-8") as f:
-        f.write("# Серверы туннеля: zapret их не трогает. Файл создаётся автоматически.\n")
-        f.write("\n".join(ips) + ("\n" if ips else ""))
+        f.write("\n".join(tunnel_ipset_header() + ips) + "\n")
     os.chmod(tunnel_servers_path(), 0o644)
 
 
@@ -2891,6 +2904,7 @@ i=0
 while [ $i -lt 30 ] && ! ip link show "$IF" >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
 ip link show "$IF" >/dev/null 2>&1 || exit 0
 DOMS=$(grep -v '^[[:space:]]*#' "$LIST" 2>/dev/null | tr -d ' \\t\\r' | grep . | sed 's/^/~/' | tr '\\n' ' ')
+[ -n "$DOMS" ] && DOMS="$DOMS ~{DOH_CANARY}"
 resolvectl dns "$IF" {TUNNEL_TUN_DNS4} || exit 0
 if [ -n "$DOMS" ]; then resolvectl domain "$IF" $DOMS; else resolvectl domain "$IF" ""; fi
 resolvectl default-route "$IF" false 2>/dev/null
@@ -2910,6 +2924,43 @@ def tunnel_tun_exists():
 def apply_tunnel_dns():
     if which("resolvectl"):
         run(["/bin/sh", tunnel_dns_script_path()], timeout=40)
+
+
+def firefox_doh_forced():
+    """
+    True, если в Firefox DNS через HTTPS включён вручную (network.trr.mode
+    2 или 3): тогда Firefox не слушает системный DNS и сайты из списка
+    туннеля идут мимо него. Включённый по умолчанию DoH отключается сам.
+    """
+    import glob
+    import pwd
+    homes = set()
+    for name in (os.environ.get("SUDO_USER"), os.environ.get("USER")):
+        try:
+            if name:
+                homes.add(pwd.getpwnam(name).pw_dir)
+        except KeyError:
+            pass
+    for home in homes:
+        for base in (".mozilla/firefox", "snap/firefox/common/.mozilla/firefox",
+                     ".var/app/org.mozilla.firefox/.mozilla/firefox"):
+            for prefs in glob.glob(os.path.join(home, base, "*", "prefs.js")):
+                try:
+                    with open(prefs, encoding="utf-8", errors="replace") as f:
+                        if re.search(r'user_pref\("network\.trr\.mode",\s*[23]\)', f.read()):
+                            return True
+                except OSError:
+                    pass
+    return False
+
+
+def warn_browser_dns():
+    if firefox_doh_forced():
+        warn("В Firefox вручную включён «DNS через HTTPS»: он узнаёт адреса сайтов мимо туннеля.")
+        info("Настройки Firefox -> Приватность и защита -> DNS через HTTPS -> «Отключено», затем перезапустите Firefox.")
+    else:
+        info("Браузер нужно перезапустить: он помнит прежние адреса сайтов. Если в браузере вручную "
+             "включён «Безопасный DNS» (DNS через HTTPS), отключите его.")
 
 
 def check_tunnel_dns():
@@ -2950,7 +3001,8 @@ def build_tunnel_config(profile):
                 # Настоящие адреса сайтов из списка ищем через сам туннель.
                 {"type": "tcp", "tag": "tunnel-dns", "server": "1.1.1.1", "detour": "tunnel"},
             ],
-            "rules": [{"inbound": ["tun-in"], "rule_set": ["tunnel-domains"],
+            "rules": [{"domain": [DOH_CANARY], "action": "predefined", "rcode": "NXDOMAIN"},
+                      {"inbound": ["tun-in"], "rule_set": ["tunnel-domains"],
                        "query_type": ["A", "AAAA"], "server": "fakeip"}],
             "final": "local",
         },
@@ -2991,6 +3043,11 @@ def build_tunnel_config(profile):
 
 
 # --- проверка туннеля ---------------------------------------------------------
+
+# Firefox спрашивает этот домен у системного DNS; ответ «нет такого домена»
+# выключает его встроенный DNS через HTTPS (если тот включён по умолчанию, а
+# не вручную). Иначе Firefox узнаёт адреса сайтов мимо туннеля.
+DOH_CANARY = "use-application-dns.net"
 
 TUNNEL_TRACE_LAST = ""   # чем закончилась последняя проверка туннеля
 TUNNEL_EXIT = {}         # откуда туннель выходит в интернет: loc, colo, ip
@@ -3779,6 +3836,7 @@ def tunnel_test(domains=None):
     ex = read_json(tunnel_path("exit.json")) or {}
     if ex:
         info(f"Выход туннеля: страна {ex.get('loc')}, адрес {ex.get('ip')}")
+    warn_browser_dns()
 
 
 # --- меню ---------------------------------------------------------------------
