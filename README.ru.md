@@ -59,6 +59,13 @@ DPI-десинхронизация для всех приложений, обх�
 | Импорт конфига | `-Action WarpImport -WarpConfig wgcf.conf` | `--action warp-import --warp-config wgcf.conf` |
 | Процесс | `sing-box.exe`, запускается вместе с обходом | служба `zapret2win-warp` (нужен systemd) |
 
+**Если WARP включён, но не запускается**, причина показывается сразу и
+остаётся в меню WARP («Последняя ошибка»). Журналы: Windows —
+`C:\Windows\System32\Zapret2Windows\logs\sing-box*.log`, Linux —
+`journalctl -u zapret2win-warp`. «Ни один узел WARP не ответил» означает,
+что WireGuard к Cloudflare у провайдера не проходит; «sing-box завершился» —
+проблема самого sing-box (адаптер TUN, права), её текст будет в журнале.
+
 **Регистрация.** Скрипт регистрирует бесплатное устройство WARP через API
 Cloudflare так же, как приложение 1.1.1.1 (протокол взят из
 [wgcf](https://github.com/ViRb3/wgcf)). Если регистрация не проходит
@@ -338,7 +345,7 @@ https://github.com/HikariRisser/Zapret2Scrpt
 Версия хранится в самом скрипте:
 
 ```powershell
-$script:ScriptVersion='1.3.0'
+$script:ScriptVersion='1.3.1'
 ```
 
 Порядок работы:

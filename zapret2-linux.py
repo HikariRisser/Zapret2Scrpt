@@ -35,7 +35,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1867,9 +1867,13 @@ def warp_trace(port, timeout=5.0):
     return -1
 
 
-def wait_local_port(port, timeout=4.0):
+def wait_local_port(port, timeout=4.0, proc=None, alive=None):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
+        if proc is not None and proc.poll() is not None:
+            return False
+        if alive is not None and not alive():
+            return False
         if tcp_ok("127.0.0.1", port, timeout=0.3):
             return True
         time.sleep(0.15)
@@ -1881,16 +1885,17 @@ def test_warp_endpoint(endpoint):
     acc = read_json(warp_path("account.json"))
     probe = warp_path("probe.json")
     write_json(probe, {
-        "log": {"level": "error"},
+        "log": {"level": "info"},
         "endpoints": [warp_endpoint_json(acc, endpoint)],
         "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
                       "listen_port": WARP_PROBE_PORT}],
         "route": {"final": "warp", "auto_detect_interface": True},
     })
+    logf = open(warp_path("probe.log"), "w")
     proc = subprocess.Popen([singbox_path(), "run", "-c", probe],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=logf, stderr=subprocess.STDOUT)
     try:
-        if not wait_local_port(WARP_PROBE_PORT):
+        if not wait_local_port(WARP_PROBE_PORT, 8.0, proc):
             return -1
         if warp_trace(WARP_PROBE_PORT, 4.0) < 0:
             return -1
@@ -1902,6 +1907,7 @@ def test_warp_endpoint(endpoint):
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        logf.close()
 
 
 def find_warp_endpoint(skip=()):
@@ -1937,7 +1943,9 @@ def find_warp_endpoint(skip=()):
                 break
     results.sort(key=lambda r: r["ms"])
     if not results:
-        err("Ни один узел WARP не ответил — возможно, WireGuard к Cloudflare заблокирован.")
+        set_warp_error("Ни один узел WARP не ответил.",
+                       ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 8))
+        warn("Возможно, WireGuard к Cloudflare заблокирован провайдером.")
         info("Попробуйте с запущенным zapret (он маскирует рукопожатие) или импортируйте "
              "другой конфиг: --action warp-import --warp-config <файл>")
         return None
@@ -1975,41 +1983,110 @@ WantedBy=multi-user.target
 """
 
 
+def file_tail(path, lines=12):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = re.sub(r"\x1b\[[0-9;]*m", "", f.read())  # цвета sing-box
+            return [ln.rstrip() for ln in text.splitlines() if ln.strip()][-lines:]
+    except OSError:
+        return []
+
+
+def set_warp_error(message, details=()):
+    """Запоминает причину сбоя: её видно в меню WARP, а не только при запуске."""
+    err(message)
+    for ln in details:
+        print(_c(C.GRAY, f"    {ln}"))
+    try:
+        os.makedirs(warp_dir(), exist_ok=True)
+        with open(warp_path("last-error.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+            f.write("\n".join(details) + "\n")
+    except OSError:
+        pass
+
+
+def clear_warp_error():
+    try:
+        os.remove(warp_path("last-error.txt"))
+    except OSError:
+        pass
+
+
+def journal_tail(lines=15):
+    rc, out, _ = run(["journalctl", "-u", WARP_SERVICE, "-n", str(lines),
+                      "--no-pager", "-o", "cat"], timeout=15)
+    return [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+
+
 def start_warp_process(endpoint):
+    """
+    'ok', 'crash' (sing-box завершился: ошибка конфига, TUN, прав — перебор
+    узлов не поможет) или 'notunnel' (sing-box работает, но трафик через
+    WARP не идёт — стоит попробовать другой узел).
+    """
     write_json(warp_path("config.json"), build_warp_config(endpoint))
     rc, out, errout = run([singbox_path(), "check", "-c", warp_path("config.json")], timeout=30)
     if rc != 0:
-        raise RuntimeError(f"конфиг sing-box не прошёл проверку:\n{errout or out}")
+        set_warp_error("Конфиг sing-box не прошёл проверку.", (errout or out).splitlines())
+        return "crash"
     with open(WARP_UNIT_PATH, "w", encoding="utf-8") as f:
         f.write(warp_unit_content())
     run(["systemctl", "daemon-reload"], timeout=60)
+    run(["systemctl", "reset-failed", WARP_SERVICE], timeout=30)
     run(["systemctl", "restart", WARP_SERVICE], timeout=60)
-    if not wait_local_port(WARP_MIXED_PORT, 6.0):
-        return False
-    return warp_trace(WARP_MIXED_PORT, 6.0) >= 0
+    # Создание TUN и маршрутов может занять несколько секунд.
+    if not wait_local_port(WARP_MIXED_PORT, 30.0, alive=warp_running):
+        if warp_running():
+            set_warp_error("sing-box не открыл локальный порт за 30 секунд.", journal_tail())
+        else:
+            set_warp_error("Служба sing-box завершилась при запуске.", journal_tail())
+        return "crash"
+    for _ in range(3):
+        if not warp_running():
+            break
+        if warp_trace(WARP_MIXED_PORT, 6.0) >= 0:
+            clear_warp_error()
+            return "ok"
+        time.sleep(1)
+    if not warp_running():
+        set_warp_error("Служба sing-box завершилась.", journal_tail())
+        return "crash"
+    set_warp_error(f"Через узел {endpoint} не идёт трафик.", journal_tail(8))
+    return "notunnel"
 
 
 def start_warp():
     ensure_root(sys.argv)
     if not which("systemctl"):
-        raise RuntimeError("для WARP нужен systemd (sing-box запускается как служба)")
-    if not os.access(singbox_path(), os.X_OK):
-        install_singbox()
-    if not os.path.isfile(warp_path("account.json")):
-        warp_register()
+        set_warp_error("Для WARP нужен systemd (sing-box запускается как служба).")
+        return
+    try:
+        if not os.access(singbox_path(), os.X_OK):
+            install_singbox()
+        if not os.path.isfile(warp_path("account.json")):
+            warp_register()
+    except Exception as e:
+        lines = str(e).splitlines() or ["ошибка"]
+        set_warp_error(lines[0], lines[1:])
+        return
     stop_warp(quiet=True)
     st = read_json(warp_path("state.json")) or {}
     ep = st.get("best") or find_warp_endpoint()
     if not ep:
         return
-    if not start_warp_process(ep):
+    head(f"Запуск sing-box (узел {ep})...")
+    r = start_warp_process(ep)
+    if r == "notunnel":
         warn(f"Узел {ep} не отвечает, подбираю другой...")
         stop_warp(quiet=True)
         ep = find_warp_endpoint(skip=(ep,))
-        if not ep or not start_warp_process(ep):
-            stop_warp(quiet=True)
-            err("WARP не запущен: туннель не устанавливается")
-            return
+        r = start_warp_process(ep) if ep else "crash"
+    if r != "ok":
+        stop_warp(quiet=True)
+        err("WARP не запущен. Причина выше; она же в меню WARP и в журнале:")
+        info(f"journalctl -u {WARP_SERVICE}")
+        return
     if warp_enabled():
         run(["systemctl", "enable", WARP_SERVICE], timeout=60)
     flush_dns()
@@ -2168,6 +2245,12 @@ def warp_menu():
         print()
         warp_status_line()
         en = warp_enabled()
+        if en and not warp_running():
+            le = file_tail(warp_path("last-error.txt"), 6)
+            if le:
+                print(_c(C.RED, "  Последняя ошибка:"))
+                for ln in le:
+                    print(_c(C.GRAY, f"    {ln}"))
         print(f"  [1] {'Выключить' if en else 'Включить'} WARP")
         print("  [2] Подобрать лучший узел Cloudflare заново")
         print("  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret")
@@ -2178,28 +2261,36 @@ def warp_menu():
             ch = input("\n  Выбор: ").strip()
         except EOFError:
             return
-        if ch == "1":
-            disable_warp() if en else enable_warp()
-        elif ch == "2":
-            find_warp_endpoint()
-        elif ch == "3":
-            update_warp_routes()
-        elif ch == "4":
-            d = input("  Домен (например, example.com): ").strip().lower()
-            if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
-                merge_list_file(warp_list_path(), [d])
-                write_warp_rules()
-                remove_hosts_domains([d])
-                flush_dns()
-                ok(f"{d} добавлен в WARP")
-            else:
-                err("Некорректный домен")
-        elif ch == "5":
-            warp_import(input("  Путь к .conf: ").strip())
-            if warp_enabled():
-                start_warp()
-        elif ch == "0":
+        try:
+            warp_menu_action(ch, en)
+        except Exception as e:
+            set_warp_error(f"Ошибка: {e}")
+        if ch == "0":
             return
+
+
+def warp_menu_action(ch, en):
+    """Одно действие меню WARP; исключения перехватывает warp_menu."""
+    if ch == "1":
+        disable_warp() if en else enable_warp()
+    elif ch == "2":
+        find_warp_endpoint()
+    elif ch == "3":
+        update_warp_routes()
+    elif ch == "4":
+        d = input("  Домен (например, example.com): ").strip().lower()
+        if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
+            merge_list_file(warp_list_path(), [d])
+            write_warp_rules()
+            remove_hosts_domains([d])
+            flush_dns()
+            ok(f"{d} добавлен в WARP")
+        else:
+            err("Некорректный домен")
+    elif ch == "5":
+        warp_import(input("  Путь к .conf: ").strip())
+        if warp_enabled():
+            start_warp()
 
 
 
