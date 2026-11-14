@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -742,7 +742,21 @@ def start_bypass():
         warn("Обход уже запущен")
         return
 
+    # Конфиг от другой версии скрипта переписываем сами: после обновления
+    # скрипта не нужно помнить про пункт [1], а старый конфиг мог быть
+    # нерабочим (до 1.3.4 правила перехвата на nftables не создавались).
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            first = f.readline()
+    except OSError:
+        first = ""
+    if f"zapret2-linux {VERSION}" not in first:
+        seed_lists()
+        write_config()
+        info(f"Конфигурация обновлена до версии {VERSION}")
+
     head("Запуск системного обхода...")
+    run_init("stop")  # убрать остатки правил от прошлого неудачного запуска
     rc, out = run_init("start")
     for _ in range(20):
         if nfqws2_running():
