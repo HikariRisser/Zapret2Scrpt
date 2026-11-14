@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.0'
+$script:ScriptVersion='1.4.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1402,7 +1402,7 @@ function Initialize-Masque {
     try { Install-Usque; Register-Usque; return $true }
     catch {
         $m=$_.Exception.Message -split "`n"
-        Set-WarpError $m[0] @($m | Select-Object -Skip 1)
+        Set-WarpError ('WARP через MASQUE не подготовлен: ' + $m[0]) @($m | Select-Object -Skip 1)
         return $false
     }
 }
@@ -1656,16 +1656,29 @@ function Find-WarpEndpoint {
     if(-not $results.Count){
         # WireGuard не проходит - пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
         Write-Host '  WireGuard к Cloudflare не проходит - пробую WARP через MASQUE...' -ForegroundColor Yellow
-        if(Initialize-Masque){
-            foreach($v in $script:MasqueVariants){
-                & $test $v
-                if($results.Count){ break }
-            }
+        $wgLog=@(Get-FileTail $p.ProbeLog 3)
+        foreach($f in @($p.UsqueProbeLog,$p.ProbeLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
+        if(-not (Initialize-Masque)){
+            # usque не скачался или не зарегистрировался: это и есть причина.
+            # Оставляем её в "Последней ошибке", не затирая общим сообщением.
+            Write-Host '  MASQUE недоступен: причина выше.' -ForegroundColor Yellow
+            return $null
+        }
+        foreach($v in $script:MasqueVariants){
+            & $test $v
+            if($results.Count){ break }
+        }
+        if(-not $results.Count){
+            $u=@(Get-FileTail $p.UsqueProbeLog 8); if(-not $u.Count){ $u=@('<usque ничего не вывел>') }
+            Set-WarpError 'Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).' (@('usque (MASQUE), последняя проба:') + $u + @('sing-box, последняя проба MASQUE:') + @(Get-FileTail $p.ProbeLog 4) + @('WireGuard, последняя проба:') + $wgLog)
+            Write-Host '  Похоже, провайдер блокирует WARP целиком.' -ForegroundColor Yellow
+            Write-Host '  Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).' -ForegroundColor DarkGray
+            return $null
         }
     }
     $ranked=@($results | Sort-Object ms)
     if(-not $ranked.Count){
-        Set-WarpError 'Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).' (@('Журнал последней пробы usque:') + @(Get-FileTail $p.UsqueProbeLog 6) + @('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 6))
+        Set-WarpError 'Ни один узел WARP не ответил.' (@('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 6))
         Write-Host '  Похоже, провайдер блокирует WARP целиком.' -ForegroundColor Yellow
         Write-Host '  Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).' -ForegroundColor DarkGray
         return $null

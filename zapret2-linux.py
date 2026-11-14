@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -2146,7 +2146,7 @@ def ensure_masque():
         return True
     except Exception as e:
         lines = str(e).splitlines() or ["ошибка"]
-        set_warp_error(lines[0], lines[1:])
+        set_warp_error("WARP через MASQUE не подготовлен: " + lines[0], lines[1:])
         return False
 
 
@@ -2329,16 +2329,35 @@ def find_warp_endpoint(skip=()):
     if not results:
         # WireGuard не проходит — пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
         warn("WireGuard к Cloudflare не проходит — пробую WARP через MASQUE...")
-        if ensure_masque():
-            for v in MASQUE_VARIANTS:
-                check(v)
-                if results:
-                    break
+        wg_log = file_tail(warp_path("probe.log"), 3)
+        for stale in ("probe-usque.log", "probe.log"):
+            try:
+                os.remove(warp_path(stale))
+            except OSError:
+                pass
+        if not ensure_masque():
+            # usque не скачался или не зарегистрировался: это и есть причина.
+            # Оставляем её в «Последней ошибке», не затирая общим сообщением.
+            warn("MASQUE недоступен: причина выше.")
+            return None
+        for v in MASQUE_VARIANTS:
+            check(v)
+            if results:
+                break
+        if not results:
+            set_warp_error(
+                "Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).",
+                ["usque (MASQUE), последняя проба:"]
+                + (file_tail(warp_path("probe-usque.log"), 8) or ["<usque ничего не вывел>"])
+                + ["sing-box, последняя проба MASQUE:"] + file_tail(warp_path("probe.log"), 4)
+                + ["WireGuard, последняя проба:"] + wg_log)
+            warn("Похоже, провайдер блокирует WARP целиком.")
+            info("Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).")
+            return None
     results.sort(key=lambda r: r["ms"])
     if not results:
-        set_warp_error("Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).",
-                       ["Журнал последней пробы usque:"] + file_tail(warp_path("probe-usque.log"), 6)
-                       + ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 6))
+        set_warp_error("Ни один узел WARP не ответил.",
+                       ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 6))
         warn("Похоже, провайдер блокирует WARP целиком.")
         info("Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).")
         return None
