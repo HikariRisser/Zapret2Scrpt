@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.3.2'
+$script:ScriptVersion='1.4.0'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1186,6 +1186,14 @@ function Toggle-Autostart {
 $script:SingBoxVersion='1.14.4'
 $script:WarpMixedPort=40480     # локальный прокси sing-box для проверок
 $script:WarpProbePort=40481     # порт для пробных туннелей при подборе узла
+# WARP через MASQUE (usque) - запасной транспорт, когда WireGuard к
+# Cloudflare не проходит: туннель через HTTP/3 (QUIC) или HTTP/2 (TCP 443).
+# usque отдаёт туннель как локальный SOCKS5, sing-box направляет в него
+# домены из списка WARP. "Узел" записывается как masque:<h3|h2>:<порт>.
+$script:UsqueVersion='4.2.1'
+$script:UsquePort=40482
+$script:UsqueProbePort=40483
+$script:MasqueVariants=@('masque:h3:443','masque:h3:4500','masque:h3:500','masque:h3:1701','masque:h2:443')
 $script:WarpPrefixes=@('162.159.192','162.159.193','162.159.195','188.114.96','188.114.97','188.114.98','188.114.99')
 $script:WarpPorts=@(2408,500,1701,4500)
 $script:WarpApi='https://api.cloudflareclient.com/v0a5641/reg'
@@ -1198,6 +1206,10 @@ function Get-WarpPaths {
         Dir=$d
         Exe=Join-Path $d 'sing-box.exe'
         Account=Join-Path $d 'account.json'
+        Usque=Join-Path $d 'usque.exe'
+        UsqueConfig=Join-Path $d 'usque.json'
+        UsqueLog=Join-Path $script:TrustedRuntime 'logs\usque.log'
+        UsqueProbeLog=Join-Path $script:TrustedRuntime 'logs\usque-probe.log'
         State=Join-Path $d 'state.json'
         Config=Join-Path $d 'config.json'
         Probe=Join-Path $d 'probe.json'
@@ -1341,6 +1353,84 @@ function Import-WarpConfig {
     Write-Host '  Конфиг WARP импортирован. Узел будет подобран заново.' -ForegroundColor Green
 }
 
+function Test-Masque { param([string]$Endpoint) return ($Endpoint -like 'masque:*') }
+
+function Install-Usque {
+    # Скачивает официальную сборку usque с GitHub (один раз).
+    $ErrorActionPreference='Continue'
+    $p=Get-WarpPaths
+    New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
+    if(Test-Path $p.Usque){
+        $v=(& $p.Usque version 2>&1 | Out-String)
+        if($v -match [regex]::Escape($script:UsqueVersion)){ return }
+    }
+    $arch=$env:PROCESSOR_ARCHITEW6432; if(-not $arch){ $arch=$env:PROCESSOR_ARCHITECTURE }
+    $uArch=switch($arch){ 'AMD64' {'amd64'} 'ARM64' {'arm64'} 'x86' {'386'} default {'amd64'} }
+    $url="https://github.com/Diniboy1123/usque/releases/download/v$($script:UsqueVersion)/usque_$($script:UsqueVersion)_windows_$uArch.zip"
+    $tmp=Join-Path $env:TEMP ("usque-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        Write-Host "  Скачивание usque $($script:UsqueVersion) (WARP через MASQUE)..." -ForegroundColor Yellow
+        Write-Host "    $url" -ForegroundColor DarkGray
+        [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+        $zip=Join-Path $tmp 'usque.zip'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
+        $exe=Get-ChildItem -Path $tmp -Recurse -Filter 'usque.exe' | Select-Object -First 1
+        if(-not $exe){ throw "В архиве нет usque.exe: $url" }
+        Copy-Item $exe.FullName $p.Usque -Force
+    } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host "  usque установлен: $($p.Usque)" -ForegroundColor Green
+}
+
+function Register-Usque {
+    # Регистрация устройства WARP для MASQUE (отдельная от WireGuard).
+    $ErrorActionPreference='Continue'
+    $p=Get-WarpPaths
+    if(Test-Path $p.UsqueConfig){ return }
+    Write-Host '  Регистрация устройства WARP (MASQUE)...' -ForegroundColor Yellow
+    $out=& $p.Usque -c $p.UsqueConfig register -a -n zapret2 2>&1
+    if($LASTEXITCODE -ne 0 -or -not (Test-Path $p.UsqueConfig)){
+        Remove-Item $p.UsqueConfig -Force -ErrorAction SilentlyContinue
+        throw ("Не удалось зарегистрировать WARP (MASQUE):`n" + (($out | Select-Object -Last 4 | ForEach-Object { "$_" }) -join "`n"))
+    }
+    Write-Host '  Устройство WARP (MASQUE) зарегистрировано.' -ForegroundColor Green
+}
+
+function Initialize-Masque {
+    # usque установлен и зарегистрирован; $false (с сохранённой ошибкой), если нет.
+    try { Install-Usque; Register-Usque; return $true }
+    catch {
+        $m=$_.Exception.Message -split "`n"
+        Set-WarpError $m[0] @($m | Select-Object -Skip 1)
+        return $false
+    }
+}
+
+function Get-UsqueArgs {
+    param([string]$Endpoint,[int]$Port)
+    $parts=$Endpoint -split ':'
+    $a=@('-c',"`"$((Get-WarpPaths).UsqueConfig)`"",'socks','-b','127.0.0.1','-p',"$Port",'-P',$parts[2])
+    if($parts[1] -eq 'h2'){ $a+='--http2' }
+    return $a
+}
+
+function New-MasqueOutbound {
+    param([int]$Port)
+    [ordered]@{ type='socks'; tag='warp'; server='127.0.0.1'; server_port=$Port; version='5' }
+}
+
+function Stop-Usque {
+    $p=Get-WarpPaths
+    for($i=0;$i -lt 10;$i++){
+        $procs=@(Get-CimInstance Win32_Process -Filter "Name='usque.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.ExecutablePath -eq $p.Usque })
+        if(-not $procs.Count){ break }
+        $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 300
+    }
+}
+
 function New-WarpEndpointJson {
     param($Acc,[string]$Endpoint)
     $ip,$port=$Endpoint -split ':'
@@ -1372,7 +1462,8 @@ function Write-WarpRules {
 function Write-WarpConfig {
     param([string]$Endpoint)
     $p=Get-WarpPaths
-    $acc=Read-JsonFile $p.Account
+    $masque=Test-Masque $Endpoint
+    $acc=if($masque){ $null } else { Read-JsonFile $p.Account }
     Write-WarpRules
     $cfg=[ordered]@{
         log=[ordered]@{ level='warn'; timestamp=$true; output=$p.Log }
@@ -1385,7 +1476,7 @@ function Write-WarpConfig {
             rules=@([ordered]@{ inbound=@('tun-in'); rule_set=@('warp-domains'); query_type=@('A','AAAA'); server='fakeip' })
             final='local'
         }
-        endpoints=@(New-WarpEndpointJson $acc $Endpoint)
+        endpoints=@()
         inbounds=@(
             [ordered]@{
                 type='tun'; tag='tun-in'; interface_name='Zapret2WARP'
@@ -1411,19 +1502,27 @@ function Write-WarpConfig {
         }
         experimental=[ordered]@{ cache_file=[ordered]@{ enabled=$true; path=$p.Cache; store_fakeip=$true } }
     }
+    if($masque){
+        $cfg.Remove('endpoints')
+        $cfg.outbounds=@($cfg.outbounds)+@(New-MasqueOutbound $script:UsquePort)
+        $cfg.dns.servers[2].type='tcp'   # через SOCKS usque DNS надёжнее по TCP
+    } else {
+        $cfg.endpoints=@(New-WarpEndpointJson $acc $Endpoint)
+    }
     Write-JsonFile $p.Config $cfg
 }
 
 function Write-WarpProbeConfig {
     param([string]$Endpoint,[int]$Port)
     $p=Get-WarpPaths
-    $acc=Read-JsonFile $p.Account
-    Write-JsonFile $p.Probe ([ordered]@{
+    $cfg=[ordered]@{
         log=[ordered]@{ level='info' }
-        endpoints=@(New-WarpEndpointJson $acc $Endpoint)
         inbounds=@([ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$Port })
         route=[ordered]@{ final='warp'; auto_detect_interface=$true }
-    })
+    }
+    if(Test-Masque $Endpoint){ $cfg.outbounds=@(New-MasqueOutbound $script:UsqueProbePort) }
+    else { $cfg.endpoints=@(New-WarpEndpointJson (Read-JsonFile $p.Account) $Endpoint) }
+    Write-JsonFile $p.Probe $cfg
 }
 
 function Get-FileTail {
@@ -1489,17 +1588,33 @@ function Test-WarpEndpoint {
     param([string]$Endpoint)
     $p=Get-WarpPaths
     Write-WarpProbeConfig -Endpoint $Endpoint -Port $script:WarpProbePort
+    $masque=Test-Masque $Endpoint
+    $uproc=$null
+    if($masque){
+        $uproc=Start-Process -FilePath $p.Usque -ArgumentList (Get-UsqueArgs $Endpoint $script:UsqueProbePort) -WindowStyle Hidden -PassThru `
+                   -RedirectStandardError $p.UsqueProbeLog -RedirectStandardOutput "$($p.UsqueProbeLog).out"
+    }
     $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Probe)`"") -WindowStyle Hidden -PassThru `
               -RedirectStandardError $p.ProbeLog -RedirectStandardOutput "$($p.ProbeLog).out"
     try {
+        if($uproc -and -not (Wait-LocalPort $script:UsqueProbePort 8000 $uproc)){ return -1 }
         if(-not (Wait-LocalPort $script:WarpProbePort 8000 $proc)){ return -1 }
-        if((Invoke-WarpTrace $script:WarpProbePort 4000) -lt 0){ return -1 }
+        # MASQUE-туннель устанавливается дольше WireGuard: до трёх попыток.
+        $okFirst=$false
+        foreach($i in 1..$(if($masque){3}else{1})){
+            if((Invoke-WarpTrace $script:WarpProbePort 4000) -ge 0){ $okFirst=$true; break }
+        }
+        if(-not $okFirst){ return -1 }
         $t=@(); foreach($i in 1..2){ $x=Invoke-WarpTrace $script:WarpProbePort 3000; if($x -ge 0){ $t+=$x } }
         if(-not $t.Count){ return -1 }
         return ($t | Measure-Object -Minimum).Minimum
     } finally {
         if(-not $proc.HasExited){ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
         $proc.WaitForExit(3000) | Out-Null
+        if($uproc){
+            if(-not $uproc.HasExited){ Stop-Process -Id $uproc.Id -Force -ErrorAction SilentlyContinue }
+            $uproc.WaitForExit(3000) | Out-Null
+        }
     }
 }
 
@@ -1513,8 +1628,11 @@ function Find-WarpEndpoint {
     Stop-Warp -Quiet
     $rnd=New-Object Random
     $cands=New-Object System.Collections.Generic.List[string]
-    $cands.Add('162.159.192.1:2408')
-    foreach($pre in $script:WarpPrefixes){ $cands.Add(("{0}.{1}:2408" -f $pre,$rnd.Next(1,255))) }
+    $haveWg=Test-Path $p.Account
+    if($haveWg){
+        $cands.Add('162.159.192.1:2408')
+        foreach($pre in $script:WarpPrefixes){ $cands.Add(("{0}.{1}:2408" -f $pre,$rnd.Next(1,255))) }
+    }
     $results=New-Object System.Collections.Generic.List[object]
     Write-Host '  Подбор узла Cloudflare WARP...' -ForegroundColor Yellow
     $test={
@@ -1526,7 +1644,7 @@ function Find-WarpEndpoint {
         else { Write-Host 'нет ответа' -ForegroundColor DarkGray }
     }
     foreach($c in $cands){ & $test $c }
-    if($results.Count -lt 2){
+    if($haveWg -and $results.Count -lt 2){
         foreach($port in ($script:WarpPorts | Where-Object { $_ -ne 2408 })){
             foreach($pre in $script:WarpPrefixes){
                 & $test ("{0}.{1}:{2}" -f $pre,$rnd.Next(1,255),$port)
@@ -1535,12 +1653,21 @@ function Find-WarpEndpoint {
             if($results.Count -ge 3){ break }
         }
     }
+    if(-not $results.Count){
+        # WireGuard не проходит - пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
+        Write-Host '  WireGuard к Cloudflare не проходит - пробую WARP через MASQUE...' -ForegroundColor Yellow
+        if(Initialize-Masque){
+            foreach($v in $script:MasqueVariants){
+                & $test $v
+                if($results.Count){ break }
+            }
+        }
+    }
     $ranked=@($results | Sort-Object ms)
     if(-not $ranked.Count){
-        Set-WarpError 'Ни один узел WARP не ответил.' (@('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 8))
-        Write-Host '  Возможно, WireGuard к Cloudflare заблокирован провайдером.' -ForegroundColor Yellow
-        Write-Host '  Попробуйте с запущенным обходом zapret (он маскирует рукопожатие) или импортируйте' -ForegroundColor DarkGray
-        Write-Host '  другой конфиг: -Action WarpImport -WarpConfig <файл>.' -ForegroundColor DarkGray
+        Set-WarpError 'Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).' (@('Журнал последней пробы usque:') + @(Get-FileTail $p.UsqueProbeLog 6) + @('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 6))
+        Write-Host '  Похоже, провайдер блокирует WARP целиком.' -ForegroundColor Yellow
+        Write-Host '  Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).' -ForegroundColor DarkGray
         return $null
     }
     Write-JsonFile $p.State ([ordered]@{ best=$ranked[0].endpoint; ranked=$ranked; tested=(Get-Date).ToString('s') })
@@ -1574,6 +1701,18 @@ function Start-WarpProcess {
     # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
     $ErrorActionPreference='Continue'
     $p=Get-WarpPaths
+    $masque=Test-Masque $Endpoint
+    if($masque){
+        if(-not (Initialize-Masque)){ return 'crash' }
+        Stop-Usque
+        Remove-Item $p.UsqueLog -Force -ErrorAction SilentlyContinue
+        $uproc=Start-Process -FilePath $p.Usque -ArgumentList (Get-UsqueArgs $Endpoint $script:UsquePort) -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru `
+                   -RedirectStandardError $p.UsqueLog -RedirectStandardOutput "$($p.UsqueLog).out"
+        if(-not (Wait-LocalPort $script:UsquePort 15000 $uproc)){
+            Set-WarpError 'usque (MASQUE) не запустился.' @(Get-FileTail $p.UsqueLog 10)
+            return 'crash'
+        }
+    }
     Write-WarpConfig -Endpoint $Endpoint
     $chk=& $p.Exe check -c $p.Config 2>&1
     if($LASTEXITCODE -ne 0){
@@ -1598,7 +1737,7 @@ function Start-WarpProcess {
         return 'crash'
     }
     # Рукопожатие WireGuard и маршруты TUN - даём три попытки.
-    foreach($i in 1..3){
+    foreach($i in 1..$(if($masque){5}else{3})){
         if($proc.HasExited){ break }
         if((Invoke-WarpTrace $script:WarpMixedPort 6000) -ge 0){ Clear-WarpError; return 'ok' }
         Start-Sleep -Seconds 1
@@ -1607,7 +1746,7 @@ function Start-WarpProcess {
         Set-WarpError ("sing-box завершился с кодом $($proc.ExitCode).") (@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10))
         return 'crash'
     }
-    Set-WarpError "Через узел $Endpoint не идёт трафик." @(Get-FileTail $p.Log 8)
+    Set-WarpError "Через узел $Endpoint не идёт трафик." (@(if($masque){ Get-FileTail $p.UsqueLog 6 }) + @(Get-FileTail $p.Log 8))
     return 'notunnel'
 }
 
@@ -1616,10 +1755,13 @@ function Start-Warp {
     $p=Get-WarpPaths
     try {
         if(-not (Test-Path $p.Exe)){ Install-SingBox }
-        if(-not (Test-Path $p.Account)){ New-WarpAccount }
     } catch {
         Set-WarpError ($_.Exception.Message -split "`n")[0] @(($_.Exception.Message -split "`n") | Select-Object -Skip 1)
         return
+    }
+    if(-not (Test-Path $p.Account) -and -not (Test-Path $p.UsqueConfig)){
+        # Не фатально: остаётся транспорт MASQUE со своей регистрацией.
+        try { New-WarpAccount } catch { Write-Host ('  ' + ($_.Exception.Message -split "`n")[0]) -ForegroundColor Yellow }
     }
     Stop-Warp -Quiet
     $st=Read-JsonFile $p.State
@@ -1693,6 +1835,7 @@ function Stop-Warp {
         Start-Sleep -Milliseconds 300
     }
     Remove-Item $p.Pid -Force -ErrorAction SilentlyContinue
+    Stop-Usque
     if(-not $Quiet){ Write-Host '  WARP остановлен.' -ForegroundColor Yellow }
 }
 

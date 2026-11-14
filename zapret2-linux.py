@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.5"
+VERSION = "1.4.0"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1752,12 +1752,13 @@ def uninstall(assume_yes=False):
     stop_warp(quiet=True)
 
     head("[2/4] Удаление службы...")
-    run(["systemctl", "disable", WARP_SERVICE], timeout=60)
-    if os.path.isfile(WARP_UNIT_PATH):
-        try:
-            os.remove(WARP_UNIT_PATH)
-        except OSError:
-            pass
+    for svc, unit in ((WARP_SERVICE, WARP_UNIT_PATH), (USQUE_SERVICE, USQUE_UNIT_PATH)):
+        run(["systemctl", "disable", svc], timeout=60)
+        if os.path.isfile(unit):
+            try:
+                os.remove(unit)
+            except OSError:
+                pass
     run(["systemctl", "disable", SERVICE_NAME], timeout=60)
     run(["systemctl", "stop", SERVICE_NAME], timeout=60)
     if os.path.isfile(UNIT_PATH):
@@ -2044,12 +2045,118 @@ def write_warp_rules():
                {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
 
 
+# --- WARP через MASQUE (usque) ---------------------------------------------
+# Запасной транспорт, когда WireGuard к Cloudflare не проходит. usque —
+# открытая реализация MASQUE-режима клиента WARP: туннель через HTTP/3
+# (QUIC, UDP) или HTTP/2 (обычный TCP 443). usque отдаёт туннель как
+# локальный SOCKS5, sing-box направляет в него домены из списка WARP.
+# «Узел» такого транспорта записывается как masque:<h3|h2>:<порт>.
+
+USQUE_VERSION = "4.2.1"
+USQUE_SERVICE = "zapret2win-warp-masque"
+USQUE_UNIT_PATH = f"/etc/systemd/system/{USQUE_SERVICE}.service"
+USQUE_PORT = 40482
+USQUE_PROBE_PORT = 40483
+MASQUE_VARIANTS = ["masque:h3:443", "masque:h3:4500", "masque:h3:500",
+                   "masque:h3:1701", "masque:h2:443"]
+
+
+def is_masque(endpoint):
+    return str(endpoint).startswith("masque:")
+
+
+def usque_path():
+    return warp_path("usque")
+
+
+def usque_config():
+    return warp_path("usque.json")
+
+
+def usque_arch():
+    return {"amd64": "amd64", "arm64": "arm64", "armv7": "armv7", "386": "386"}.get(singbox_arch() or "")
+
+
+def install_usque():
+    """Скачивает официальную сборку usque с GitHub (один раз)."""
+    exe = usque_path()
+    if os.access(exe, os.X_OK):
+        rc, out, errout = run([exe, "version"], timeout=15)
+        if rc == 0 and USQUE_VERSION in (out + errout):
+            return
+    arch = usque_arch()
+    if not arch:
+        raise RuntimeError(f"нет сборки usque для архитектуры {platform.machine()}")
+    url = (f"https://github.com/Diniboy1123/usque/releases/download/"
+           f"v{USQUE_VERSION}/usque_{USQUE_VERSION}_linux_{arch}.zip")
+    head(f"Скачивание usque {USQUE_VERSION} (WARP через MASQUE)...")
+    info(url)
+    import zipfile
+    os.makedirs(warp_dir(), exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="usque-")
+    try:
+        zpath = os.path.join(tmpdir, "usque.zip")
+        download(url, zpath)
+        with zipfile.ZipFile(zpath) as zf, zf.open("usque") as src, open(exe + ".new", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.chmod(exe + ".new", 0o755)
+        os.replace(exe + ".new", exe)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    ok(f"usque установлен: {exe}")
+
+
+def usque_register():
+    """Регистрация устройства WARP для MASQUE (отдельная от WireGuard)."""
+    if os.path.isfile(usque_config()):
+        return
+    head("Регистрация устройства WARP (MASQUE)...")
+    rc, out, errout = run([usque_path(), "-c", usque_config(), "register", "-a", "-n", "zapret2"],
+                          timeout=90)
+    if rc != 0 or not os.path.isfile(usque_config()):
+        try:
+            os.remove(usque_config())
+        except OSError:
+            pass
+        raise RuntimeError("не удалось зарегистрировать WARP (MASQUE):\n"
+                           + "\n".join((errout or out).splitlines()[-4:]))
+    os.chmod(usque_config(), 0o600)
+    ok("Устройство WARP (MASQUE) зарегистрировано")
+
+
+def usque_args(endpoint, port):
+    _, proto, cport = endpoint.split(":")
+    args = [usque_path(), "-c", usque_config(), "socks", "-b", "127.0.0.1",
+            "-p", str(port), "-P", cport]
+    if proto == "h2":
+        args.append("--http2")
+    return args
+
+
+def masque_outbound(port):
+    return {"type": "socks", "tag": "warp", "server": "127.0.0.1",
+            "server_port": port, "version": "5"}
+
+
+def ensure_masque():
+    """usque установлен и зарегистрирован; False (с сохранённой ошибкой), если нет."""
+    try:
+        install_usque()
+        usque_register()
+        return True
+    except Exception as e:
+        lines = str(e).splitlines() or ["ошибка"]
+        set_warp_error(lines[0], lines[1:])
+        return False
+
+
 def ipv6_available():
     return os.path.isfile("/proc/net/if_inet6")
 
 
 def build_warp_config(endpoint):
-    acc = read_json(warp_path("account.json"))
+    masque = is_masque(endpoint)
+    acc = None if masque else read_json(warp_path("account.json"))
     write_warp_rules()
     # Без IPv6 в системе sing-box не сможет назначить TUN v6-адрес и упадёт.
     v6 = ipv6_available()
@@ -2062,13 +2169,15 @@ def build_warp_config(endpoint):
             "servers": [
                 {"type": "local", "tag": "local"},
                 fake,
-                {"type": "udp", "tag": "warp-dns", "server": "1.1.1.1", "detour": "warp"},
+                # Через SOCKS usque DNS надёжнее по TCP.
+                {"type": "tcp" if masque else "udp", "tag": "warp-dns",
+                 "server": "1.1.1.1", "detour": "warp"},
             ],
             "rules": [{"inbound": ["tun-in"], "rule_set": ["warp-domains"],
                        "query_type": ["A", "AAAA"], "server": "fakeip"}],
             "final": "local",
         },
-        "endpoints": [warp_endpoint_json(acc, endpoint)],
+        "endpoints": [] if masque else [warp_endpoint_json(acc, endpoint)],
         "inbounds": [
             {
                 "type": "tun", "tag": "tun-in", "interface_name": "zapret2warp",
@@ -2081,7 +2190,8 @@ def build_warp_config(endpoint):
             {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
              "listen_port": WARP_MIXED_PORT},
         ],
-        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}]
+                     + ([masque_outbound(USQUE_PORT)] if masque else []),
         "route": {
             "rule_set": [{"type": "local", "tag": "warp-domains", "format": "source",
                           "path": warp_path("rules-warp.json")}],
@@ -2130,22 +2240,40 @@ def wait_local_port(port, timeout=4.0, proc=None, alive=None):
 
 def test_warp_endpoint(endpoint):
     """Пробный туннель: 3 запроса, задержка — лучший из 2-го и 3-го."""
-    acc = read_json(warp_path("account.json"))
+    masque = is_masque(endpoint)
     probe = warp_path("probe.json")
-    write_json(probe, {
+    cfg = {
         "log": {"level": "info"},
-        "endpoints": [warp_endpoint_json(acc, endpoint)],
         "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
                       "listen_port": WARP_PROBE_PORT}],
         "route": {"final": "warp", "auto_detect_interface": True},
-    })
+    }
+    if masque:
+        cfg["outbounds"] = [masque_outbound(USQUE_PROBE_PORT)]
+    else:
+        cfg["endpoints"] = [warp_endpoint_json(read_json(warp_path("account.json")), endpoint)]
+    write_json(probe, cfg)
+    uproc = ulog = None
+    if masque:
+        ulog = open(warp_path("probe-usque.log"), "w")
+        uproc = subprocess.Popen(usque_args(endpoint, USQUE_PROBE_PORT),
+                                 stdout=ulog, stderr=subprocess.STDOUT)
     logf = open(warp_path("probe.log"), "w")
     proc = subprocess.Popen([singbox_path(), "run", "-c", probe],
                             stdout=logf, stderr=subprocess.STDOUT)
     try:
+        if uproc and not wait_local_port(USQUE_PROBE_PORT, 8.0, uproc):
+            return -1
         if not wait_local_port(WARP_PROBE_PORT, 8.0, proc):
             return -1
-        if warp_trace(WARP_PROBE_PORT, 4.0) < 0:
+        if masque:
+            # MASQUE-туннель устанавливается дольше WireGuard: даём до 12 с.
+            for _ in range(3):
+                if warp_trace(WARP_PROBE_PORT, 4.0) >= 0:
+                    break
+            else:
+                return -1
+        elif warp_trace(WARP_PROBE_PORT, 4.0) < 0:
             return -1
         times = [t for t in (warp_trace(WARP_PROBE_PORT, 3.0) for _ in range(2)) if t >= 0]
         return min(times) if times else -1
@@ -2156,6 +2284,13 @@ def test_warp_endpoint(endpoint):
         except subprocess.TimeoutExpired:
             proc.kill()
         logf.close()
+        if uproc:
+            uproc.terminate()
+            try:
+                uproc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                uproc.kill()
+            ulog.close()
 
 
 def find_warp_endpoint(skip=()):
@@ -2163,7 +2298,9 @@ def find_warp_endpoint(skip=()):
     import random
     was_running = warp_running()
     stop_warp(quiet=True)
-    cands = ["162.159.192.1:2408"] + [f"{p}.{random.randint(1, 254)}:2408" for p in WARP_PREFIXES]
+    have_wg = os.path.isfile(warp_path("account.json"))
+    cands = (["162.159.192.1:2408"] + [f"{p}.{random.randint(1, 254)}:2408" for p in WARP_PREFIXES]
+             if have_wg else [])
     results = []
     head("Подбор узла Cloudflare WARP...")
 
@@ -2181,7 +2318,7 @@ def find_warp_endpoint(skip=()):
 
     for c in cands:
         check(c)
-    if len(results) < 2:
+    if have_wg and len(results) < 2:
         for port in WARP_PORTS[1:]:
             for p in WARP_PREFIXES:
                 check(f"{p}.{random.randint(1, 254)}:{port}")
@@ -2189,13 +2326,21 @@ def find_warp_endpoint(skip=()):
                     break
             if len(results) >= 3:
                 break
+    if not results:
+        # WireGuard не проходит — пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
+        warn("WireGuard к Cloudflare не проходит — пробую WARP через MASQUE...")
+        if ensure_masque():
+            for v in MASQUE_VARIANTS:
+                check(v)
+                if results:
+                    break
     results.sort(key=lambda r: r["ms"])
     if not results:
-        set_warp_error("Ни один узел WARP не ответил.",
-                       ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 8))
-        warn("Возможно, WireGuard к Cloudflare заблокирован провайдером.")
-        info("Попробуйте с запущенным zapret (он маскирует рукопожатие) или импортируйте "
-             "другой конфиг: --action warp-import --warp-config <файл>")
+        set_warp_error("Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).",
+                       ["Журнал последней пробы usque:"] + file_tail(warp_path("probe-usque.log"), 6)
+                       + ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 6))
+        warn("Похоже, провайдер блокирует WARP целиком.")
+        info("Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).")
         return None
     write_json(warp_path("state.json"), {"best": results[0]["endpoint"], "ranked": results,
                                          "tested": datetime.now().isoformat(timespec="seconds")})
@@ -2214,10 +2359,38 @@ def warp_enabled():
     return os.path.isfile(warp_path("enabled"))
 
 
+def usque_unit_content(endpoint):
+    return f"""[Unit]
+Description=Zapret2 WARP over MASQUE (usque)
+After=network-online.target {SERVICE_NAME}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={' '.join(usque_args(endpoint, USQUE_PORT))}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def usque_running():
+    rc, _, _ = run(["systemctl", "is-active", "--quiet", USQUE_SERVICE], timeout=10)
+    return rc == 0
+
+
+def usque_journal(lines=10):
+    rc, out, _ = run(["journalctl", "-u", USQUE_SERVICE, "-n", str(lines),
+                      "--no-pager", "-o", "cat"], timeout=15)
+    return [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+
+
 def warp_unit_content():
     return f"""[Unit]
 Description=Zapret2 WARP (sing-box) for sites zapret can't open
-After=network-online.target {SERVICE_NAME}.service
+After=network-online.target {SERVICE_NAME}.service {USQUE_SERVICE}.service
 Wants=network-online.target
 
 [Service]
@@ -2273,6 +2446,17 @@ def start_warp_process(endpoint):
     узлов не поможет) или 'notunnel' (sing-box работает, но трафик через
     WARP не идёт — стоит попробовать другой узел).
     """
+    if is_masque(endpoint):
+        if not ensure_masque():
+            return "crash"
+        with open(USQUE_UNIT_PATH, "w", encoding="utf-8") as f:
+            f.write(usque_unit_content(endpoint))
+        run(["systemctl", "daemon-reload"], timeout=60)
+        run(["systemctl", "reset-failed", USQUE_SERVICE], timeout=30)
+        run(["systemctl", "restart", USQUE_SERVICE], timeout=60)
+        if not wait_local_port(USQUE_PORT, 15.0, alive=usque_running):
+            set_warp_error("usque (MASQUE) не запустился.", usque_journal())
+            return "crash"
     write_json(warp_path("config.json"), build_warp_config(endpoint))
     rc, out, errout = run([singbox_path(), "check", "-c", warp_path("config.json")], timeout=30)
     if rc != 0:
@@ -2290,7 +2474,7 @@ def start_warp_process(endpoint):
         else:
             set_warp_error("Служба sing-box завершилась при запуске.", journal_tail())
         return "crash"
-    for _ in range(3):
+    for _ in range(5 if is_masque(endpoint) else 3):
         if not warp_running():
             break
         if warp_trace(WARP_MIXED_PORT, 6.0) >= 0:
@@ -2300,7 +2484,8 @@ def start_warp_process(endpoint):
     if not warp_running():
         set_warp_error("Служба sing-box завершилась.", journal_tail())
         return "crash"
-    set_warp_error(f"Через узел {endpoint} не идёт трафик.", journal_tail(8))
+    set_warp_error(f"Через узел {endpoint} не идёт трафик.",
+                   (usque_journal(6) if is_masque(endpoint) else []) + journal_tail(8))
     return "notunnel"
 
 
@@ -2312,12 +2497,16 @@ def start_warp():
     try:
         if not os.access(singbox_path(), os.X_OK):
             install_singbox()
-        if not os.path.isfile(warp_path("account.json")):
-            warp_register()
     except Exception as e:
         lines = str(e).splitlines() or ["ошибка"]
         set_warp_error(lines[0], lines[1:])
         return
+    if not os.path.isfile(warp_path("account.json")) and not os.path.isfile(usque_config()):
+        try:
+            warp_register()
+        except Exception as e:
+            # Не фатально: остаётся транспорт MASQUE со своей регистрацией.
+            warn(str(e).splitlines()[0])
     stop_warp(quiet=True)
     st = read_json(warp_path("state.json")) or {}
     ep = st.get("best") or find_warp_endpoint()
@@ -2337,6 +2526,10 @@ def start_warp():
         return
     if warp_enabled():
         run(["systemctl", "enable", WARP_SERVICE], timeout=60)
+        if is_masque(ep):
+            run(["systemctl", "enable", USQUE_SERVICE], timeout=60)
+        else:
+            run(["systemctl", "disable", USQUE_SERVICE], timeout=60)
     flush_dns()
     ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
 
@@ -2401,6 +2594,9 @@ def stop_warp(quiet=False):
     if os.path.isfile(WARP_UNIT_PATH):
         run(["systemctl", "stop", WARP_SERVICE], timeout=60)
     run(["pkill", "-f", f"{singbox_path()} run"])
+    if os.path.isfile(USQUE_UNIT_PATH):
+        run(["systemctl", "stop", USQUE_SERVICE], timeout=60)
+    run(["pkill", "-f", f"{usque_path()} -c"])
     if not quiet:
         ok("WARP остановлен")
 
@@ -2434,6 +2630,8 @@ def disable_warp():
     stop_warp()
     if os.path.isfile(WARP_UNIT_PATH):
         run(["systemctl", "disable", WARP_SERVICE], timeout=60)
+    if os.path.isfile(USQUE_UNIT_PATH):
+        run(["systemctl", "disable", USQUE_SERVICE], timeout=60)
     flush_dns()
 
 

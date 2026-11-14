@@ -59,6 +59,18 @@ DPI-десинхронизация для всех приложений, обх�
 | Импорт конфига | `-Action WarpImport -WarpConfig wgcf.conf` | `--action warp-import --warp-config wgcf.conf` |
 | Процесс | `sing-box.exe`, запускается вместе с обходом | служба `zapret2win-warp` (нужен systemd) |
 
+**WARP через MASQUE (1.4.0).** Если ни один узел WireGuard не отвечает,
+скрипт сам переходит на второй транспорт — MASQUE, тот же бесплатный WARP
+через HTTP/3 (QUIC), а если не проходит и он, через HTTP/2 (обычный TCP 443).
+Для этого скачивается [usque](https://github.com/Diniboy1123/usque) 4.2.1 —
+открытая реализация MASQUE-режима клиента WARP; он регистрирует своё
+устройство и отдаёт туннель как локальный SOCKS5, в который sing-box
+направляет домены из списка WARP. Порядок проб: WireGuard → MASQUE HTTP/3
+на портах 443, 4500, 500, 1701 → MASQUE HTTP/2. В меню «узел» такого
+транспорта выглядит как `masque:h3:443`. Linux: дополнительная служба
+`zapret2win-warp-masque`; Windows: процесс `usque.exe`, журнал
+`logs\usque.log`.
+
 **Запуск вместе с обходом.** Если WARP включён, он запускается следом за
 zapret автоматически, в фоне: сам обход стартует сразу, а проверка узла
 Cloudflare (и при необходимости подбор нового) идёт отдельно. Пока это
@@ -353,7 +365,7 @@ https://github.com/HikariRisser/Zapret2Scrpt
 Версия хранится в самом скрипте:
 
 ```powershell
-$script:ScriptVersion='1.3.2'
+$script:ScriptVersion='1.4.0'
 ```
 
 Порядок работы:
