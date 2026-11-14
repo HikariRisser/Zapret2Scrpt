@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.5'
+$script:ScriptVersion='1.4.6'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1506,6 +1506,10 @@ function Write-WarpConfig {
         $cfg.Remove('endpoints')
         $cfg.outbounds=@($cfg.outbounds)+@(New-MasqueOutbound $script:UsquePort)
         $cfg.dns.servers[2].type='tcp'   # через SOCKS usque DNS надёжнее по TCP
+        # usque не принимает UDP от sing-box по SOCKS. Отклоняем UDP сразу:
+        # браузер мгновенно переходит с QUIC на TCP вместо ожидания тайм-аута.
+        $r=@($cfg.route.rules)
+        $cfg.route.rules=@($r[0..2])+@([ordered]@{ inbound=@('tun-in','mixed-in'); network='udp'; action='reject' })+@($r[3])
     } else {
         $cfg.endpoints=@(New-WarpEndpointJson $acc $Endpoint)
     }

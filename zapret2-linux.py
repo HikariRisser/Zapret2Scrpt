@@ -37,7 +37,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1509,6 +1509,10 @@ def collect_report():
                  f"{'работает' if warp_running() else 'не запущен'}")
     file(warp_path("last-error.txt"))
 
+    sec("Другие туннели")
+    cmd(["sh", "-c", "ip -br link 2>&1 | grep -iE 'tun|wg|tap|warp|throne|nekoray|hiddify|sing' || echo 'нет'"])
+    cmd(["sh", "-c", "ps -eo pid,args | grep -iE '[s]ing-box|[x]ray|[t]hrone|[n]ekoray|[h]iddify|[c]lash|[m]ihomo' | cut -c1-160 || true"])
+
     sec("WARP: журналы")
     st = read_json(warp_path("state.json")) or {}
     lines.append(f"state: best={st.get('best')} tested={st.get('tested')} ranked={st.get('ranked')}")
@@ -1524,7 +1528,7 @@ def collect_report():
         lines.append(f"--- {name}")
         lines.extend(file_tail(warp_path(name), 60) or ["<пусто>"])
     cmd(["sh", "-c", f"resolvectl status {WARP_TUN} 2>&1 | head -12"])
-    cmd(["sh", "-c", "ip rule 2>&1 | head -12; ip route get 198.18.0.1 2>&1"])
+    cmd(["sh", "-c", f"ip rule 2>&1 | head -12; ip route get {WARP_FAKE4_PREFIX}0.1 2>&1"])
     for d in list_entries(warp_list_path())[:3]:
         cmd(["sh", "-c", f"resolvectl query {shlex.quote(d)} 2>&1 | head -4"])
         lines.append(f"через TUN {d}: {_probe_tls(d, 4)}")
@@ -2072,6 +2076,19 @@ def write_warp_rules():
 
 
 WARP_TUN = "zapret2warp"
+# Свои адреса, диапазон FakeIP и номера таблицы/правил маршрутизации —
+# намеренно НЕ значения sing-box по умолчанию (172.19.0.1/30, 198.18.0.0/15,
+# таблица 2022, правила с 9000). Их же используют другие клиенты на
+# sing-box в режиме TUN (Throne, Hiddify, NekoBox...): при одновременной
+# работе адреса и таблицы совпадали, и трафик/DNS уходил не в тот туннель.
+WARP_TUN_ADDR4 = "172.31.251.1/30"
+WARP_TUN_DNS4 = "172.31.251.2"
+WARP_TUN_ADDR6 = "fd7a:7a70:7761::1/126"
+WARP_FAKE4 = "10.249.0.0/16"
+WARP_FAKE4_PREFIX = "10.249."
+WARP_FAKE6 = "fd7a:7a70:fa4e::/64"
+WARP_RT_TABLE = 2649
+WARP_RT_RULE = 8640
 
 
 def warp_dns_script_path():
@@ -2099,7 +2116,7 @@ i=0
 while [ $i -lt 30 ] && ! ip link show "$IF" >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
 ip link show "$IF" >/dev/null 2>&1 || exit 0
 DOMS=$(grep -v '^[[:space:]]*#' "$LIST" 2>/dev/null | tr -d ' \\t\\r' | grep . | sed 's/^/~/' | tr '\\n' ' ')
-resolvectl dns "$IF" 172.19.0.2 || exit 0
+resolvectl dns "$IF" {WARP_TUN_DNS4} || exit 0
 if [ -n "$DOMS" ]; then resolvectl domain "$IF" $DOMS; else resolvectl domain "$IF" ""; fi
 resolvectl default-route "$IF" false 2>/dev/null
 resolvectl flush-caches 2>/dev/null
@@ -2130,11 +2147,11 @@ def check_warp_dns():
     except OSError as e:
         ips = set()
         warn(f"DNS: {doms[0]} не разрешается ({e})")
-    if any(ip.startswith(("198.18.", "198.19.")) for ip in ips):
+    if any(ip.startswith(WARP_FAKE4_PREFIX) for ip in ips):
         ok(f"DNS доменов WARP идёт в туннель ({doms[0]} -> {sorted(ips)[0]})")
         return
     warn(f"DNS: {doms[0]} получает обычный адрес ({', '.join(sorted(ips)) or 'нет'}), "
-         "а не адрес туннеля 198.18.x.x — сайт пойдёт мимо WARP.")
+         f"а не адрес туннеля {WARP_FAKE4_PREFIX}x.x — сайт пойдёт мимо WARP.")
     if not which("resolvectl"):
         info("В системе нет systemd-resolved: автоматическая настройка DNS для WARP не поддерживается.")
     else:
@@ -2256,9 +2273,9 @@ def build_warp_config(endpoint):
     write_warp_rules()
     # Без IPv6 в системе sing-box не сможет назначить TUN v6-адрес и упадёт.
     v6 = ipv6_available()
-    fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"}
+    fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": WARP_FAKE4}
     if v6:
-        fake["inet6_range"] = "fc00::/18"
+        fake["inet6_range"] = WARP_FAKE6
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -2277,11 +2294,13 @@ def build_warp_config(endpoint):
         "inbounds": [
             {
                 "type": "tun", "tag": "tun-in", "interface_name": "zapret2warp",
-                "address": ["172.19.0.1/30"] + (["fdfe:dcba:9876::1/126"] if v6 else []),
+                "address": [WARP_TUN_ADDR4] + ([WARP_TUN_ADDR6] if v6 else []),
                 "mtu": 1400,
                 "auto_route": True,
                 # В TUN идут только FakeIP: остальной трафик мимо sing-box.
-                "route_address": ["198.18.0.0/15"] + (["fc00::/18"] if v6 else []),
+                "route_address": [WARP_FAKE4] + ([WARP_FAKE6] if v6 else []),
+                "iproute2_table_index": WARP_RT_TABLE,
+                "iproute2_rule_index": WARP_RT_RULE,
             },
             {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
              "listen_port": WARP_MIXED_PORT},
@@ -2295,6 +2314,12 @@ def build_warp_config(endpoint):
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
                 {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "warp-dns"},
+            ] + ([
+                # usque не принимает UDP от sing-box по SOCKS («udp address is not
+                # associated with tcp»). Отклоняем UDP сразу: браузер мгновенно
+                # переходит с QUIC на обычный TCP вместо ожидания тайм-аута.
+                {"inbound": ["tun-in", "mixed-in"], "network": "udp", "action": "reject"},
+            ] if masque else []) + [
                 {"inbound": ["tun-in", "mixed-in"], "outbound": "warp"},
             ],
             "final": "direct",
@@ -2885,6 +2910,11 @@ def update_warp_routes():
     head(f"Проверка {len(cands)} сайтов через zapret...")
     direct = https_batch(cands)
     failed = [d for d in cands if not direct[d]]
+    if failed:
+        # Вторая попытка: случайный сбой не должен навсегда увести сайт в WARP
+        # (домены из списка WARP zapret больше не обрабатывает).
+        again = https_batch(failed)
+        failed = [d for d in failed if not again[d]]
     info(f"открываются через zapret: {len(cands) - len(failed)}, не открываются: {len(failed)}")
     if not failed:
         ok("WARP не нужен ни одному сайту из списков")
