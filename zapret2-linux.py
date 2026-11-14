@@ -37,7 +37,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -2332,6 +2332,7 @@ def build_warp_config(endpoint):
 
 
 WARP_TRACE_LAST = ""   # чем закончилась последняя проверка туннеля
+WARP_EXIT = {}         # откуда WARP выходит в интернет: loc (страна), colo (узел), ip
 
 
 def warp_trace(port, timeout=5.0):
@@ -2356,6 +2357,10 @@ def warp_trace(port, timeout=5.0):
             m = re.search(r"warp=(\w+)", text)
             if m and m.group(1) in ("on", "plus"):
                 WARP_TRACE_LAST = f"{url}: warp={m.group(1)}"
+                for key in ("loc", "colo", "ip"):
+                    mm = re.search(rf"(?m)^{key}=(\S+)", text)
+                    if mm:
+                        WARP_EXIT[key] = mm.group(1)
                 return int((time.monotonic() - t0) * 1000)
             WARP_TRACE_LAST = (f"{url}: ответ получен, но " +
                                (f"warp={m.group(1)}" if m else "без поля warp")
@@ -2727,6 +2732,7 @@ def start_warp():
     apply_warp_dns()
     flush_dns()
     ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
+    report_warp_exit()
     check_warp_dns()
 
 
@@ -2939,6 +2945,52 @@ def update_warp_routes():
     info(f"Список WARP: {warp_list_path()} (можно править вручную)")
 
 
+def report_warp_exit():
+    """
+    Показывает, из какой страны WARP выходит в интернет. Cloudflare сам
+    выбирает ближайший узел, и из России это обычно российский узел: тогда
+    сайты видят российский адрес, и сервисы, закрытые для России самими
+    владельцами (ChatGPT, Claude, Spotify...), через WARP не откроются —
+    WARP помогает только от блокировок на стороне провайдера.
+    """
+    if not WARP_EXIT:
+        return
+    write_json(warp_path("exit.json"), WARP_EXIT, mode=0o644)
+    loc = WARP_EXIT.get("loc", "?")
+    info(f"Выход WARP в интернет: страна {loc}, узел Cloudflare {WARP_EXIT.get('colo', '?')}, "
+         f"адрес {WARP_EXIT.get('ip', '?')}")
+    if loc == "RU":
+        warn("Выход — российский узел Cloudflare. Сайты, заблокированные провайдером, откроются;")
+        warn("сервисы, которые сами не пускают из России (ChatGPT, Claude, Spotify...), — нет.")
+
+
+def warp_test(domains=None):
+    """Проверка сайтов из списка WARP так, как их видит браузер (через DNS и TUN)."""
+    ensure_root(sys.argv)
+    if not warp_running():
+        err("WARP не запущен")
+        return
+    doms = domains or list_entries(warp_list_path())
+    if not doms:
+        info("Список WARP пуст")
+        return
+    head("Проверка сайтов из списка WARP (как в браузере)...")
+    for d in doms:
+        try:
+            ips = sorted({i[4][0] for i in socket.getaddrinfo(d, 443, socket.AF_INET, socket.SOCK_STREAM)})
+        except OSError:
+            ips = []
+        via = "в туннель" if any(ip.startswith(WARP_FAKE4_PREFIX) for ip in ips) else "МИМО туннеля"
+        res = _probe_tls(d, 4) if ips else "DNS: имя не разрешается"
+        color = C.GREEN if res.startswith("OK") else C.RED
+        print(f"    {d:<28} DNS {via:<13} {_c(color, res)}")
+    print()
+    info("«OK … 403 Forbidden» или страница «недоступно в вашем регионе» — отказ самого сайта, а не блокировка.")
+    ex = read_json(warp_path("exit.json")) or {}
+    if ex:
+        info(f"Выход WARP: страна {ex.get('loc')}, узел {ex.get('colo')}")
+
+
 def warp_status_line():
     st = read_json(warp_path("state.json")) or {}
     if warp_running():
@@ -2947,8 +2999,10 @@ def warp_status_line():
         state = _c(C.YELLOW, "запускается...")
     else:
         state = _c(C.GRAY, "не запущен")
+    ex = read_json(warp_path("exit.json")) or {}
+    where = f" | выход: {ex.get('loc')}/{ex.get('colo')}" if ex and warp_running() else ""
     print(f"  WARP: {'включён' if warp_enabled() else 'выключен'} | {state} | "
-          f"сайтов в списке: {len(list_entries(warp_list_path()))}")
+          f"сайтов в списке: {len(list_entries(warp_list_path()))}{where}")
 
 
 def warp_menu():
@@ -2967,6 +3021,7 @@ def warp_menu():
         print("  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret")
         print("  [4] Добавить домен в WARP вручную")
         print("  [5] Импортировать WireGuard-конфиг WARP (если регистрация не проходит)")
+        print("  [6] Проверить сайты из списка WARP (как в браузере)")
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
@@ -3002,6 +3057,8 @@ def warp_menu_action(ch, en):
         warp_import(input("  Путь к .conf: ").strip())
         if warp_enabled():
             start_warp()
+    elif ch == "6":
+        warp_test()
 
 
 
@@ -3172,6 +3229,7 @@ ACTIONS = {
     "warp-routes": None,
     "warp-import": None,
     "warp-start": None,
+    "warp-test": None,
 }
 
 
@@ -3203,6 +3261,7 @@ def main():
   warp-scan    подобрать лучший узел Cloudflare WARP
   warp-routes  проверить сайты и перенести неоткрывающиеся в WARP
   warp-import  импортировать WireGuard-конфиг WARP (--warp-config <файл>)
+  warp-test    проверить сайты из списка WARP так, как их видит браузер
   warp-start   запустить WARP, если он включён (так обход запускает его следом)
 
 Примеры:
@@ -3244,6 +3303,7 @@ def main():
         "warp-routes": update_warp_routes,
         "warp-import": lambda: (ensure_root(sys.argv), warp_import(args.warp_config)),
         "warp-start": lambda: (ensure_root(sys.argv), warp_start_action()),
+        "warp-test": warp_test,
     }
     if action in warp_actions:
         try:

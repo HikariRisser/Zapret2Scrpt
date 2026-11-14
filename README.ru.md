@@ -365,7 +365,7 @@ https://github.com/HikariRisser/Zapret2Scrpt
 Версия хранится в самом скрипте:
 
 ```powershell
-$script:ScriptVersion='1.4.6'
+$script:ScriptVersion='1.4.7'
 ```
 
 Порядок работы:
