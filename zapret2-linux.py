@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -2263,6 +2263,30 @@ def warp_trace(port, timeout=5.0):
     return -1
 
 
+def warp_ping(port, tries=3, timeout=3.0):
+    """
+    Задержка через туннель: время установки TCP-соединения с 1.1.1.1:443
+    через прокси sing-box (CONNECT), лучший из нескольких замеров, мс.
+    Это примерно один круговой пробег пакета (RTT). Время полного
+    HTTPS-запроса из warp_trace в 3–4 раза больше и для сравнения узлов
+    не годится.
+    """
+    best = -1
+    for _ in range(tries):
+        try:
+            t0 = time.monotonic()
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall(b"CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n")
+                reply = s.recv(256)
+            ms = int((time.monotonic() - t0) * 1000)
+            if reply.split(b" ", 2)[1:2] == [b"200"] and (best < 0 or ms < best):
+                best = ms
+        except (OSError, IndexError):
+            pass
+    return best
+
+
 def wait_local_port(port, timeout=4.0, proc=None, alive=None):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -2313,6 +2337,10 @@ def test_warp_endpoint(endpoint):
                 return -1
         elif warp_trace(WARP_PROBE_PORT, 4.0) < 0:
             return -1
+        # Туннель подтверждён (warp=on). Для сравнения узлов меряем задержку.
+        ping = warp_ping(WARP_PROBE_PORT)
+        if ping >= 2:   # 0–1 мс значило бы, что замер не дошёл до туннеля
+            return ping
         times = [t for t in (warp_trace(WARP_PROBE_PORT, 3.0) for _ in range(2)) if t >= 0]
         return min(times) if times else -1
     finally:
@@ -2378,10 +2406,9 @@ def find_warp_endpoint(skip=()):
             # Оставляем её в «Последней ошибке», не затирая общим сообщением.
             warn("MASQUE недоступен: причина выше.")
             return None
+        # Проверяем все варианты и берём самый быстрый, а не первый рабочий.
         for v in MASQUE_VARIANTS:
             check(v)
-            if results:
-                break
         if not results:
             set_warp_error(
                 "Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).",
@@ -2401,7 +2428,9 @@ def find_warp_endpoint(skip=()):
         return None
     write_json(warp_path("state.json"), {"best": results[0]["endpoint"], "ranked": results,
                                          "tested": datetime.now().isoformat(timespec="seconds")})
-    ok(f"Лучший узел: {results[0]['endpoint']} ({results[0]['ms']} мс)")
+    ok(f"Лучший узел: {results[0]['endpoint']} (задержка {results[0]['ms']} мс)")
+    if len(results) > 1:
+        info("Остальные: " + ", ".join(f"{r['endpoint']} {r['ms']} мс" for r in results[1:4]))
     if was_running:
         start_warp()
     return results[0]["endpoint"]

@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.3'
+$script:ScriptVersion='1.4.4'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1603,6 +1603,36 @@ function Invoke-WarpTrace {
     return -1
 }
 
+function Measure-WarpPing {
+    <#
+      Задержка через туннель: время установки TCP-соединения с 1.1.1.1:443
+      через прокси sing-box (CONNECT), лучший из трёх замеров, мс. Это
+      примерно один круговой пробег пакета; время полного HTTPS-запроса
+      в 3-4 раза больше и для сравнения узлов не годится.
+    #>
+    param([int]$Port,[int]$TimeoutMs=3000)
+    $best=-1
+    foreach($i in 1..3){
+        $c=$null
+        try {
+            $sw=[Diagnostics.Stopwatch]::StartNew()
+            $c=[Net.Sockets.TcpClient]::new()
+            $c.Connect('127.0.0.1',$Port)
+            $s=$c.GetStream(); $s.ReadTimeout=$TimeoutMs; $s.WriteTimeout=$TimeoutMs
+            $req=[Text.Encoding]::ASCII.GetBytes("CONNECT 1.1.1.1:443 HTTP/1.1`r`nHost: 1.1.1.1:443`r`n`r`n")
+            $s.Write($req,0,$req.Length)
+            $buf=New-Object byte[] 256
+            $n=$s.Read($buf,0,256); $sw.Stop()
+            $reply=[Text.Encoding]::ASCII.GetString($buf,0,$n)
+            if($reply -match '^HTTP/\d\.\d 200'){
+                $ms=[int]$sw.ElapsedMilliseconds
+                if($best -lt 0 -or $ms -lt $best){ $best=$ms }
+            }
+        } catch {} finally { if($c){ $c.Dispose() } }
+    }
+    return $best
+}
+
 function Test-WarpEndpoint {
     # Пробный туннель к узлу: 3 запроса, задержка = лучший из 2-го и 3-го
     # (первый включает рукопожатие WireGuard).
@@ -1626,6 +1656,9 @@ function Test-WarpEndpoint {
             if((Invoke-WarpTrace $script:WarpProbePort 4000) -ge 0){ $okFirst=$true; break }
         }
         if(-not $okFirst){ return -1 }
+        # Туннель подтверждён (warp=on). Для сравнения узлов меряем задержку.
+        $ping=Measure-WarpPing $script:WarpProbePort
+        if($ping -ge 2){ return $ping }   # 0-1 мс значило бы, что замер не дошёл до туннеля
         $t=@(); foreach($i in 1..2){ $x=Invoke-WarpTrace $script:WarpProbePort 3000; if($x -ge 0){ $t+=$x } }
         if(-not $t.Count){ return -1 }
         return ($t | Measure-Object -Minimum).Minimum
@@ -1685,10 +1718,8 @@ function Find-WarpEndpoint {
             Write-Host '  MASQUE недоступен: причина выше.' -ForegroundColor Yellow
             return $null
         }
-        foreach($v in $script:MasqueVariants){
-            & $test $v
-            if($results.Count){ break }
-        }
+        # Проверяем все варианты и берём самый быстрый, а не первый рабочий.
+        foreach($v in $script:MasqueVariants){ & $test $v }
         if(-not $results.Count){
             $u=@(Get-FileTail $p.UsqueProbeLog 8); if(-not $u.Count){ $u=@('<usque ничего не вывел>') }
             Set-WarpError 'Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).' (@('usque (MASQUE), последняя проба:') + $u + @('sing-box, последняя проба MASQUE:') + @(Get-FileTail $p.ProbeLog 4) + @('WireGuard, последняя проба:') + $wgLog)
@@ -1705,7 +1736,10 @@ function Find-WarpEndpoint {
         return $null
     }
     Write-JsonFile $p.State ([ordered]@{ best=$ranked[0].endpoint; ranked=$ranked; tested=(Get-Date).ToString('s') })
-    Write-Host ("  Лучший узел: {0} ({1} мс)" -f $ranked[0].endpoint,$ranked[0].ms) -ForegroundColor Green
+    Write-Host ("  Лучший узел: {0} (задержка {1} мс)" -f $ranked[0].endpoint,$ranked[0].ms) -ForegroundColor Green
+    if($ranked.Count -gt 1){
+        Write-Host ('  Остальные: ' + ((@($ranked | Select-Object -Skip 1 -First 3) | ForEach-Object { "$($_.endpoint) $($_.ms) мс" }) -join ', ')) -ForegroundColor DarkGray
+    }
     if($wasRunning){ Start-Warp }
     return $ranked[0].endpoint
 }
