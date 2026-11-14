@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.3.0'
+$script:ScriptVersion='1.3.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1208,6 +1208,9 @@ function Get-WarpPaths {
         Pid=Join-Path $d 'sing-box.pid'
         Enabled=Join-Path $d 'enabled'
         Log=Join-Path $script:TrustedRuntime 'logs\sing-box.log'
+        ErrLog=Join-Path $script:TrustedRuntime 'logs\sing-box-stderr.log'
+        ProbeLog=Join-Path $script:TrustedRuntime 'logs\sing-box-probe.log'
+        LastError=Join-Path $d 'last-error.txt'
         List=Join-Path $script:TrustedRuntime 'lists\warp.txt'
     }
 }
@@ -1416,17 +1419,47 @@ function Write-WarpProbeConfig {
     $p=Get-WarpPaths
     $acc=Read-JsonFile $p.Account
     Write-JsonFile $p.Probe ([ordered]@{
-        log=[ordered]@{ level='error' }
+        log=[ordered]@{ level='info' }
         endpoints=@(New-WarpEndpointJson $acc $Endpoint)
         inbounds=@([ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$Port })
         route=[ordered]@{ final='warp'; auto_detect_interface=$true }
     })
 }
 
+function Get-FileTail {
+    param([string]$Path,[int]$Lines=12)
+    if(-not (Test-Path -LiteralPath $Path)){ return @() }
+    try {
+        # sing-box держит файл открытым - читаем с FileShare.ReadWrite.
+        $fs=[IO.File]::Open($Path,'Open','Read','ReadWrite')
+        $sr=New-Object IO.StreamReader($fs)
+        $all=$sr.ReadToEnd(); $sr.Close()
+        $all=$all -replace "$([char]27)\[[0-9;]*m",''   # цвета sing-box
+        return @($all -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $Lines)
+    } catch { return @() }
+}
+
+function Set-WarpError {
+    # Запоминает причину сбоя: её видно в меню WARP, а не только в момент запуска.
+    param([string]$Message,[string[]]$Details=@())
+    $p=Get-WarpPaths
+    Write-Host "  $Message" -ForegroundColor Red
+    foreach($l in $Details){ Write-Host "    $l" -ForegroundColor DarkGray }
+    try {
+        New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
+        [IO.File]::WriteAllLines($p.LastError,@("$((Get-Date).ToString('s')) $Message")+$Details,[Text.UTF8Encoding]::new($false))
+    } catch {}
+}
+
+function Clear-WarpError {
+    Remove-Item (Get-WarpPaths).LastError -Force -ErrorAction SilentlyContinue
+}
+
 function Wait-LocalPort {
-    param([int]$Port,[int]$TimeoutMs=4000)
+    param([int]$Port,[int]$TimeoutMs=4000,$Process=$null)
     $sw=[Diagnostics.Stopwatch]::StartNew()
     while($sw.ElapsedMilliseconds -lt $TimeoutMs){
+        if($Process -and $Process.HasExited){ return $false }
         if(Test-TcpQuick -IP '127.0.0.1' -Port $Port -TimeoutMs 300){ return $true }
         Start-Sleep -Milliseconds 150
     }
@@ -1456,9 +1489,10 @@ function Test-WarpEndpoint {
     param([string]$Endpoint)
     $p=Get-WarpPaths
     Write-WarpProbeConfig -Endpoint $Endpoint -Port $script:WarpProbePort
-    $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Probe)`"") -WindowStyle Hidden -PassThru
+    $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Probe)`"") -WindowStyle Hidden -PassThru `
+              -RedirectStandardError $p.ProbeLog -RedirectStandardOutput "$($p.ProbeLog).out"
     try {
-        if(-not (Wait-LocalPort $script:WarpProbePort)){ return -1 }
+        if(-not (Wait-LocalPort $script:WarpProbePort 8000 $proc)){ return -1 }
         if((Invoke-WarpTrace $script:WarpProbePort 4000) -lt 0){ return -1 }
         $t=@(); foreach($i in 1..2){ $x=Invoke-WarpTrace $script:WarpProbePort 3000; if($x -ge 0){ $t+=$x } }
         if(-not $t.Count){ return -1 }
@@ -1503,7 +1537,8 @@ function Find-WarpEndpoint {
     }
     $ranked=@($results | Sort-Object ms)
     if(-not $ranked.Count){
-        Write-Host '  Ни один узел WARP не ответил. Возможно, WireGuard к Cloudflare заблокирован.' -ForegroundColor Red
+        Set-WarpError 'Ни один узел WARP не ответил.' (@('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 8))
+        Write-Host '  Возможно, WireGuard к Cloudflare заблокирован провайдером.' -ForegroundColor Yellow
         Write-Host '  Попробуйте с запущенным обходом zapret (он маскирует рукопожатие) или импортируйте' -ForegroundColor DarkGray
         Write-Host '  другой конфиг: -Action WarpImport -WarpConfig <файл>.' -ForegroundColor DarkGray
         return $null
@@ -1529,39 +1564,82 @@ function Get-WarpStatus {
 }
 
 function Start-WarpProcess {
+    <#
+      Возвращает 'ok', 'crash' (sing-box завершился: ошибка конфига, TUN,
+      прав - перебор узлов тут не поможет) или 'notunnel' (sing-box работает,
+      но трафик через WARP не идёт - стоит попробовать другой узел).
+    #>
     param([string]$Endpoint)
     # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
     $ErrorActionPreference='Continue'
     $p=Get-WarpPaths
     Write-WarpConfig -Endpoint $Endpoint
     $chk=& $p.Exe check -c $p.Config 2>&1
-    if($LASTEXITCODE -ne 0){ throw ("Конфиг sing-box не прошёл проверку:`n" + ($chk -join "`n")) }
-    $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Config)`"") -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru
+    if($LASTEXITCODE -ne 0){
+        Set-WarpError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" })
+        return 'crash'
+    }
+    foreach($f in @($p.Log,$p.ErrLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Config)`"") -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru `
+              -RedirectStandardError $p.ErrLog -RedirectStandardOutput "$($p.ErrLog).out"
+    $null=$proc.Handle   # без этого ExitCode после завершения бывает пустым
     [IO.File]::WriteAllText($p.Pid,[string]$proc.Id,[Text.Encoding]::ASCII)
-    if(-not (Wait-LocalPort $script:WarpMixedPort 6000)){ return $false }
-    return ((Invoke-WarpTrace $script:WarpMixedPort 6000) -ge 0)
+    # При первом запуске Windows создаёт адаптер Wintun - это бывает дольше
+    # 10 секунд. Ждём, пока процесс жив, до 30 секунд.
+    if(-not (Wait-LocalPort $script:WarpMixedPort 30000 $proc)){
+        $why=@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10)
+        if($proc.HasExited){
+            Set-WarpError ("sing-box завершился с кодом $($proc.ExitCode).") $why
+        } else {
+            Set-WarpError 'sing-box не открыл локальный порт за 30 секунд.' $why
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+        return 'crash'
+    }
+    # Рукопожатие WireGuard и маршруты TUN - даём три попытки.
+    foreach($i in 1..3){
+        if($proc.HasExited){ break }
+        if((Invoke-WarpTrace $script:WarpMixedPort 6000) -ge 0){ Clear-WarpError; return 'ok' }
+        Start-Sleep -Seconds 1
+    }
+    if($proc.HasExited){
+        Set-WarpError ("sing-box завершился с кодом $($proc.ExitCode).") (@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10))
+        return 'crash'
+    }
+    Set-WarpError "Через узел $Endpoint не идёт трафик." @(Get-FileTail $p.Log 8)
+    return 'notunnel'
 }
 
 function Start-Warp {
     Ensure-Admin
     $p=Get-WarpPaths
-    if(-not (Test-Path $p.Exe)){ Install-SingBox }
-    if(-not (Test-Path $p.Account)){ New-WarpAccount }
+    try {
+        if(-not (Test-Path $p.Exe)){ Install-SingBox }
+        if(-not (Test-Path $p.Account)){ New-WarpAccount }
+    } catch {
+        Set-WarpError ($_.Exception.Message -split "`n")[0] @(($_.Exception.Message -split "`n") | Select-Object -Skip 1)
+        return
+    }
     Stop-Warp -Quiet
     $st=Read-JsonFile $p.State
     $ep=if($st){ $st.best } else { $null }
     if(-not $ep){ $ep=Find-WarpEndpoint }
     if(-not $ep){ return }
-    if(-not (Start-WarpProcess $ep)){
+    Write-Host "  Запуск sing-box (узел $ep)..." -ForegroundColor Yellow
+    $r=Start-WarpProcess $ep
+    if($r -eq 'notunnel'){
         # Узел перестал отвечать (заблокирован или ушёл) - подбираем новый.
         Write-Host "  Узел $ep не отвечает, подбираю другой..." -ForegroundColor Yellow
         Stop-Warp -Quiet
         $ep=Find-WarpEndpoint -Skip @($ep)
-        if(-not $ep -or -not (Start-WarpProcess $ep)){
-            Stop-Warp -Quiet
-            Write-Host '  WARP не запущен: туннель не устанавливается.' -ForegroundColor Red
-            return
-        }
+        $r=if($ep){ Start-WarpProcess $ep } else { 'crash' }
+    }
+    if($r -ne 'ok'){
+        Stop-Warp -Quiet
+        Write-Host '  WARP не запущен. Причина выше; она же в меню WARP и в журналах:' -ForegroundColor Red
+        Write-Host "    $($p.Log)" -ForegroundColor DarkGray
+        Write-Host "    $($p.ErrLog)" -ForegroundColor DarkGray
+        return
     }
     & ipconfig.exe /flushdns | Out-Null
     Write-Host "  WARP работает через узел $ep. Сайтов в списке WARP: $((Get-WarpStatus).Domains)" -ForegroundColor Green
@@ -1719,13 +1797,23 @@ function Show-WarpMenu {
         Write-Host ('  WARP: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
                     $(if($w.Running){"работает, узел $($w.Endpoint)"}else{'не запущен'}) +
                     ' | сайтов в списке: ' + $w.Domains) -ForegroundColor Cyan
+        if($w.Enabled -and -not $w.Running){
+            $le=Get-FileTail (Get-WarpPaths).LastError 6
+            if($le.Count){
+                Write-Host '  Последняя ошибка:' -ForegroundColor Red
+                $le | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+            }
+        }
         Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить WARP'}else{'Включить WARP'}))
         Write-Host '  [2] Подобрать лучший узел Cloudflare заново'
         Write-Host '  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret'
         Write-Host '  [4] Добавить домен в WARP вручную'
         Write-Host '  [5] Импортировать WireGuard-конфиг WARP (если регистрация не проходит)'
         Write-Host '  [0] Назад'
-        switch(Read-Host '  Выбор'){
+        $choice=Read-Host '  Выбор'
+        if($choice -eq '0'){ return }
+        try {
+        switch($choice){
             '1' { Toggle-Warp }
             '2' { [void](Find-WarpEndpoint) }
             '3' { Update-WarpRoutes }
@@ -1739,7 +1827,9 @@ function Show-WarpMenu {
                 } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
             }
             '5' { Import-WarpConfig -Path (Read-Host '  Путь к .conf'); if((Get-WarpStatus).Enabled){ Start-Warp } }
-            '0' { return }
+        }
+        } catch {
+            Set-WarpError ('Ошибка: ' + $_.Exception.Message)
         }
     }
 }
