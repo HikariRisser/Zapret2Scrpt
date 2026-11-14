@@ -25,6 +25,7 @@ import platform
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -34,8 +35,8 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.1.0"
-UPDATE_REPO = "HikariRisser/Zapret2WinScrpt"
+VERSION = "1.2.0"
+UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
 
@@ -55,16 +56,190 @@ DOH_PROVIDERS = [
 ]
 
 # Домены для DPI-обхода. Соответствует списку Windows-версии.
+# При установке/обновлении недостающие домены ДОПИСЫВАЮТСЯ в существующий
+# список, ручные правки пользователя сохраняются.
 SEED_DOMAINS = [
-    "discord.com", "discord.gg", "discordapp.com", "discordapp.net",
-    "discord.media", "discordcdn.com",
-    "rutracker.org", "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com",
-    "instagram.com", "facebook.com", "fbcdn.net", "fbsbx.com", "threads.net",
-    "x.com", "twitter.com", "twimg.com", "t.me", "telegram.org", "telegram.me",
-    "reddit.com", "redditstatic.com", "redd.it", "tiktok.com", "tiktokcdn.com",
-    "github.com", "githubusercontent.com", "githubassets.com",
-    "cloudflare.com", "cloudflare-dns.com",
-    "medium.com", "soundcloud.com", "spotify.com", "twitch.tv", "ttvnw.net",
+    "archive.org", "cdn-telegram.org", "cdninstagram.com", "cloudflare-dns.com",
+    "cloudflare-ech.com", "cloudflare.com", "dis.gd", "discord-attachments-uploads-prd.storage.googleapis.com",
+    "discord.co", "discord.com", "discord.dev", "discord.gg",
+    "discord.gift", "discord.media", "discord.new", "discordapp.com",
+    "discordapp.net", "discordcdn.com", "discordstatus.com", "facebook.com",
+    "facebook.net", "fb.com", "fb.me", "fbcdn.net",
+    "fbsbx.com", "ggpht.com", "github.com", "githubassets.com",
+    "githubusercontent.com", "googlevideo.com", "instagram.com", "jnn-pa.googleapis.com",
+    "jtvnw.net", "licdn.com", "linkedin.com", "live-video.net",
+    "medium.com", "messenger.com", "nnmclub.to", "patreon.com",
+    "proton.me", "protonmail.com", "rbxcdn.com", "redd.it",
+    "reddit.com", "redditmedia.com", "redditstatic.com", "roblox.com",
+    "rutor.info", "rutor.is", "rutracker.cc", "rutracker.org",
+    "signal.org", "sndcdn.com", "soundcloud.com", "spotify.com",
+    "t-ru.org", "t.co", "t.me", "telegra.ph",
+    "telegram.me", "telegram.org", "telesco.pe", "threads.com",
+    "threads.net", "tiktok.com", "tiktokcdn.com", "tiktokv.com",
+    "ttvnw.net", "ttwstatic.com", "twimg.com", "twitch.tv",
+    "twitter.com", "viber.com", "wa.me", "whatsapp.com",
+    "whatsapp.net", "x.com", "youtu.be", "youtube-nocookie.com",
+    "youtube.com", "youtubei.googleapis.com", "youtubekids.com", "yt.be",
+    "yt3.googleusercontent.com", "ytimg.com",
+]
+
+SEED_EXCLUDE = ["localhost", "local", "example.com"]
+
+# "Белый" SNI для фейковых ClientHello. ТСПУ пропускает соединения к
+# хостингам (Cloudflare, Hetzner, OVH, AWS...) только для доменов из своего
+# белого списка, остальные обрывает после ~16 КБ. Фейк с белым SNI
+# заставляет DPI отнести поток к разрешённому домену.
+WHITE_SNI = "www.google.com"
+
+# Подсети хостингов, которые ТСПУ режет "по 16 КБ". Для них работает
+# отдельный профиль с белым SNI. Файл можно дополнять своими подсетями.
+HOSTING_IPSET_FILE = "zapret2win-ip-hosting.txt"
+SEED_HOSTING_IPSET = [
+    "# Cloudflare (https://www.cloudflare.com/ips/)",
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+    "# Amazon CloudFront",
+    "13.32.0.0/15",
+    "13.35.0.0/16",
+    "13.224.0.0/14",
+    "18.64.0.0/14",
+    "18.154.0.0/15",
+    "18.160.0.0/15",
+    "18.164.0.0/15",
+    "18.172.0.0/15",
+    "52.84.0.0/15",
+    "54.182.0.0/16",
+    "54.192.0.0/16",
+    "54.230.0.0/16",
+    "54.239.128.0/18",
+    "99.84.0.0/16",
+    "99.86.0.0/16",
+    "108.138.0.0/15",
+    "108.156.0.0/14",
+    "143.204.0.0/16",
+    "205.251.192.0/19",
+    "# Hetzner",
+    "5.9.0.0/16",
+    "5.75.128.0/17",
+    "23.88.0.0/17",
+    "37.27.0.0/16",
+    "46.4.0.0/16",
+    "49.12.0.0/15",
+    "65.21.0.0/16",
+    "65.108.0.0/15",
+    "78.46.0.0/15",
+    "88.99.0.0/16",
+    "88.198.0.0/16",
+    "91.107.128.0/17",
+    "95.216.0.0/15",
+    "116.202.0.0/15",
+    "128.140.0.0/17",
+    "135.181.0.0/16",
+    "136.243.0.0/16",
+    "138.201.0.0/16",
+    "144.76.0.0/16",
+    "148.251.0.0/16",
+    "157.90.0.0/16",
+    "159.69.0.0/16",
+    "162.55.0.0/16",
+    "167.235.0.0/16",
+    "168.119.0.0/16",
+    "176.9.0.0/16",
+    "178.63.0.0/16",
+    "188.40.0.0/16",
+    "195.201.0.0/16",
+    "213.133.96.0/19",
+    "213.239.192.0/18",
+    "# OVH",
+    "5.39.0.0/17",
+    "5.135.0.0/16",
+    "5.196.0.0/16",
+    "37.59.0.0/16",
+    "37.187.0.0/16",
+    "46.105.0.0/16",
+    "51.38.0.0/16",
+    "51.68.0.0/16",
+    "51.75.0.0/16",
+    "51.77.0.0/16",
+    "51.89.0.0/16",
+    "51.91.0.0/16",
+    "51.195.0.0/16",
+    "54.36.0.0/14",
+    "87.98.128.0/17",
+    "91.121.0.0/16",
+    "92.222.0.0/16",
+    "94.23.0.0/16",
+    "137.74.0.0/16",
+    "141.94.0.0/15",
+    "145.239.0.0/16",
+    "147.135.0.0/16",
+    "149.202.0.0/16",
+    "151.80.0.0/16",
+    "164.132.0.0/16",
+    "176.31.0.0/16",
+    "178.32.0.0/15",
+    "188.165.0.0/16",
+    "193.70.0.0/17",
+    "213.186.32.0/19",
+    "213.251.128.0/18",
+    "217.182.0.0/16",
+    "# DigitalOcean",
+    "46.101.0.0/16",
+    "64.225.0.0/16",
+    "64.227.0.0/16",
+    "68.183.0.0/16",
+    "104.131.0.0/16",
+    "104.236.0.0/16",
+    "107.170.0.0/16",
+    "128.199.0.0/16",
+    "134.122.0.0/16",
+    "134.209.0.0/16",
+    "137.184.0.0/16",
+    "138.68.0.0/16",
+    "138.197.0.0/16",
+    "139.59.0.0/16",
+    "142.93.0.0/16",
+    "143.198.0.0/16",
+    "146.190.0.0/16",
+    "157.230.0.0/16",
+    "157.245.0.0/16",
+    "159.65.0.0/16",
+    "159.89.0.0/16",
+    "159.203.0.0/16",
+    "161.35.0.0/16",
+    "164.90.0.0/16",
+    "164.92.0.0/16",
+    "165.22.0.0/16",
+    "165.227.0.0/16",
+    "167.71.0.0/16",
+    "167.99.0.0/16",
+    "167.172.0.0/16",
+    "170.64.0.0/16",
+    "174.138.0.0/17",
+    "178.62.0.0/16",
+    "178.128.0.0/16",
+    "188.166.0.0/16",
+    "206.189.0.0/16",
 ]
 
 # ----------------------------------------------------------------------------
@@ -360,22 +535,55 @@ def build_config():
     UDP-порты включают медиа-диапазоны Discord и STUN (3478), иначе
     голосовой трафик не попадёт в перехват.
     """
-    opt = "\n".join([
+    ipd = ipset_dir()
+    user_list = os.path.join(ipd, "zapret-hosts-user.txt")
+    auto_list = os.path.join(ipd, "zapret-hosts-auto.txt")
+    excl_list = os.path.join(ipd, "zapret-hosts-user-exclude.txt")
+    hosting = os.path.join(ipd, HOSTING_IPSET_FILE)
+    sni = WHITE_SNI
+
+    profiles = [
+        # [1] HTTP
         "--filter-tcp=80 --filter-l7=http <HOSTLIST> --payload=http_req "
         "--lua-desync=fake:blob=fake_default_http:tcp_md5 "
-        "--lua-desync=multisplit:pos=method+2 --new",
+        "--lua-desync=multisplit:pos=method+2",
+    ]
+    if hosting_ipset_nonempty():
+        # [2] Хостинги ("16 КБ"): сайты на Cloudflare/Hetzner/OVH/AWS/DO,
+        # которых НЕТ в списках доменов. Должен стоять до [3]: профиль с
+        # autohostlist забирает любой поток с известным именем.
+        profiles.append(
+            f"--filter-tcp=443 --filter-l7=tls --ipset={hosting} "
+            f"--hostlist-exclude={excl_list} --hostlist-exclude={user_list} "
+            f"--hostlist-exclude={auto_list} --payload=tls_client_hello "
+            f"--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:"
+            f"tls_mod=rnd,dupsid,sni={sni}:repeats=6 "
+            "--lua-desync=multidisorder:pos=1,midsld")
+    profiles += [
+        # [3] TLS для доменов из списков: автоперебор стратегий (circular)
+        # отдельно для каждого домена 2-го уровня. Стратегия 1 — прежняя.
+        "--filter-tcp=443 --filter-l7=tls <HOSTLIST> "
+        "--in-range=-s5556 --lua-desync=circular:fails=2:retrans=2:nld=2 "
+        "--in-range=x --payload=tls_client_hello "
+        "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6:strategy=1 "
+        "--lua-desync=multidisorder:pos=1,midsld:strategy=1 "
+        f"--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:"
+        f"tls_mod=rnd,dupsid,sni={sni}:repeats=6:strategy=2 "
+        "--lua-desync=multisplit:pos=1,sniext+1:strategy=2 "
+        "--lua-desync=hostfakesplit:host=google.com:tcp_md5:strategy=3 "
+        "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls:strategy=4",
 
-        "--filter-tcp=443 --filter-l7=tls <HOSTLIST> --payload=tls_client_hello "
-        "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6 "
-        "--lua-desync=multidisorder:pos=1,midsld --new",
+        # [4] QUIC: без автообучения (как в официальном config.default),
+        # выученные TCP-домены применяются и здесь.
+        "--filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> --payload=quic_initial "
+        "--lua-desync=fake:blob=fake_default_quic:repeats=6",
 
-        "--filter-udp=443 --filter-l7=quic <HOSTLIST> --payload=quic_initial "
-        "--lua-desync=fake:blob=fake_default_quic:repeats=6 --new",
-
+        # [5] Голос/медиа Discord, STUN, WireGuard
         "--filter-l7=stun,discord,wireguard "
         "--payload=stun,discord_ip_discovery,wireguard_initiation,wireguard_cookie "
         "--lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2",
-    ])
+    ]
+    opt = " --new\n".join(profiles)
 
     return f"""# Сгенерировано zapret2-linux {VERSION}
 # Ручные правки будут перезаписаны при обновлении среды.
@@ -383,6 +591,14 @@ def build_config():
 NFQWS2_ENABLE=1
 NFQWS2_PORTS_TCP=80,443
 NFQWS2_PORTS_UDP=443,3478,50000-50099,19294-19344
+
+# Сколько первых пакетов соединения отдавать nfqws2 (connbytes).
+# Без этих переменных init-скрипт zapret2 НЕ создаёт правила перехвата
+# вообще. Остальной трафик идёт мимо nfqws2 — это и даёт скорость.
+NFQWS2_TCP_PKT_OUT=20
+NFQWS2_TCP_PKT_IN=10
+NFQWS2_UDP_PKT_OUT=5
+NFQWS2_UDP_PKT_IN=3
 
 NFQWS2_OPT="
 {opt}
@@ -396,32 +612,63 @@ AUTOHOSTLIST_FAIL_TIME=60
 AUTOHOSTLIST_RETRANS_THRESHOLD=3
 AUTOHOSTLIST_RETRANS_RESET=1
 AUTOHOSTLIST_RETRANS_MAXSEQ=32768
-AUTOHOSTLIST_INCOMING_MAXSEQ=32768
+AUTOHOSTLIST_INCOMING_MAXSEQ=4096
 AUTOHOSTLIST_UDP_IN=1
 AUTOHOSTLIST_UDP_OUT=4
 
-DISABLE_IPV6=1
+# IPv6 тоже перехватываем: иначе при наличии IPv6 браузер уходит на
+# AAAA-адрес мимо обхода.
+DISABLE_IPV6=0
 FLOWOFFLOAD=donttouch
 INIT_APPLY_FW=1
 FILTER_TTL_EXPIRED_ICMP=1
 """
 
 
+def hosting_ipset_nonempty():
+    path = os.path.join(ipset_dir(), HOSTING_IPSET_FILE)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return any(ln.strip() and not ln.strip().startswith("#") for ln in f)
+    except OSError:
+        return False
+
+
+def merge_list_file(path, seed):
+    """
+    Дописывает в файл недостающие строки из seed, ничего не удаляя:
+    ручные правки и комментарии пользователя сохраняются.
+    Возвращает число добавленных строк.
+    """
+    lines = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    have = {ln.strip().lower() for ln in lines}
+    added = 0
+    for item in seed:
+        if item and item.strip().lower() not in have:
+            have.add(item.strip().lower())
+            lines.append(item)
+            added += 1
+    if added or not os.path.isfile(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(path, 0o644)
+    return added
+
+
 def seed_lists():
-    """Создаёт списки доменов, не перезаписывая существующие."""
+    """Создаёт списки и дописывает в них недостающие записи."""
     os.makedirs(ipset_dir(), exist_ok=True)
 
-    user_list = os.path.join(ipset_dir(), "zapret-hosts-user.txt")
-    if not os.path.isfile(user_list):
-        with open(user_list, "w", encoding="utf-8") as f:
-            f.write("\n".join(SEED_DOMAINS) + "\n")
-        info(f"создан список: {user_list}")
-
-    exclude = os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt")
-    if not os.path.isfile(exclude):
-        with open(exclude, "w", encoding="utf-8") as f:
-            f.write("localhost\nlocal\n")
-        info(f"создан список исключений: {exclude}")
+    n = merge_list_file(os.path.join(ipset_dir(), "zapret-hosts-user.txt"), SEED_DOMAINS)
+    if n:
+        info(f"добавлено доменов в список обхода: {n}")
+    merge_list_file(os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt"), SEED_EXCLUDE)
+    n = merge_list_file(os.path.join(ipset_dir(), HOSTING_IPSET_FILE), SEED_HOSTING_IPSET)
+    if n:
+        info(f"добавлено подсетей хостингов: {n}")
 
     auto = os.path.join(ipset_dir(), "zapret-hosts-auto.txt")
     if not os.path.isfile(auto):
@@ -803,6 +1050,47 @@ def tcp_ok(ip, port=443, timeout=1.5):
         return False
 
 
+BOGON_RE = re.compile(
+    r"^(0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\."
+    r"|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)")
+
+
+def tls_cert_ok(ip, hostname, timeout=2.5):
+    """
+    TLS-рукопожатие с ip и проверка, что сертификат выдан на hostname.
+    Заглушка провайдера или чужой узел такой сертификат не предъявят.
+    """
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            with ctx.wrap_socket(raw, server_hostname=hostname):
+                return True
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def system_dns_ok(domain):
+    """
+    Нужен ли домену пиннинг в hosts вообще? Если системный DNS отдаёт
+    рабочий адрес с правильным сертификатом — нет: CDN выбирает ближайший
+    узел, а адрес из чужого DoH-ответа бывает дальним и устаревает.
+    Вызывать, когда наш блок уже убран из hosts.
+    """
+    try:
+        infos = socket.getaddrinfo(domain, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    ips = []
+    for inf in infos:
+        ip = inf[4][0]
+        if ip not in ips:
+            ips.append(ip)
+    if not ips or any(BOGON_RE.match(ip) for ip in ips):
+        return False
+    return any(tls_cert_ok(ip, domain) for ip in ips[:2])
+
+
 def working_ip(domain, max_candidates=8):
     """
     Возвращает первый РАБОЧИЙ IP домена или None.
@@ -825,6 +1113,11 @@ def working_ip(domain, max_candidates=8):
     if domain.startswith("www."):
         add_all(doh_query(domain[4:], "A"))
 
+    # Сначала адрес с правильным сертификатом. Если DPI рвёт рукопожатие
+    # (обход не запущен), берём, как раньше, первый отвечающий по TCP.
+    for ip in cands[:max_candidates]:
+        if tls_cert_ok(ip, domain, timeout=2.0):
+            return ip
     for ip in cands[:max_candidates]:
         if tcp_ok(ip):
             return ip
@@ -909,17 +1202,30 @@ def doh_update():
     for d in domains:
         if d not in targets:
             targets.append(d)
-        if not d.startswith("www."):
+        # www-вариант имеет смысл только для доменов 2-го уровня
+        if not d.startswith("www.") and d.count(".") == 1:
             w = "www." + d
             if w not in targets:
                 targets.append(w)
 
+    # Убираем прежний блок, чтобы системный резолвер отвечал без него.
+    old_lines = read_hosts()
+    stripped, removed = strip_marked_block(old_lines)
+    if removed:
+        write_hosts(stripped)
+        flush_dns()
+
     head(f"Разрешение {len(targets)} имён с проверкой рабочего IP...")
     resolved = []
     failed = []
+    sys_ok = []
     for i, d in enumerate(targets, 1):
         sys.stdout.write(f"    [{i}/{len(targets)}] {d:<38} ")
         sys.stdout.flush()
+        if system_dns_ok(d):
+            sys_ok.append(d)
+            print(_c(C.GRAY, "системный DNS в порядке"))
+            continue
         ip = working_ip(d)
         if ip:
             resolved.append((ip, d))
@@ -942,7 +1248,11 @@ def doh_update():
     flush_dns()
 
     print()
-    ok(f"Записано в hosts: {len(resolved)}, без рабочего IP: {len(failed)}")
+    ok(f"Записано в hosts: {len(resolved)}, системный DNS в порядке: {len(sys_ok)}, "
+       f"без рабочего IP: {len(failed)}")
+    if resolved and not nfqws2_running():
+        info("Совет: повторите при ЗАПУЩЕННОМ обходе — тогда в hosts попадут "
+             "только домены с подменой DNS.")
     if failed:
         info("Не пиннингуются (системный DNS остаётся): " + ", ".join(failed[:10])
              + (" ..." if len(failed) > 10 else ""))

@@ -1,3 +1,0 @@
-localhost
-local
-example.com

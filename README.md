@@ -15,6 +15,43 @@ Two implementations with the same feature set:
 
 **Both console UIs are in Russian.**
 
+## What's new in 1.2.0: speed and coverage
+
+**Speed**
+
+- Windows: no more interception of **all incoming** 80/443 TCP and UDP 443
+  traffic (`--wf-tcp-in`, `--wf-udp-in`) or of every empty ACK
+  (`--wf-tcp-empty`). Previously every downloaded packet, including YouTube
+  video over QUIC, went through user-mode `winws2`. The strategies don't need
+  incoming data; winws2's filter constructor already captures SYN+ACK/FIN/RST
+  and HTTP redirects.
+- DoH pinning no longer writes domains to `hosts` when the **system DNS
+  already returns a working address** (verified by TLS certificate), so CDNs
+  keep picking the nearest node and pins don't go stale.
+- Linux: the generated `config` lacked `NFQWS2_TCP_PKT_OUT/IN` and
+  `NFQWS2_UDP_PKT_OUT/IN`, so the zapret2 init script created **no
+  interception rules at all**. The official values (20/10, 5/3) are now set.
+
+**Fewer sites needing a VPN**
+
+- **TLS strategy rotation** via `circular`: after 2 failures (ClientHello
+  retransmissions or DPI RST) the second-level domain moves to the next
+  strategy. Strategy 1 is the previous one.
+- **"16 KB" block**: a new profile matches connections to big hosting
+  networks (`lists\ipset-hosting.txt`) for domains that are *not* in the
+  lists and sends a fake ClientHello with a whitelisted SNI
+  (`$script:WhiteSni`, default `www.google.com`).
+- **Seed list grown** from 37 to 86 domains; updates now **merge** new
+  entries into existing lists instead of skipping existing files.
+- **IPv6 on Linux** is intercepted too (`DISABLE_IPV6=0`).
+
+Not fixable by DPI desync: geo-blocking by the services themselves (ChatGPT,
+Spotify, Notion, ...) and full IP blocks.
+
+To apply on an existing install: update the script ([9]), run install ([1])
+to rewrite the launch config and merge the lists, then start the bypass.
+Run the DoH update ([7]) while the bypass is running.
+
 ## Linux version
 
 ```bash
@@ -187,7 +224,7 @@ no separate "disable" item — one action covers both states.
 Update source:
 
 ```
-https://github.com/HikariRisser/Zapret2WinScrpt
+https://github.com/HikariRisser/Zapret2Scrpt
 ```
 
 The script downloads `Zapret2Windows.ps1` from the `main` branch (falling back
@@ -196,7 +233,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.1.0'
+$script:ScriptVersion='1.2.0'
 ```
 
 Flow:
@@ -249,10 +286,13 @@ powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Uninstall
 ## What is implemented
 
 - official x64/x86 release selection based on Windows architecture;
-- WinDivert full-port interception for TCP 80/443 and UDP 443, both directions;
-- official `zapret-lib.lua` and `zapret-antidpi.lua` from the same release;
+- WinDivert interception of **outgoing** TCP 80/443 and UDP 443 only
+  (incoming SYN+ACK/FIN/RST and HTTP redirects are added by winws2 itself);
+- official `zapret-lib.lua`, `zapret-antidpi.lua` and `zapret-auto.lua` from the same release;
 - HTTP strategy: fake + multisplit;
-- TLS strategy: fake + multidisorder with ClientHello reassembly enabled;
+- TLS strategy: **automatic rotation of 4 strategies** (`circular`) per domain;
+- **hosting profile** (Cloudflare, Hetzner, OVH, AWS CloudFront,
+  DigitalOcean) against the "16 KB" block — fake ClientHello with a whitelisted SNI;
 - QUIC strategy: fake on `quic_initial`;
 - **Discord voice/media profile**: fake on `discord_ip_discovery`, `stun`,
   `wireguard_initiation`, `wireguard_cookie` (official zapret2 scheme from
