@@ -38,7 +38,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -714,6 +714,7 @@ def seed_lists():
 
     cleanup_legacy_warp()
     merge_list_file(tunnel_list_path(), SEED_TUNNEL)
+    merge_list_file(geo_list_path(), SEED_GEO)
 
     auto = os.path.join(ipset_dir(), "zapret-hosts-auto.txt")
     if not os.path.isfile(auto):
@@ -849,6 +850,7 @@ def toggle_autostart():
     if service_enabled():
         head("Выключение автозапуска...")
         run(["systemctl", "disable", SERVICE_NAME], timeout=60)
+        sync_tunnel_autostart()
         ok("Автозапуск выключен")
         return
 
@@ -864,6 +866,13 @@ def toggle_autostart():
         raise RuntimeError(f"systemctl enable: {errout}")
     ok("Автозапуск включён")
     info(f"юнит: {UNIT_PATH}")
+    if tunnel_enabled():
+        if os.path.isfile(TUNNEL_UNIT_PATH):
+            sync_tunnel_autostart()
+            ok("Туннель будет запускаться вместе с обходом")
+        else:
+            warn("Туннель включён, но ещё ни разу не запускался: запустите обход (пункт [2]), "
+                 "после этого он будет стартовать при загрузке.")
 
 
 # ----------------------------------------------------------------------------
@@ -1543,6 +1552,8 @@ def collect_report():
         cmd(["sh", "-c", f"resolvectl query {shlex.quote(d)} 2>&1 | head -4"])
         lines.append(f"через TUN {d}: {_probe_tls(d, 4)}")
     cmd(["journalctl", "-u", TUNNEL_SERVICE, "-n", "40", "--no-pager", "-o", "cat"])
+    if os.path.isfile(XRAY_UNIT_PATH):
+        cmd(["journalctl", "-u", XRAY_SERVICE, "-n", "25", "--no-pager", "-o", "cat"])
 
     # Проверка сайтов с отладочным журналом nfqws2: перезапускаем nfqws2 с
     # теми же параметрами + --debug, правила перехвата остаются на месте.
@@ -1790,6 +1801,10 @@ def uninstall(assume_yes=False):
 
     head("[2/4] Удаление службы...")
     run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
+    try:
+        os.remove(XRAY_UNIT_PATH)
+    except OSError:
+        pass
     if os.path.isfile(TUNNEL_UNIT_PATH):
         try:
             os.remove(TUNNEL_UNIT_PATH)
@@ -1855,6 +1870,30 @@ TUNNEL_UNIT_PATH = f"/etc/systemd/system/{TUNNEL_SERVICE}.service"
 TUNNEL_MIXED_PORT = 40480
 TUNNEL_PROBE_PORT = 40481
 TUNNEL_LIST_FILE = "zapret2win-hosts-tunnel.txt"
+# xray-core: только для профилей, которые sing-box не умеет (транспорт XHTTP,
+# конфиги Xray). Работает локальным прокси, в который sing-box отправляет трафик.
+XRAY_SERVICE = "zapret2win-xray"
+XRAY_UNIT_PATH = f"/etc/systemd/system/{XRAY_SERVICE}.service"
+XRAY_PORT = 40482
+XRAY_PROBE_PORT = 40483
+# Сайты, по которым проверяется, пускает ли сервис с адреса профиля.
+TUNNEL_GEO_FILE = "zapret2win-geo-sites.txt"
+SEED_GEO = [
+    "# Сайты с региональными ограничениями: по ним выбирается профиль туннеля.",
+    "# По домену в строке. Профиль, с которого открывается больше сайтов, - лучший.",
+    "claude.ai",
+    "chatgpt.com",
+    "gemini.google.com",
+]
+# Признаки отказа по региону: в адресе перенаправления или в тексте страницы.
+GEO_RE = re.compile(
+    r"app-unavailable-in-region|unavailable[-_ ]in[-_ ](your[-_ ])?(region|country)"
+    r"|unsupported[-_ ](country|region)|country[-_ ]not[-_ ]supported"
+    r"|not[-_ ](available|supported)[-_ ]in[-_ ]your[-_ ](country|region|location)"
+    r"|region[-_ ](restricted|blocked)|geo[-_ ]?(block|restrict)"
+    r"|недоступ\w+ в ваш\w+ (стране|регионе)", re.I)
+GEO_LABEL = {"ok": "открывается", "challenge": "отвечает (проверка браузера)",
+             "geo": "отказ по региону", "deny": "отказ (403)", "fail": "нет ответа"}
 TUNNEL_SERVERS_FILE = "zapret2win-ip-tunnel.txt"
 SEED_TUNNEL = [
     "# Сайты, которые открываются через туннель (sing-box), а не через zapret.",
@@ -1896,6 +1935,14 @@ def tunnel_list_path():
 
 def tunnel_servers_path():
     return os.path.join(ipset_dir(), TUNNEL_SERVERS_FILE)
+
+
+def geo_list_path():
+    return os.path.join(ipset_dir(), TUNNEL_GEO_FILE)
+
+
+def xray_path():
+    return tunnel_path("xray")
 
 
 def singbox_path():
@@ -2025,10 +2072,46 @@ def install_singbox():
     ok(f"sing-box установлен: {exe}")
 
 
+def install_xray():
+    """Скачивает официальную сборку xray-core с GitHub (один раз)."""
+    exe = xray_path()
+    if os.access(exe, os.X_OK):
+        return
+    m = platform.machine().lower()
+    arch = {"x86_64": "64", "amd64": "64", "aarch64": "arm64-v8a", "arm64": "arm64-v8a",
+            "armv7l": "arm32-v7a", "armv7": "arm32-v7a", "i386": "32", "i686": "32",
+            "riscv64": "riscv64"}.get(m)
+    if not arch:
+        raise RuntimeError(f"нет сборки xray-core для архитектуры {platform.machine()}")
+    url = f"https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-{arch}.zip"
+    head("Скачивание xray-core (нужен для профилей с XHTTP и конфигов Xray)...")
+    info(url)
+    import zipfile
+    os.makedirs(tunnel_dir(), exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="xray-")
+    try:
+        zpath = os.path.join(tmpdir, "xray.zip")
+        download(url, zpath)
+        with zipfile.ZipFile(zpath) as zf:
+            with zf.open("xray") as src, open(exe + ".new", "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        os.chmod(exe + ".new", 0o755)
+        os.replace(exe + ".new", exe)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    ok(f"xray-core установлен: {exe}")
+
+
 # --- разбор конфигов и ссылок ------------------------------------------------
 #
 # Каждый профиль: {"name", "source" ("proton" | "custom"), "type",
 # "endpoint" (True для WireGuard), "outbound" (объект sing-box без tag)}.
+# Профиль для xray-core дополнительно: "engine": "xray", "xray" (outbound
+# Xray), "server": [хост, порт]; его "outbound" - SOCKS на локальный xray.
+
+class NeedXray(Exception):
+    """Профиль не для sing-box: его нужно запускать через xray-core."""
+
 
 class ProfileError(Exception):
     pass
@@ -2114,9 +2197,65 @@ def _transport_block(q):
             tr["host"] = host
         return tr
     if net in ("xhttp", "splithttp"):
-        raise ProfileError("транспорт XHTTP (SplitHTTP) sing-box не поддерживает — "
-                           "нужен другой транспорт на сервере (TCP/Reality, WS, gRPC)")
+        raise NeedXray()
     raise ProfileError(f"транспорт «{net}» не поддерживается sing-box")
+
+
+def _xray_stream(q, host):
+    """streamSettings Xray для транспорта XHTTP из параметров ссылки."""
+    sec = (q.get("security") or "none").lower()
+    sni = q.get("sni") or q.get("peer") or ("" if _is_ip(host) else host)
+    fp = q.get("fp") or q.get("fingerprint") or ""
+    xh = {"path": urllib.parse.unquote(q.get("path", "") or "") or "/"}
+    if q.get("host"):
+        xh["host"] = q["host"]
+    if q.get("mode"):
+        xh["mode"] = q["mode"]
+    if q.get("extra"):
+        try:
+            xh["extra"] = json.loads(urllib.parse.unquote(q["extra"]))
+        except ValueError:
+            raise ProfileError("параметр extra в ссылке XHTTP - не JSON")
+    ss = {"network": "xhttp", "xhttpSettings": xh}
+    if sec == "reality":
+        if not q.get("pbk"):
+            raise ProfileError("в ссылке Reality нет открытого ключа (pbk)")
+        ss["security"] = "reality"
+        ss["realitySettings"] = {"serverName": sni, "fingerprint": fp or "chrome",
+                                 "publicKey": q["pbk"], "shortId": q.get("sid", ""),
+                                 "spiderX": urllib.parse.unquote(q.get("spx", "") or "")}
+    elif sec in ("tls", "xtls"):
+        tls = {"serverName": sni}
+        if fp:
+            tls["fingerprint"] = fp
+        if q.get("alpn"):
+            tls["alpn"] = [a for a in urllib.parse.unquote(q["alpn"]).split(",") if a]
+        if _truthy(q.get("allowInsecure")) or _truthy(q.get("insecure")):
+            tls["allowInsecure"] = True
+        ss["security"] = "tls"
+        ss["tlsSettings"] = tls
+    else:
+        ss["security"] = "none"
+    return ss
+
+
+def _xray_link(proto, host, port, q, **user):
+    """Профиль для xray-core из ссылки vless/vmess/trojan с транспортом XHTTP."""
+    if proto == "trojan":
+        settings = {"servers": [{"address": host, "port": port, "password": user["password"]}]}
+    else:
+        u = {"id": user["uuid"]}
+        if proto == "vless":
+            u["encryption"] = q.get("encryption") or "none"
+            if q.get("flow"):
+                u["flow"] = q["flow"]
+        else:
+            u["security"] = user.get("security") or "auto"
+            u["alterId"] = int(user.get("alter_id") or 0)
+        settings = {"vnext": [{"address": host, "port": port, "users": [u]}]}
+    return {"type": f"{proto}+xhttp", "_xray": {"protocol": proto, "settings": settings,
+                                                "streamSettings": _xray_stream(q, host)},
+            "_server": [host, port]}
 
 
 def _split_link(link):
@@ -2143,10 +2282,13 @@ def parse_vless(link):
           "uuid": urllib.parse.unquote(u.username or ""), "packet_encoding": "xudp"}
     if q.get("flow"):
         ob["flow"] = q["flow"]
+    try:
+        tr = _transport_block(q)
+    except NeedXray:
+        return name or f"VLESS {host}", _xray_link("vless", host, port, q, uuid=ob["uuid"])
     tls = _tls_block(q, host)
     if tls:
         ob["tls"] = tls
-    tr = _transport_block(q)
     if tr:
         ob["transport"] = tr
     return name or f"VLESS {host}", ob
@@ -2177,9 +2319,13 @@ def parse_vmess(link):
         ob = {"type": "vmess", "server": host, "server_port": port, "uuid": str(j.get("id", "")),
               "security": str(j.get("scy") or "auto"), "alter_id": int(j.get("aid", 0) or 0)}
         tls = _tls_block(q, q.get("host") or host)
+    try:
+        tr = _transport_block(q)
+    except NeedXray:
+        return name or f"VMess {host}", _xray_link("vmess", host, port, q, uuid=ob["uuid"],
+                                                   security=ob["security"], alter_id=ob["alter_id"])
     if tls:
         ob["tls"] = tls
-    tr = _transport_block(q)
     if tr:
         ob["transport"] = tr
     return name or f"VMess {host}", ob
@@ -2190,9 +2336,13 @@ def parse_trojan(link):
     _need(host, port)
     ob = {"type": "trojan", "server": host, "server_port": port,
           "password": urllib.parse.unquote(u.username or "")}
+    try:
+        tr = _transport_block(q)
+    except NeedXray:
+        q.setdefault("security", "tls")
+        return name or f"Trojan {host}", _xray_link("trojan", host, port, q, password=ob["password"])
     if (q.get("security") or "tls").lower() != "none":
         ob["tls"] = _tls_block(q, host, force=True)
-    tr = _transport_block(q)
     if tr:
         ob["transport"] = tr
     return name or f"Trojan {host}", ob
@@ -2375,9 +2525,58 @@ LINK_PARSERS = {
 SUPPORTED_FORMATS = ("конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, "
                      "hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; "
                      "несколько ссылок или подписка (адрес https://… либо base64); "
-                     "JSON sing-box (outbound или целый конфиг)")
+                     "JSON sing-box (outbound или целый конфиг); JSON Xray (outbound или целый конфиг). "
+                     "Транспорт XHTTP и конфиги Xray работают через xray-core, остальное - через sing-box")
 # Служебные типы sing-box, которые не являются выходом на сервер.
 _NOT_SERVERS = {"direct", "block", "dns", "selector", "urltest", "tor", "ssh"}
+
+
+_XRAY_NOT_SERVERS = {"freedom", "blackhole", "dns", "loopback"}
+
+
+def _xray_server(ob):
+    """[хост, порт] сервера из outbound Xray."""
+    s = ob.get("settings") or {}
+    for key in ("vnext", "servers", "peers"):
+        first = (s.get(key) or [{}])[0]
+        if first.get("address"):
+            return [str(first["address"]), first.get("port")]
+        if first.get("endpoint"):                      # WireGuard: "хост:порт"
+            h, _, p = str(first["endpoint"]).rpartition(":")
+            return [h.strip("[]"), int(p) if p.isdigit() else None]
+    if s.get("address"):
+        return [str(s["address"]), s.get("port")]
+    return ["", None]
+
+
+def parse_xray_json(j):
+    """Конфиг Xray (целый или один outbound): список профилей либо None."""
+    if isinstance(j, dict) and isinstance(j.get("outbounds"), list) \
+            and any(isinstance(o, dict) and "protocol" in o for o in j["outbounds"]):
+        items = j["outbounds"]
+    elif isinstance(j, dict) and "protocol" in j and "type" not in j:
+        items = [j]
+    elif isinstance(j, list) and j and all(isinstance(o, dict) and "protocol" in o for o in j):
+        items = j
+    else:
+        return None
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("protocol") in _XRAY_NOT_SERVERS:
+            continue
+        server = _xray_server(it)
+        if not server[0]:
+            continue
+        ob = {k: v for k, v in it.items() if k not in ("tag", "proxySettings", "sendThrough")}
+        ss = ob.get("streamSettings")
+        if isinstance(ss, dict) and isinstance(ss.get("sockopt"), dict):
+            ss["sockopt"].pop("dialerProxy", None)     # цепочки на другие outbound не переносим
+        net = (ss or {}).get("network", "tcp") if isinstance(ss, dict) else "tcp"
+        name = str(it.get("tag") or f"{it['protocol']} {server[0]}").strip()
+        out.append((name, {"type": f"{it['protocol']}+{net} (xray)", "_xray": ob, "_server": server}))
+    if not out:
+        raise ProfileError("в конфиге Xray нет ни одного сервера (outbound с адресом)")
+    return out
 
 
 def parse_singbox_json(text):
@@ -2386,9 +2585,9 @@ def parse_singbox_json(text):
         j = json.loads(text)
     except ValueError as e:
         raise ProfileError(f"JSON не разбирается: {e}")
-    if isinstance(j, dict) and ("inbounds" in j and "routing" in j or "vnext" in json.dumps(j)[:4000]):
-        raise ProfileError("это конфиг Xray/V2Ray, а не sing-box. Возьмите ссылку на сервер "
-                           "(vless://…) или экспортируйте конфиг в формате sing-box")
+    xray = parse_xray_json(j)
+    if xray is not None:
+        return xray
     items = []
     if isinstance(j, list):
         items = j
@@ -2419,6 +2618,13 @@ def parse_profiles(text, source="custom", _depth=0):
     profiles, errors = [], []
 
     def add(name, ob):
+        if "_xray" in ob:
+            profiles.append({"name": name.strip() or ob["type"], "source": source, "type": ob["type"],
+                             "endpoint": False, "engine": "xray", "xray": ob["_xray"],
+                             "server": ob["_server"],
+                             "outbound": {"type": "socks", "server": "127.0.0.1",
+                                          "server_port": XRAY_PORT, "version": "5"}})
+            return
         profiles.append({"name": name.strip() or ob.get("type", "сервер"), "source": source,
                          "type": ob.get("type"), "endpoint": ob.get("type") == "wireguard",
                          "outbound": ob})
@@ -2474,6 +2680,11 @@ def parse_profiles(text, source="custom", _depth=0):
 def profile_server(p):
     """(хост, порт, это_udp) сервера профиля."""
     ob = p["outbound"]
+    if p.get("engine") == "xray":
+        host, port = (p.get("server") or ["", None])[:2]
+        net = ((p.get("xray") or {}).get("streamSettings") or {}).get("network", "tcp")
+        udp = net in ("kcp", "quic", "hysteria") or (p.get("xray") or {}).get("protocol") in ("wireguard", "hysteria")
+        return host, port, udp
     if p.get("endpoint"):
         peer = (ob.get("peers") or [{}])[0]
         return peer.get("address", ""), peer.get("port"), True
@@ -2528,15 +2739,41 @@ def tunnel_wg_ports():
     return ports
 
 
-def profile_parts(p, tag="tunnel"):
+def profile_parts(p, tag="tunnel", probe=False):
     """(endpoints, outbounds) для конфига sing-box."""
     ob = dict(p["outbound"])
     ob["tag"] = tag
+    if p.get("engine") == "xray":
+        ob["server_port"] = XRAY_PROBE_PORT if probe else XRAY_PORT
     return ([ob], []) if p.get("endpoint") else ([], [ob])
 
 
+def xray_config(profile, port):
+    """Конфиг xray-core: локальный SOCKS -> сервер профиля."""
+    ob = dict(profile["xray"])
+    ob["tag"] = "proxy"
+    return {"log": {"loglevel": "warning"},
+            "inbounds": [{"tag": "socks-in", "listen": "127.0.0.1", "port": port,
+                          "protocol": "socks", "settings": {"auth": "noauth", "udp": True}}],
+            "outbounds": [ob]}
+
+
 def validate_profile(p):
-    """Проверяет профиль настоящим sing-box: (годен, текст ошибки)."""
+    """Проверяет профиль настоящим sing-box или xray-core: (годен, текст ошибки)."""
+    if p.get("engine") == "xray":
+        try:
+            install_xray()
+        except Exception as e:
+            return False, f"xray-core не скачался: {e}"
+        path = tunnel_path("validate-xray.json")
+        write_json(path, xray_config(p, XRAY_PROBE_PORT))
+        rc, out, errout = run([xray_path(), "run", "-test", "-c", path], timeout=30)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        msg = [ln for ln in (out + "\n" + errout).splitlines() if ln.strip()]
+        return rc == 0, (msg[-1] if msg else "")
     eps, obs = profile_parts(p)
     cfg = {"log": {"level": "error"}, "outbounds": obs + [{"type": "direct", "tag": "direct"}],
            "route": {"final": "tunnel", "default_domain_resolver": "local"},
@@ -2567,7 +2804,8 @@ def import_profiles(text, source="custom", replace=False):
         if valid:
             good.append(p)
         else:
-            errors.append(f"{p['name']} — sing-box не принял профиль: {why}")
+            eng = "xray-core" if p.get("engine") == "xray" else "sing-box"
+            errors.append(f"{p['name']} — {eng} не принял профиль: {why}")
     for e in errors:
         warn(e)
     if not good:
@@ -2595,10 +2833,12 @@ def import_profiles(text, source="custom", replace=False):
         info("Перезапуск обхода, чтобы zapret учёл серверы туннеля...")
         run_init("stop")
         run_init("start")
-    try:
-        os.remove(tunnel_path("state.json"))    # выбрать лучший профиль заново
-    except OSError:
-        pass
+    st = read_json(tunnel_path("state.json")) or {}
+    if not (st.get("pinned") and find_profile(st.get("active", ""))):
+        try:
+            os.remove(tunnel_path("state.json"))    # выбрать лучший профиль заново
+        except OSError:
+            pass
     return good
 
 
@@ -2820,8 +3060,114 @@ def wait_local_port(port, timeout=4.0, proc=None, alive=None):
     return False
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def geo_probe(domain, port, timeout=10.0):
+    """
+    Пускает ли сайт с адреса туннеля. Запрос идёт через локальный прокси.
+    'ok' - открывается; 'geo' - отказ по региону (код 451, перенаправление
+    или страница с таким текстом); 'challenge' - сайт отвечает, но требует
+    проверку браузера (по ней регион не определить); 'deny' - отказ 403 без
+    объяснения (часто так закрывают адреса VPN); 'fail' - нет ответа.
+    """
+    proxy = f"http://127.0.0.1:{port}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()), _NoRedirect())
+    url = f"https://{domain}/"
+    for _ in range(4):
+        req = urllib.request.Request(url, headers={
+            "User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"})
+        try:
+            r = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            r = e
+        except Exception:
+            return "fail"
+        code = r.getcode()
+        hdr = r.headers
+        try:
+            body = r.read(65536).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        finally:
+            r.close()
+        if code == 451:
+            return "geo"
+        if 300 <= code < 400 and hdr.get("Location"):
+            loc = urllib.parse.urljoin(url, hdr["Location"])
+            if GEO_RE.search(loc):
+                return "geo"
+            if not loc.lower().startswith("https://"):
+                return "ok"
+            url = loc
+            continue
+        if GEO_RE.search(body[:20000]) and code >= 400:
+            return "geo"
+        if (hdr.get("cf-mitigated") or "").lower() == "challenge":
+            return "challenge"
+        if code == 403:
+            return "geo" if GEO_RE.search(body) else "deny"
+        if GEO_RE.search(body[:20000]) and len(body) < 20000:
+            return "geo"
+        return "ok" if code < 500 else "fail"
+    return "ok"
+
+
+def geo_check(port):
+    """Проверка всех сайтов из списка региональных ограничений: {сайт: статус}."""
+    sites = list_entries(geo_list_path())
+    if not sites:
+        return {}
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        return dict(zip(sites, ex.map(lambda d: geo_probe(d, port), sites)))
+
+
+def geo_score(geo):
+    """Сколько сайтов пускают с этого адреса (проверка браузера - не отказ)."""
+    return sum(1 for v in geo.values() if v in ("ok", "challenge"))
+
+
+def geo_summary(geo):
+    if not geo:
+        return ""
+    bad = [f"{d}: {GEO_LABEL[v]}" for d, v in geo.items() if v not in ("ok", "challenge")]
+    return f"сайты {geo_score(geo)}/{len(geo)}" + (f" ({'; '.join(bad)})" if bad else "")
+
+
+def start_xray_probe(profile):
+    """Пробный xray-core для профиля: процесс или None."""
+    global TUNNEL_TRACE_LAST
+    install_xray()
+    path = tunnel_path("probe-xray.json")
+    write_json(path, xray_config(profile, XRAY_PROBE_PORT))
+    logf = open(tunnel_path("probe-xray.log"), "w")
+    proc = subprocess.Popen([xray_path(), "run", "-c", path], stdout=logf, stderr=subprocess.STDOUT)
+    logf.close()
+    if not wait_local_port(XRAY_PROBE_PORT, 8.0, proc):
+        TUNNEL_TRACE_LAST = "xray-core не запустился: " + " | ".join(file_tail(tunnel_path("probe-xray.log"), 3))
+        stop_proc(proc)
+        return None
+    return proc
+
+
+def stop_proc(proc):
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def test_profile(profile):
-    """Пробный запуск профиля: (задержка мс или -1, страна выхода)."""
+    """Пробный запуск профиля: (задержка мс или -1, страна выхода, {сайт: статус})."""
     global TUNNEL_TRACE_LAST
     host, port, is_udp = profile_server(profile)
     # Быстрый отсев: если TCP-порт сервера не отвечает, туннель не поднимется.
@@ -2834,8 +3180,16 @@ def test_profile(profile):
                 os.remove(tunnel_path("probe.log"))
             except OSError:
                 pass
-            return -1, None
-    eps, obs = profile_parts(profile)
+            return -1, None, {}
+    xproc = None
+    if profile.get("engine") == "xray":
+        try:
+            xproc = start_xray_probe(profile)
+        except Exception as e:
+            TUNNEL_TRACE_LAST = f"xray-core: {e}"
+        if xproc is None:
+            return -1, None, {}
+    eps, obs = profile_parts(profile, probe=True)
     cfg = {
         "log": {"level": "info"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
@@ -2854,27 +3208,30 @@ def test_profile(profile):
                             stdout=logf, stderr=subprocess.STDOUT)
     try:
         if not wait_local_port(TUNNEL_PROBE_PORT, 8.0, proc):
-            return -1, None
+            return -1, None, {}
         if tunnel_trace(TUNNEL_PROBE_PORT, 6.0) < 0:
-            return -1, None
+            return -1, None, {}
         loc = TUNNEL_EXIT.get("loc")
         ping = tunnel_ping(TUNNEL_PROBE_PORT)
-        if ping >= 2:
-            return ping, loc
-        t = tunnel_trace(TUNNEL_PROBE_PORT, 6.0)
-        return (t if t >= 0 else -1), loc
+        if ping < 2:
+            ping = tunnel_trace(TUNNEL_PROBE_PORT, 6.0)
+        if ping < 0:
+            return -1, loc, {}
+        return ping, loc, geo_check(TUNNEL_PROBE_PORT)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        stop_proc(proc)
+        stop_proc(xproc)
         logf.close()
 
 
 def select_profile(skip=(), autostart=True):
-    """Проверяет все профили и выбирает рабочий с наименьшей задержкой."""
+    """
+    Проверяет все профили и выбирает лучший: сначала тот, с которого
+    открывается больше сайтов из списка региональных ограничений, затем
+    зарубежный выход, затем наименьшая задержка. Снимает ручное закрепление.
+    """
     profiles = load_profiles()
+    merge_list_file(geo_list_path(), SEED_GEO)
     if not profiles:
         set_tunnel_error("Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.")
         return None
@@ -2888,27 +3245,33 @@ def select_profile(skip=(), autostart=True):
             continue
         sys.stdout.write(f"    {p['name'][:40]:<40} ")
         sys.stdout.flush()
-        ms, loc = test_profile(p)
+        ms, loc, geo = test_profile(p)
         if ms >= 0:
-            results.append({"name": p["name"], "ms": ms, "loc": loc})
+            results.append({"name": p["name"], "ms": ms, "loc": loc, "geo": geo,
+                            "geo_ok": geo_score(geo)})
             flag = _c(C.YELLOW, " (Россия!)") if loc == "RU" else ""
-            print(_c(C.GREEN, f"{ms} мс, выход: {loc}") + flag)
+            gs = geo_summary(geo)
+            print(_c(C.GREEN, f"{ms} мс, выход: {loc}") + flag + (f", {gs}" if gs else ""))
         else:
             print(_c(C.GRAY, "нет ответа"))
             last_fail = [f"Профиль «{p['name']}»: {TUNNEL_TRACE_LAST}"] + file_tail(tunnel_path("probe.log"), 6)
-    # Зарубежный выход важнее скорости: с российским адресом сервисы,
-    # закрытые для России, не откроются.
-    results.sort(key=lambda r: (r["loc"] == "RU", r["ms"]))
+    # Доступ к сайтам с региональными ограничениями важнее всего, затем
+    # зарубежный выход, затем скорость.
+    results.sort(key=lambda r: (-r["geo_ok"], r["loc"] == "RU", r["ms"]))
     if not results:
         set_tunnel_error("Ни один профиль туннеля не ответил.", last_fail)
         warn("Сервер недоступен или его протокол блокируется провайдером.")
         info("Попробуйте при запущенном zapret, другой сервер или другой протокол.")
         return None
     best = results[0]
-    write_json(tunnel_path("state.json"), {"active": best["name"], "ranked": results,
+    write_json(tunnel_path("state.json"), {"active": best["name"], "pinned": False, "ranked": results,
                                            "tested": datetime.now().isoformat(timespec="seconds")})
     clear_tunnel_error()
-    ok(f"Лучший профиль: {best['name']} (задержка {best['ms']} мс, выход: {best['loc']})")
+    gs = geo_summary(best["geo"])
+    ok(f"Лучший профиль: {best['name']} (задержка {best['ms']} мс, выход: {best['loc']}"
+       + (f", {gs}" if gs else "") + ")")
+    if best["geo"] and best["geo_ok"] < len(best["geo"]):
+        warn("Ни с одного профиля не открываются все сайты из списка региональных ограничений.")
     if autostart:
         if was_running or (tunnel_enabled() and nfqws2_running()):
             start_tunnel()
@@ -2917,6 +3280,52 @@ def select_profile(skip=(), autostart=True):
         else:
             info("Туннель выключен: включите его в меню туннеля, пункт [1].")
     return best["name"]
+
+
+def use_profile(ref):
+    """
+    Ручной выбор: номер или имя профиля закрепляет его (автовыбор его не
+    сменит); 'auto' снимает закрепление и выбирает лучший заново.
+    """
+    ensure_root(sys.argv)
+    ref = str(ref).strip()
+    if ref.lower() in ("auto", "авто"):
+        return select_profile()
+    profiles = load_profiles()
+    profile = None
+    if ref.isdigit() and 1 <= int(ref) <= len(profiles):
+        profile = profiles[int(ref) - 1]
+    else:
+        profile = next((p for p in profiles if p["name"] == ref), None) \
+            or next((p for p in profiles if ref.lower() in p["name"].lower()), None)
+    if not profile:
+        raise ProfileError(f"профиль не найден: {ref}")
+    st = read_json(tunnel_path("state.json")) or {}
+    st.update({"active": profile["name"], "pinned": True})
+    was_running = tunnel_running()
+    write_json(tunnel_path("state.json"), st)
+    ok(f"Выбран профиль «{profile['name']}». Он закреплён: автовыбор его не сменит.")
+    if was_running or (tunnel_enabled() and nfqws2_running()):
+        start_tunnel()
+    elif not tunnel_enabled():
+        info("Туннель выключен: включите его в меню туннеля, пункт [1].")
+    return profile["name"]
+
+
+def tunnel_geo():
+    """Проверка сайтов с региональными ограничениями через работающий туннель."""
+    merge_list_file(geo_list_path(), SEED_GEO)
+    if not tunnel_running():
+        err("Туннель не запущен")
+        return
+    head("Проверка региональных ограничений через активный профиль...")
+    geo = geo_check(TUNNEL_MIXED_PORT)
+    for d, v in geo.items():
+        color = C.GREEN if v in ("ok", "challenge") else C.RED
+        print(f"    {d:<28} " + _c(color, GEO_LABEL[v]))
+    info(f"Список сайтов: {geo_list_path()} (можно править вручную)")
+    if geo and geo_score(geo) < len(geo) and len(load_profiles()) > 1:
+        info("Пункт «Проверить профили и выбрать лучший» подберёт профиль, с которого открывается больше сайтов.")
 
 
 # --- запуск и остановка -------------------------------------------------------
@@ -2930,11 +3339,29 @@ def tunnel_enabled():
     return os.path.isfile(tunnel_path("enabled"))
 
 
-def tunnel_unit_content():
+def xray_unit_content():
+    return f"""[Unit]
+Description=Zapret2 tunnel helper (xray-core) for XHTTP and Xray profiles
+After=network-online.target {SERVICE_NAME}.service
+PartOf={TUNNEL_SERVICE}.service
+
+[Service]
+Type=simple
+ExecStart={xray_path()} run -c {tunnel_path('xray.json')}
+Restart=on-failure
+RestartSec=5
+"""
+
+
+def tunnel_unit_content(with_xray=False):
+    xray = f"\nRequires={XRAY_SERVICE}.service\nAfter={XRAY_SERVICE}.service" if with_xray else ""
+    # WantedBy/PartOf: при автозапуске обхода туннель поднимается и
+    # останавливается вместе со службой zapret.
     return f"""[Unit]
 Description=Zapret2 tunnel (sing-box) for sites zapret can't open
 After=network-online.target {SERVICE_NAME}.service
 Wants=network-online.target
+PartOf={SERVICE_NAME}.service{xray}
 
 [Service]
 Type=simple
@@ -2944,8 +3371,21 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy={SERVICE_NAME}.service
 """
+
+
+def sync_tunnel_autostart():
+    """
+    Автозапуск обхода запускает и туннель: юнит туннеля привязан к службе
+    zapret, пока включены и автозапуск, и туннель.
+    """
+    if not os.path.isfile(TUNNEL_UNIT_PATH):
+        return
+    # disable убирает и прежнюю привязку к multi-user.target (версия 1.5.0).
+    run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
+    if service_enabled() and tunnel_enabled():
+        run(["systemctl", "enable", TUNNEL_SERVICE], timeout=60)
 
 
 def set_tunnel_error(message, details=()):
@@ -2994,9 +3434,28 @@ def start_tunnel_process(profile):
     if rc != 0:
         set_tunnel_error("Конфиг sing-box не прошёл проверку.", (errout or out).splitlines())
         return "crash"
+    use_xray = profile.get("engine") == "xray"
+    if use_xray:
+        try:
+            install_xray()
+        except Exception as e:
+            set_tunnel_error(f"xray-core не скачался: {e}")
+            return "crash"
+        write_json(tunnel_path("xray.json"), xray_config(profile, XRAY_PORT))
+        with open(XRAY_UNIT_PATH, "w", encoding="utf-8") as f:
+            f.write(xray_unit_content())
     with open(TUNNEL_UNIT_PATH, "w", encoding="utf-8") as f:
-        f.write(tunnel_unit_content())
+        f.write(tunnel_unit_content(with_xray=use_xray))
     run(["systemctl", "daemon-reload"], timeout=60)
+    if use_xray:
+        run(["systemctl", "reset-failed", XRAY_SERVICE], timeout=30)
+        run(["systemctl", "restart", XRAY_SERVICE], timeout=60)
+        if not wait_local_port(XRAY_PORT, 10.0):
+            rc, out, _ = run(["journalctl", "-u", XRAY_SERVICE, "-n", "12", "--no-pager", "-o", "cat"], timeout=15)
+            set_tunnel_error("xray-core не запустился.", [ln for ln in out.splitlines() if ln.strip()])
+            return "crash"
+    elif os.path.isfile(XRAY_UNIT_PATH):
+        run(["systemctl", "stop", XRAY_SERVICE], timeout=60)
     run(["systemctl", "reset-failed", TUNNEL_SERVICE], timeout=30)
     run(["systemctl", "restart", TUNNEL_SERVICE], timeout=60)
     # Создание TUN и маршрутов может занять несколько секунд.
@@ -3047,7 +3506,10 @@ def start_tunnel():
         return
     head(f"Запуск туннеля (профиль «{profile['name']}»)...")
     r = start_tunnel_process(profile)
-    if r == "notunnel" and len(load_profiles()) > 1:
+    if r == "notunnel" and st.get("pinned"):
+        warn("Профиль выбран вручную, поэтому на другой не переключаюсь. "
+             "Автовыбор: меню туннеля, пункт [5].")
+    elif r == "notunnel" and len(load_profiles()) > 1:
         warn("Профиль не отвечает, проверяю остальные...")
         stop_tunnel(quiet=True)
         name = select_profile(skip=(profile["name"],), autostart=False)
@@ -3058,8 +3520,7 @@ def start_tunnel():
         err("Туннель не запущен. Причина выше; она же в меню туннеля и в журнале:")
         info(f"journalctl -u {TUNNEL_SERVICE}")
         return
-    if tunnel_enabled():
-        run(["systemctl", "enable", TUNNEL_SERVICE], timeout=60)
+    sync_tunnel_autostart()
     apply_tunnel_dns()
     flush_dns()
     ok(f"Туннель работает: «{profile['name']}». Сайтов в списке туннеля: "
@@ -3134,7 +3595,10 @@ def stop_tunnel(quiet=False):
             pass
     if os.path.isfile(TUNNEL_UNIT_PATH):
         run(["systemctl", "stop", TUNNEL_SERVICE], timeout=60)
+    if os.path.isfile(XRAY_UNIT_PATH):
+        run(["systemctl", "stop", XRAY_SERVICE], timeout=60)
     run(["pkill", "-f", f"{singbox_path()} run"])
+    run(["pkill", "-f", f"{xray_path()} run"])
     if not quiet:
         ok("Туннель остановлен")
 
@@ -3145,6 +3609,7 @@ def enable_tunnel(assume_yes=False):
     os.makedirs(tunnel_dir(), exist_ok=True)
     os.makedirs(ipset_dir(), exist_ok=True)
     merge_list_file(tunnel_list_path(), SEED_TUNNEL)
+    merge_list_file(geo_list_path(), SEED_GEO)
     if not load_profiles():
         err("Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).")
         return
@@ -3338,7 +3803,8 @@ CUSTOM_HELP = f"""
 def tunnel_status_line():
     st = read_json(tunnel_path("state.json")) or {}
     if tunnel_running():
-        state = _c(C.GREEN, f"работает, профиль «{st.get('active')}»")
+        state = _c(C.GREEN, f"работает, профиль «{st.get('active')}»"
+                   + (" (выбран вручную)" if st.get("pinned") else ""))
     elif tunnel_starter_pid():
         state = _c(C.YELLOW, "запускается...")
     else:
@@ -3355,12 +3821,23 @@ def show_profiles():
     if not profiles:
         info("Профилей нет")
         return profiles
-    active = (read_json(tunnel_path("state.json")) or {}).get("active")
+    st = read_json(tunnel_path("state.json")) or {}
+    active = st.get("active")
+    tested = {r["name"]: r for r in st.get("ranked") or []}
     for i, p in enumerate(profiles, 1):
         host, port, _ = profile_server(p)
-        mark = _c(C.GREEN, " <- активный") if p["name"] == active else ""
+        mark = ""
+        if p["name"] == active:
+            mark = _c(C.GREEN, " <- активный" + (", выбран вручную" if st.get("pinned") else ""))
         src = "Proton" if p.get("source") == "proton" else "свой"
-        print(f"    [{i}] {p['name']}  [{p['type']}, {src}]  {host}:{port}{mark}")
+        r = tested.get(p["name"])
+        res = ""
+        if r:
+            gs = geo_summary(r.get("geo") or {})
+            res = _c(C.GRAY, f"  {r['ms']} мс, выход {r['loc']}" + (f", {gs}" if gs else ""))
+        elif st.get("ranked") is not None:
+            res = _c(C.GRAY, "  при проверке не ответил")
+        print(f"    [{i}] {p['name']}  [{p['type']}, {src}]  {host}:{port}{res}{mark}")
     return profiles
 
 
@@ -3378,11 +3855,13 @@ def tunnel_menu():
         print(f"  [1] {'Выключить' if en else 'Включить'} туннель")
         print("  [2] Proton VPN Free: импортировать конфиг WireGuard")
         print("  [3] Свой сервер: импортировать конфиг, ссылку или подписку")
-        print("  [4] Проверить профили и выбрать лучший")
-        print("  [5] Проверить сайты и перенести в туннель те, что не открываются через zapret")
-        print("  [6] Добавить домен в туннель вручную")
-        print("  [7] Проверить сайты из списка туннеля (как в браузере)")
-        print("  [8] Профили: показать / удалить")
+        print("  [4] Выбрать профиль вручную")
+        print("  [5] Проверить профили и выбрать лучший автоматически")
+        print("  [6] Проверить сайты и перенести в туннель те, что не открываются через zapret")
+        print("  [7] Добавить домен в туннель вручную")
+        print("  [8] Проверить сайты из списка туннеля (как в браузере)")
+        print("  [9] Профили: показать / удалить")
+        print("  [10] Региональные ограничения: проверить сайты через активный профиль")
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
@@ -3411,10 +3890,18 @@ def tunnel_menu_action(ch, en):
         import_profiles(read_user_input(value), "proton" if ch == "2" else "custom")
         select_profile()
     elif ch == "4":
-        select_profile()
+        if not show_profiles():
+            return
+        n = input("  Номер профиля (a — выбрать автоматически, Enter — отмена): ").strip()
+        if n:
+            use_profile("auto" if n.lower() in ("a", "а") else n)
     elif ch == "5":
-        update_tunnel_routes()
+        select_profile()
     elif ch == "6":
+        update_tunnel_routes()
+    elif ch == "10":
+        tunnel_geo()
+    elif ch == "7":
         d = input("  Домен (например, example.com): ").strip().lower()
         if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
             add_tunnel_domains([d])
@@ -3424,9 +3911,9 @@ def tunnel_menu_action(ch, en):
                 tunnel_test([d])
         else:
             err("Некорректный домен")
-    elif ch == "7":
-        tunnel_test()
     elif ch == "8":
+        tunnel_test()
+    elif ch == "9":
         profiles = show_profiles()
         if not profiles:
             return
@@ -3610,6 +4097,8 @@ ACTIONS = {
     "tunnel-off": None,
     "tunnel-import": None,
     "tunnel-select": None,
+    "tunnel-use": None,
+    "tunnel-geo": None,
     "tunnel-routes": None,
     "tunnel-test": None,
     "tunnel-list": None,
@@ -3644,7 +4133,9 @@ def main():
   tunnel-off     выключить туннель
   tunnel-import  добавить сервер: --config <файл> или --link <ссылка/подписка>;
                  с --proton — как конфиг Proton VPN Free
-  tunnel-select  проверить профили и выбрать лучший
+  tunnel-select  проверить профили и выбрать лучший (с учётом региональных ограничений сайтов)
+  tunnel-use     выбрать профиль вручную: --profile <номер | имя | auto>
+  tunnel-geo     проверить сайты с региональными ограничениями через активный профиль
   tunnel-routes  проверить сайты и перенести неоткрывающиеся в туннель
   tunnel-test    проверить сайты из списка туннеля так, как их видит браузер
   tunnel-list    показать профили
@@ -3662,6 +4153,7 @@ def main():
     )
     parser.add_argument("--config", help="tunnel-import: путь к файлу конфига (WireGuard .conf, JSON, список ссылок)")
     parser.add_argument("--link", help="tunnel-import: ссылка на сервер (vless://… и др.) или адрес подписки")
+    parser.add_argument("--profile", help="tunnel-use: номер или имя профиля; auto - выбрать автоматически")
     parser.add_argument("--proton", action="store_true", help="tunnel-import: это конфиг Proton VPN Free")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="не задавать вопросов подтверждения")
@@ -3696,6 +4188,8 @@ def main():
         "tunnel-off": disable_tunnel,
         "tunnel-import": do_import,
         "tunnel-select": lambda: (ensure_root(sys.argv), select_profile()),
+        "tunnel-use": lambda: use_profile(args.profile or "") if args.profile else (show_profiles(), info("укажите --profile <номер | имя | auto>")),
+        "tunnel-geo": tunnel_geo,
         "tunnel-routes": update_tunnel_routes,
         "tunnel-test": tunnel_test,
         "tunnel-list": show_profiles,
