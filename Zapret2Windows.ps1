@@ -43,9 +43,195 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.1.0'
-$script:UpdateRepo='HikariRisser/Zapret2WinScrpt'
+$script:ScriptVersion='1.2.0'
+$script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
+
+# "Белый" SNI для фейковых ClientHello. ТСПУ пропускает соединения к
+# хостингам (Cloudflare, Hetzner, OVH, AWS...) только для доменов из своего
+# белого списка, остальные обрывает после ~16 КБ. Фейк с белым SNI
+# заставляет DPI отнести поток к разрешённому домену.
+$script:WhiteSni='www.google.com'
+
+# Начальный список доменов для обхода. При каждой установке/обновлении
+# недостающие домены ДОБАВЛЯЮТСЯ в существующий список, ручные правки
+# пользователя сохраняются.
+$script:SeedDomains=@(
+    'archive.org','cdn-telegram.org','cdninstagram.com','cloudflare-dns.com',
+    'cloudflare-ech.com','cloudflare.com','dis.gd','discord-attachments-uploads-prd.storage.googleapis.com',
+    'discord.co','discord.com','discord.dev','discord.gg',
+    'discord.gift','discord.media','discord.new','discordapp.com',
+    'discordapp.net','discordcdn.com','discordstatus.com','facebook.com',
+    'facebook.net','fb.com','fb.me','fbcdn.net',
+    'fbsbx.com','ggpht.com','github.com','githubassets.com',
+    'githubusercontent.com','googlevideo.com','instagram.com','jnn-pa.googleapis.com',
+    'jtvnw.net','licdn.com','linkedin.com','live-video.net',
+    'medium.com','messenger.com','nnmclub.to','patreon.com',
+    'proton.me','protonmail.com','rbxcdn.com','redd.it',
+    'reddit.com','redditmedia.com','redditstatic.com','roblox.com',
+    'rutor.info','rutor.is','rutracker.cc','rutracker.org',
+    'signal.org','sndcdn.com','soundcloud.com','spotify.com',
+    't-ru.org','t.co','t.me','telegra.ph',
+    'telegram.me','telegram.org','telesco.pe','threads.com',
+    'threads.net','tiktok.com','tiktokcdn.com','tiktokv.com',
+    'ttvnw.net','ttwstatic.com','twimg.com','twitch.tv',
+    'twitter.com','viber.com','wa.me','whatsapp.com',
+    'whatsapp.net','x.com','youtu.be','youtube-nocookie.com',
+    'youtube.com','youtubei.googleapis.com','youtubekids.com','yt.be',
+    'yt3.googleusercontent.com','ytimg.com'
+)
+$script:SeedExclude=@('localhost','local','example.com')
+
+# Подсети хостингов, которые ТСПУ режет "по 16 КБ". Для них работает
+# отдельный профиль с белым SNI - сайты, которых нет в списках доменов,
+# тоже открываются. Файл можно дополнять своими подсетями.
+$script:SeedHostingIpset=@(
+    '# Cloudflare (https://www.cloudflare.com/ips/)',
+    '173.245.48.0/20',
+    '103.21.244.0/22',
+    '103.22.200.0/22',
+    '103.31.4.0/22',
+    '141.101.64.0/18',
+    '108.162.192.0/18',
+    '190.93.240.0/20',
+    '188.114.96.0/20',
+    '197.234.240.0/22',
+    '198.41.128.0/17',
+    '162.158.0.0/15',
+    '104.16.0.0/13',
+    '104.24.0.0/14',
+    '172.64.0.0/13',
+    '131.0.72.0/22',
+    '2400:cb00::/32',
+    '2606:4700::/32',
+    '2803:f800::/32',
+    '2405:b500::/32',
+    '2405:8100::/32',
+    '2a06:98c0::/29',
+    '2c0f:f248::/32',
+    '# Amazon CloudFront',
+    '13.32.0.0/15',
+    '13.35.0.0/16',
+    '13.224.0.0/14',
+    '18.64.0.0/14',
+    '18.154.0.0/15',
+    '18.160.0.0/15',
+    '18.164.0.0/15',
+    '18.172.0.0/15',
+    '52.84.0.0/15',
+    '54.182.0.0/16',
+    '54.192.0.0/16',
+    '54.230.0.0/16',
+    '54.239.128.0/18',
+    '99.84.0.0/16',
+    '99.86.0.0/16',
+    '108.138.0.0/15',
+    '108.156.0.0/14',
+    '143.204.0.0/16',
+    '205.251.192.0/19',
+    '# Hetzner',
+    '5.9.0.0/16',
+    '5.75.128.0/17',
+    '23.88.0.0/17',
+    '37.27.0.0/16',
+    '46.4.0.0/16',
+    '49.12.0.0/15',
+    '65.21.0.0/16',
+    '65.108.0.0/15',
+    '78.46.0.0/15',
+    '88.99.0.0/16',
+    '88.198.0.0/16',
+    '91.107.128.0/17',
+    '95.216.0.0/15',
+    '116.202.0.0/15',
+    '128.140.0.0/17',
+    '135.181.0.0/16',
+    '136.243.0.0/16',
+    '138.201.0.0/16',
+    '144.76.0.0/16',
+    '148.251.0.0/16',
+    '157.90.0.0/16',
+    '159.69.0.0/16',
+    '162.55.0.0/16',
+    '167.235.0.0/16',
+    '168.119.0.0/16',
+    '176.9.0.0/16',
+    '178.63.0.0/16',
+    '188.40.0.0/16',
+    '195.201.0.0/16',
+    '213.133.96.0/19',
+    '213.239.192.0/18',
+    '# OVH',
+    '5.39.0.0/17',
+    '5.135.0.0/16',
+    '5.196.0.0/16',
+    '37.59.0.0/16',
+    '37.187.0.0/16',
+    '46.105.0.0/16',
+    '51.38.0.0/16',
+    '51.68.0.0/16',
+    '51.75.0.0/16',
+    '51.77.0.0/16',
+    '51.89.0.0/16',
+    '51.91.0.0/16',
+    '51.195.0.0/16',
+    '54.36.0.0/14',
+    '87.98.128.0/17',
+    '91.121.0.0/16',
+    '92.222.0.0/16',
+    '94.23.0.0/16',
+    '137.74.0.0/16',
+    '141.94.0.0/15',
+    '145.239.0.0/16',
+    '147.135.0.0/16',
+    '149.202.0.0/16',
+    '151.80.0.0/16',
+    '164.132.0.0/16',
+    '176.31.0.0/16',
+    '178.32.0.0/15',
+    '188.165.0.0/16',
+    '193.70.0.0/17',
+    '213.186.32.0/19',
+    '213.251.128.0/18',
+    '217.182.0.0/16',
+    '# DigitalOcean',
+    '46.101.0.0/16',
+    '64.225.0.0/16',
+    '64.227.0.0/16',
+    '68.183.0.0/16',
+    '104.131.0.0/16',
+    '104.236.0.0/16',
+    '107.170.0.0/16',
+    '128.199.0.0/16',
+    '134.122.0.0/16',
+    '134.209.0.0/16',
+    '137.184.0.0/16',
+    '138.68.0.0/16',
+    '138.197.0.0/16',
+    '139.59.0.0/16',
+    '142.93.0.0/16',
+    '143.198.0.0/16',
+    '146.190.0.0/16',
+    '157.230.0.0/16',
+    '157.245.0.0/16',
+    '159.65.0.0/16',
+    '159.89.0.0/16',
+    '159.203.0.0/16',
+    '161.35.0.0/16',
+    '164.90.0.0/16',
+    '164.92.0.0/16',
+    '165.22.0.0/16',
+    '165.227.0.0/16',
+    '167.71.0.0/16',
+    '167.99.0.0/16',
+    '167.172.0.0/16',
+    '170.64.0.0/16',
+    '174.138.0.0/17',
+    '178.62.0.0/16',
+    '178.128.0.0/16',
+    '188.166.0.0/16',
+    '206.189.0.0/16'
+)
 
 function Test-Admin {
     $id=[Security.Principal.WindowsIdentity]::GetCurrent()
@@ -130,6 +316,28 @@ function Get-Upstream {
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Write-Host "  Релиз распакован в: $ZapretRoot" -ForegroundColor Green
 }
+function Merge-ListFile {
+    <#
+      Дописывает в файл списка недостающие строки из $Seed, ничего не
+      удаляя: ручные правки и комментарии пользователя сохраняются.
+      Возвращает число добавленных строк.
+    #>
+    param([string]$Path,[string[]]$Seed)
+    $have=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $lines=New-Object System.Collections.Generic.List[string]
+    if(Test-Path -LiteralPath $Path){
+        foreach($l in [IO.File]::ReadAllLines($Path)){ $lines.Add($l); [void]$have.Add($l.Trim()) }
+    }
+    $added=0
+    foreach($x in $Seed){
+        if(-not $x){continue}
+        if($have.Add($x.Trim())){ $lines.Add($x); $added++ }
+    }
+    if($added -or -not (Test-Path -LiteralPath $Path)){
+        [IO.File]::WriteAllLines($Path,$lines,[Text.UTF8Encoding]::new($false))
+    }
+    return $added
+}
 function Install-Runtime {
     Ensure-Admin
     if(-not (Test-Path $ZapretRoot)){Get-Upstream}
@@ -161,19 +369,7 @@ function Install-Runtime {
     foreach($f in @('windivert_part.discord_media.txt','windivert_part.stun.txt','windivert_part.wireguard.txt')){
         Copy-Item (Join-Path $wfSource $f) (Join-Path $wfDest $f) -Force
     }
-    $allDomains=@(
-      'discord.com','discord.gg','discordapp.com','discordapp.net','discord.media','discordcdn.com',
-      'rutracker.org','youtube.com','youtu.be','googlevideo.com','ytimg.com',
-      'instagram.com','facebook.com','fbcdn.net','fbsbx.com','threads.net',
-      'x.com','twitter.com','twimg.com','t.me','telegram.org','telegram.me',
-      'reddit.com','redditstatic.com','redd.it','tiktok.com','tiktokcdn.com',
-      'github.com','githubusercontent.com','githubassets.com','cloudflare.com','cloudflare-dns.com',
-      'medium.com','soundcloud.com','spotify.com','twitch.tv','ttvnw.net'
-    ) | Sort-Object -Unique
-    $blockedW=Join-Path $script:Runtime 'lists\blocked.txt'
-    if(-not (Test-Path $blockedW)){
-        [IO.File]::WriteAllLines($blockedW,$allDomains,[Text.UTF8Encoding]::new($false))
-    }
+    $null=Merge-ListFile (Join-Path $script:Runtime 'lists\blocked.txt') $script:SeedDomains
 
     # --- Безопасность: всё боевое переносим в каталог, доступный на запись
     # только Administrators/SYSTEM. Рабочая папка проекта может быть
@@ -197,17 +393,15 @@ function Install-Runtime {
     Copy-Item (Join-Path $script:Runtime 'windivert.filter') (Join-Path $script:TrustedRuntime 'windivert.filter') -Recurse -Force
     foreach($d in @('lists','logs')){New-Item -ItemType Directory -Path (Join-Path $script:TrustedRuntime $d) -Force | Out-Null}
 
-    # Списки живут в защищённом каталоге. Существующие (в т.ч. выученные
-    # autohostlist) не перезаписываем.
-    $blocked=Join-Path $script:TrustedRuntime 'lists\blocked.txt'
-    if(-not (Test-Path $blocked)){
-        [IO.File]::WriteAllLines($blocked,$allDomains,[Text.UTF8Encoding]::new($false))
-    }
-    $exclude=Join-Path $script:TrustedRuntime 'lists\exclude.txt'
-    if(-not (Test-Path $exclude)){
-        [IO.File]::WriteAllLines($exclude,@('localhost','local','example.com'),[Text.UTF8Encoding]::new($false))
-    }
-    $auto=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'
+    # Списки живут в защищённом каталоге. Недостающие записи дописываются,
+    # ручные правки и выученный autohostlist сохраняются.
+    $lists=Join-Path $script:TrustedRuntime 'lists'
+    $n=Merge-ListFile (Join-Path $lists 'blocked.txt') $script:SeedDomains
+    if($n){Write-Host "  Добавлено доменов в список обхода: $n" -ForegroundColor DarkGray}
+    $null=Merge-ListFile (Join-Path $lists 'exclude.txt') $script:SeedExclude
+    $n=Merge-ListFile (Join-Path $lists 'ipset-hosting.txt') $script:SeedHostingIpset
+    if($n){Write-Host "  Добавлено подсетей хостингов: $n" -ForegroundColor DarkGray}
+    $auto=Join-Path $lists 'autohostlist.txt'
     if(-not (Test-Path $auto)){[IO.File]::WriteAllText($auto,'',[Text.UTF8Encoding]::new($false))}
 
     Write-LaunchConfig
@@ -227,38 +421,90 @@ function Write-LaunchConfig {
     $lua=Join-Path $script:TrustedRuntime 'lua'
     $lists=Join-Path $script:TrustedRuntime 'lists'
     $wf=Join-Path $script:TrustedRuntime 'windivert.filter'
-    $args=@(
-      '--wf-tcp-out=80,443','--wf-tcp-in=80,443','--wf-udp-out=443','--wf-udp-in=443','--wf-tcp-empty=1',
+    $blocked=Join-Path $lists 'blocked.txt'
+    $auto=Join-Path $lists 'autohostlist.txt'
+    $exclude=Join-Path $lists 'exclude.txt'
+    $hosting=Join-Path $lists 'ipset-hosting.txt'
+    $sni=$script:WhiteSni
+    # Если пользователь удалил файл подсетей - профиль хостингов не включаем.
+    $useHosting=$false
+    if(Test-Path -LiteralPath $hosting){
+        $useHosting=@(Get-Content -LiteralPath $hosting -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -notmatch '^\s*#' }).Count -gt 0
+    }
+
+    $wsArgs=@(
+      # СКОРОСТЬ. Перехватываем только ИСХОДЯЩИЕ пакеты 80/443. Входящие
+      # SYN+ACK, FIN, RST и HTTP-редиректы фильтр-конструктор winws2
+      # добавляет сам - этого хватает и стратегиям, и детекторам сбоев.
+      # Раньше здесь были --wf-tcp-in/--wf-udp-in (весь скачиваемый трафик,
+      # включая видео, шёл через winws2) и --wf-tcp-empty (все пустые ACK):
+      # по документации zapret2 это до ~50% лишней нагрузки на CPU.
+      '--wf-tcp-out=80,443','--wf-udp-out=443',
       "--wf-raw-part=@$(Join-Path $wf 'windivert_part.discord_media.txt')",
       "--wf-raw-part=@$(Join-Path $wf 'windivert_part.stun.txt')",
       "--wf-raw-part=@$(Join-Path $wf 'windivert_part.wireguard.txt')",
       "--lua-init=@$(Join-Path $lua 'zapret-lib.lua')",
       "--lua-init=@$(Join-Path $lua 'zapret-antidpi.lua')",
+      # zapret-auto.lua: оркестратор circular (автоперебор стратегий).
+      "--lua-init=@$(Join-Path $lua 'zapret-auto.lua')",
       '--hostlist-auto-fail-threshold=3','--hostlist-auto-fail-time=60',
       '--hostlist-auto-retrans-threshold=3','--hostlist-auto-retrans-reset=1',
-      '--hostlist-auto-incoming-maxseq=32768','--hostlist-auto-retrans-maxseq=32768',
-      "--filter-tcp=80","--filter-l7=http", "--hostlist=$(Join-Path $lists 'blocked.txt')",
-      "--hostlist-auto=$(Join-Path $lists 'autohostlist.txt')","--hostlist-exclude=$(Join-Path $lists 'exclude.txt')",
+      '--hostlist-auto-incoming-maxseq=4096','--hostlist-auto-retrans-maxseq=32768',
+
+      # [1] HTTP
+      '--filter-tcp=80','--filter-l7=http',
+      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude",
       '--out-range=-d10','--payload=http_req',
       '--lua-desync=fake:blob=fake_default_http:tcp_md5',
-      '--lua-desync=multisplit:pos=method+2','--new',
-      '--filter-tcp=443','--filter-l7=tls',"--hostlist=$(Join-Path $lists 'blocked.txt')",
-      "--hostlist-auto=$(Join-Path $lists 'autohostlist.txt')","--hostlist-exclude=$(Join-Path $lists 'exclude.txt')",
-      '--out-range=-d10','--payload=tls_client_hello',
-      '--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6',
-      '--lua-desync=multidisorder:pos=1,midsld','--new',
-      '--filter-udp=443','--filter-l7=quic',"--hostlist=$(Join-Path $lists 'blocked.txt')",
-      "--hostlist-auto=$(Join-Path $lists 'autohostlist.txt')","--hostlist-exclude=$(Join-Path $lists 'exclude.txt')",
-      '--payload=quic_initial','--lua-desync=fake:blob=fake_default_quic:repeats=6','--new',
-      # Голос/медиа Discord: IP-discovery (STUN-подобный) и STUN/WireGuard.
+      '--lua-desync=multisplit:pos=method+2'
+    )
+    if($useHosting){
+      $wsArgs+=@(
+        # [2] Хостинги ("16 КБ"). Любой сайт на Cloudflare/Hetzner/OVH/AWS/DO,
+        # которого НЕТ в списках доменов: фейк с белым SNI + разрезание
+        # настоящего ClientHello. Домены из списков обрабатывает профиль [3].
+        # Профиль должен стоять ДО [3]: профиль с autohostlist забирает
+        # себе любой поток, у которого известно имя.
+        '--new','--filter-tcp=443','--filter-l7=tls',"--ipset=$hosting",
+        "--hostlist-exclude=$exclude","--hostlist-exclude=$blocked","--hostlist-exclude=$auto",
+        '--out-range=-d10','--payload=tls_client_hello',
+        "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:tls_mod=rnd,dupsid,sni=${sni}:repeats=6",
+        '--lua-desync=multidisorder:pos=1,midsld'
+      )
+    }
+    $wsArgs+=@(
+      # [3] TLS для доменов из списков. circular перебирает стратегии для
+      # каждого домена 2-го уровня отдельно (nld=2), если текущая не
+      # проходит: 2 сбоя (ретрансмиссии ClientHello или RST от DPI) - и
+      # домен переключается на следующую стратегию. Стратегия 1 - прежняя.
+      '--new','--filter-tcp=443','--filter-l7=tls',
+      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude",
+      '--out-range=-d10',
+      '--in-range=-s5556','--lua-desync=circular:fails=2:retrans=2:nld=2',
+      '--in-range=x','--payload=tls_client_hello',
+      '--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6:strategy=1',
+      '--lua-desync=multidisorder:pos=1,midsld:strategy=1',
+      "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:tls_mod=rnd,dupsid,sni=${sni}:repeats=6:strategy=2",
+      '--lua-desync=multisplit:pos=1,sniext+1:strategy=2',
+      '--lua-desync=hostfakesplit:host=google.com:tcp_md5:strategy=3',
+      '--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls:strategy=4',
+
+      # [4] QUIC. Без автообучения: детектору UDP нужны входящие пакеты,
+      # а их мы больше не перехватываем (иначе весь QUIC-трафик YouTube шёл
+      # бы через winws2). Выученные TCP-домены применяются и к QUIC.
+      '--new','--filter-udp=443','--filter-l7=quic',
+      "--hostlist=$blocked","--hostlist=$auto","--hostlist-exclude=$exclude",
+      '--payload=quic_initial','--lua-desync=fake:blob=fake_default_quic:repeats=6',
+
+      # [5] Голос/медиа Discord: IP-discovery (STUN-подобный) и STUN/WireGuard.
       # Официальная схема zapret2 (init.d/custom.d.examples.*/50-discord-media,
       # 50-stun4all, 50-wg4all): fake с нулевым блобом, repeats=2.
       # Фильтровать по hostlist здесь нельзя - в UDP-медиа нет SNI.
-      '--filter-l7=stun,discord,wireguard',
+      '--new','--filter-l7=stun,discord,wireguard',
       '--payload=stun,discord_ip_discovery,wireguard_initiation,wireguard_cookie',
       '--lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2'
     )
-    [IO.File]::WriteAllLines($cfg,$args,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllLines($cfg,$wsArgs,[Text.UTF8Encoding]::new($false))
 }
 function Start-Zapret {
     Ensure-Admin
@@ -1082,10 +1328,70 @@ function Get-WorkingIPFor {
     # Последовательная проверка. Runspace-пул в PowerShell 5.1 ненадёжен
     # внутри функций, а кандидатов обычно 2-6, так что это быстро.
     $limit=[Math]::Min($cands.Count,$MaxCandidates)
+    # Сначала ищем адрес с правильным сертификатом. Если DPI рвёт
+    # TLS-рукопожатие (обход ещё не запущен), ни один не пройдёт - тогда,
+    # как раньше, берём первый адрес, принимающий TCP-соединение.
+    for($i=0;$i -lt $limit;$i++){
+        if(Test-TlsCert -IP $cands[$i] -HostName $Domain -TimeoutMs 2000){ return $cands[$i] }
+    }
     for($i=0;$i -lt $limit;$i++){
         if(Test-TcpQuick -IP $cands[$i] -Port 443 -TimeoutMs 1500){ return $cands[$i] }
     }
     return $null
+}
+
+function Test-BogonIP {
+    # Адреса, которые провайдерский DNS подставляет вместо настоящих
+    # (заглушки, 0.0.0.0, локальные сети) - это признак DNS-подмены.
+    param([string]$IP)
+    return ($IP -match '^(0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)')
+}
+
+function Test-TlsCert {
+    <#
+      TLS-рукопожатие с IP и проверка, что сертификат действительно выдан
+      на HostName. Заглушка провайдера или чужой узел такой сертификат
+      предъявить не могут, поэтому это надёжнее простого TCP-коннекта.
+    #>
+    param([string]$IP,[string]$HostName,[int]$TimeoutMs=2500)
+    $tcp=$null; $ssl=$null
+    try {
+        $tcp=[Net.Sockets.TcpClient]::new()
+        $ar=$tcp.BeginConnect($IP,443,$null,$null)
+        if(-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)){ return $false }
+        $tcp.EndConnect($ar)
+        $tcp.ReceiveTimeout=$TimeoutMs; $tcp.SendTimeout=$TimeoutMs
+        $ssl=[Net.Security.SslStream]::new($tcp.GetStream(),$false)
+        $proto=[Security.Authentication.SslProtocols]::Tls12
+        try { $proto=$proto -bor [Security.Authentication.SslProtocols]'Tls13' } catch {}
+        $ar2=$ssl.BeginAuthenticateAsClient($HostName,$null,$proto,$false,$null,$null)
+        if(-not $ar2.AsyncWaitHandle.WaitOne($TimeoutMs)){ return $false }
+        $ssl.EndAuthenticateAsClient($ar2)
+        return [bool]$ssl.IsAuthenticated
+    } catch { return $false }
+    finally { if($ssl){$ssl.Dispose()}; if($tcp){$tcp.Dispose()} }
+}
+
+function Test-SystemDnsOk {
+    <#
+      Отвечает на вопрос: нужен ли этому домену пиннинг в hosts вообще?
+      Берём адреса от СИСТЕМНОГО DNS (минуя hosts) и проверяем сертификат.
+      Если системный DNS отдаёт рабочий адрес - пиннинг не нужен и даже
+      вреден: CDN (YouTube, Discord, Cloudflare) выбирает ближайший к вам
+      узел, а адрес из DoH-ответа другого резолвера бывает дальним и со
+      временем устаревает, то есть замедляет или ломает доступ.
+    #>
+    param([string]$Domain)
+    try {
+        $ips=@(Resolve-DnsName -Name $Domain -Type A -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop |
+               Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress })
+    } catch { return $false }
+    if(-not $ips.Count){ return $false }
+    if(@($ips | Where-Object { Test-BogonIP $_ }).Count){ return $false }
+    foreach($ip in @($ips | Select-Object -First 2)){
+        if(Test-TlsCert -IP $ip -HostName $Domain){ return $true }
+    }
+    return $false
 }
 
 function Update-DohHosts {
@@ -1106,17 +1412,26 @@ function Update-DohHosts {
     $targets=New-Object System.Collections.Generic.List[string]
     foreach($d in $domains){
         $targets.Add($d)
-        if($d -notmatch '^www\.'){$targets.Add("www.$d")}
+        # www-вариант имеет смысл только для доменов 2-го уровня.
+        if($d -notmatch '^www\.' -and ($d.Split('.').Count -eq 2)){$targets.Add("www.$d")}
     }
     $domains=@($targets | Select-Object -Unique)
 
     if(-not $Quiet){Write-Host ("  DoH-разрешение {0} доменов..." -f $domains.Count) -ForegroundColor Yellow}
     $resolved=New-Object System.Collections.Generic.List[string]
     $failed=New-Object System.Collections.Generic.List[string]
+    $sysOk=New-Object System.Collections.Generic.List[string]
+    $haveResolveDns=[bool](Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)
     $i=0
     foreach($d in $domains){
         $i++
         if(-not $Quiet){Write-Host ("    [{0}/{1}] {2,-34} " -f $i,$domains.Count,$d) -NoNewline}
+        # Системный DNS честный и адрес рабочий - в hosts не пишем.
+        if($haveResolveDns -and (Test-SystemDnsOk -Domain $d)){
+            $sysOk.Add($d)
+            if(-not $Quiet){Write-Host 'системный DNS в порядке' -ForegroundColor DarkGray}
+            continue
+        }
         $ip=Get-WorkingIPFor -Domain $d
         if($ip){
             $resolved.Add(("{0}`t{1}" -f $ip,$d))
@@ -1143,7 +1458,11 @@ function Update-DohHosts {
     & ipconfig.exe /flushdns | Out-Null
 
     Write-Host ''
-    Write-Host ("  Записано в hosts: {0}, не разрешилось: {1}" -f $resolved.Count,$failed.Count) -ForegroundColor Green
+    Write-Host ("  Записано в hosts: {0}, системный DNS в порядке: {1}, не разрешилось: {2}" -f $resolved.Count,$sysOk.Count,$failed.Count) -ForegroundColor Green
+    if($resolved.Count -and -not (Get-Status).Running){
+        Write-Host '  Совет: повторите это обновление при ЗАПУЩЕННОМ обходе - тогда проверка' -ForegroundColor DarkGray
+        Write-Host '  сертификатов проходит и в hosts попадут только домены с подменой DNS.' -ForegroundColor DarkGray
+    }
     if($failed.Count){
         Write-Host ("  Без рабочего IP: {0}" -f ($failed -join ', ')) -ForegroundColor DarkGray
     }

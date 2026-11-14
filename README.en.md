@@ -54,10 +54,13 @@ powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Uninstall
 ## What is implemented
 
 - official x64/x86 release selection based on Windows architecture;
-- WinDivert full-port interception for TCP 80/443 and UDP 443, both directions;
-- official `zapret-lib.lua` and `zapret-antidpi.lua` from the same release;
+- WinDivert interception of **outgoing** TCP 80/443 and UDP 443 only
+  (incoming SYN+ACK/FIN/RST and HTTP redirects are added by winws2 itself);
+- official `zapret-lib.lua`, `zapret-antidpi.lua` and `zapret-auto.lua` from the same release;
 - HTTP strategy: fake + multisplit;
-- TLS strategy: fake + multidisorder with ClientHello reassembly enabled;
+- TLS strategy: **automatic rotation of 4 strategies** (`circular`) per domain;
+- **hosting profile** (Cloudflare, Hetzner, OVH, AWS CloudFront,
+  DigitalOcean) against the "16 KB" block — fake ClientHello with a whitelisted SNI;
 - QUIC strategy: fake on `quic_initial`;
 - **Discord voice/media profile**: fake on `discord_ip_discovery`, `stun`,
   `wireguard_initiation`, `wireguard_cookie` (official zapret2 scheme from
