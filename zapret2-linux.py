@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1508,6 +1508,23 @@ def collect_report():
                  f"{'работает' if warp_running() else 'не запущен'}")
     file(warp_path("last-error.txt"))
 
+    sec("WARP: журналы")
+    st = read_json(warp_path("state.json")) or {}
+    lines.append(f"state: best={st.get('best')} tested={st.get('tested')} ranked={st.get('ranked')}")
+    lines.append(f"usque: {'есть' if os.path.isfile(usque_path()) else 'нет'}, "
+                 f"регистрация MASQUE: {'есть' if os.path.isfile(usque_config()) else 'нет'}, "
+                 f"регистрация WireGuard: {'есть' if os.path.isfile(warp_path('account.json')) else 'нет'}")
+    uc = read_json(usque_config()) or {}
+    lines.append("usque endpoints: " + ", ".join(
+        f"{k}={uc.get(k)}" for k in ("endpoint_v4", "endpoint_v6", "endpoint_h2_v4", "endpoint_h2_v6")))
+    if os.path.isfile(usque_path()):
+        cmd([usque_path(), "version"])
+    for name in ("probe-usque.log", "probe.log", "start.log"):
+        lines.append(f"--- {name}")
+        lines.extend(file_tail(warp_path(name), 60) or ["<пусто>"])
+    for svc in (USQUE_SERVICE, WARP_SERVICE):
+        cmd(["journalctl", "-u", svc, "-n", "40", "--no-pager", "-o", "cat"])
+
     # Проверка сайтов с отладочным журналом nfqws2: перезапускаем nfqws2 с
     # теми же параметрами + --debug, правила перехвата остаются на месте.
     debug_log = "/tmp/zapret2-nfqws2-debug.log"
@@ -2771,7 +2788,7 @@ def warp_menu():
         warp_status_line()
         en = warp_enabled()
         if en and not warp_running() and not warp_starter_pid():
-            le = file_tail(warp_path("last-error.txt"), 6)
+            le = file_tail(warp_path("last-error.txt"), 40)
             if le:
                 print(_c(C.RED, "  Последняя ошибка:"))
                 for ln in le:

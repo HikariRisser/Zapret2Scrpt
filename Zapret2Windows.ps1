@@ -44,7 +44,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.1'
+$script:ScriptVersion='1.4.2'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1991,7 +1991,7 @@ function Show-WarpMenu {
                     $(if($w.Running){"работает, узел $($w.Endpoint)"}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
                     ' | сайтов в списке: ' + $w.Domains) -ForegroundColor Cyan
         if($w.Enabled -and -not $w.Running -and -not $w.Starting){
-            $le=Get-FileTail (Get-WarpPaths).LastError 6
+            $le=Get-FileTail (Get-WarpPaths).LastError 40
             if($le.Count){
                 Write-Host '  Последняя ошибка:' -ForegroundColor Red
                 $le | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
