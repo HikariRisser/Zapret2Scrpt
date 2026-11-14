@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) and [`Zapret2Windows.ps1`](Zapret2Windows.ps1) | `winws2` + WinDivert |
 
-Script version: 1.7.0. **The console UI is in Russian.** The
+Script version: 1.7.1. **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
