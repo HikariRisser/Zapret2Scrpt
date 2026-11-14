@@ -155,6 +155,7 @@ Windows (PowerShell-парсер недоступен).
 ./zapret2-linux.sh                       # меню (лаунчер сам запросит root)
 ./zapret2-linux.sh install               # любое действие: install, start, warp-on...
 ./zapret2-linux.sh check                 # проверка требований без root
+./zapret2-linux.sh report                # отчёт для поиска неисправностей (/tmp/zapret2-report-*.txt)
 ```
 
 Лаунчер `zapret2-linux.sh` находит Python 3.8+ (если его нет — предлагает

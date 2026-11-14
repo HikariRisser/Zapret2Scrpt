@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -1350,6 +1350,203 @@ def diagnose():
     print()
     warn("Код 200 подтверждает только эти запросы, а не все протоколы и приложения.")
     print()
+    if sys.stdin.isatty():
+        try:
+            ans = input("  Собрать подробный отчёт для поиска неисправности? (y/N) ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans in ("y", "yes", "д", "да"):
+            collect_report()
+
+
+# ----------------------------------------------------------------------------
+#  Подробный отчёт для поиска неисправностей
+# ----------------------------------------------------------------------------
+
+REPORT_TARGETS = ["www.youtube.com", "youtube.com", "i.ytimg.com",
+                  "rr1---sn-4g5e6nz7.googlevideo.com", "discord.com",
+                  "gateway.discord.gg", "cdn.discordapp.com"]
+
+
+def _probe_tls(host, family, timeout=6.0, ip=None):
+    """
+    Одна попытка: DNS -> TCP -> TLS (SNI=host) -> GET / и чтение до 64 КБ.
+    Возвращает строку с этапом, на котором всё оборвалось, и временем.
+    """
+    fam = socket.AF_INET if family == 4 else socket.AF_INET6
+    t0 = time.monotonic()
+    if not ip:
+        try:
+            ips = sorted({i[4][0] for i in socket.getaddrinfo(host, 443, fam, socket.SOCK_STREAM)})
+        except (OSError, UnicodeError) as e:
+            return f"DNS: нет адреса ({e.__class__.__name__})"
+        ip = ips[0]
+    stage = "TCP"
+    try:
+        raw = socket.create_connection((ip, 443), timeout=timeout)
+        stage = "TLS"
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(raw, server_hostname=host) as s:
+            s.settimeout(timeout)
+            t_tls = time.monotonic()
+            stage = "HTTP"
+            s.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {BROWSER_UA}\r\n"
+                      f"Connection: close\r\n\r\n".encode())
+            total = 0
+            first = b""
+            while total < 65536:
+                chunk = s.recv(16384)
+                if not chunk:
+                    break
+                if not first:
+                    first = chunk[:40]
+                total += len(chunk)
+        status = first.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        return (f"OK {ip} TLS {int((t_tls - t0) * 1000)} мс, "
+                f"получено {total} Б, «{status}»")
+    except ssl.SSLCertVerificationError as e:
+        return f"СБОЙ на {stage} {ip}: неверный сертификат ({e.verify_message}) — подмена DNS/заглушка"
+    except (socket.timeout, TimeoutError):
+        return f"СБОЙ на {stage} {ip}: тайм-аут {int(time.monotonic() - t0)} с"
+    except OSError as e:
+        return f"СБОЙ на {stage} {ip}: {e.__class__.__name__} {e}"
+
+
+def collect_report():
+    """Собирает отчёт в файл: конфигурация, правила, процессы, проверки сайтов."""
+    ensure_root(sys.argv)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = f"/tmp/zapret2-report-{stamp}.txt"
+    lines = []
+
+    def sec(title):
+        lines.append("")
+        lines.append("=" * 72)
+        lines.append(title)
+        lines.append("=" * 72)
+
+    def cmd(c, timeout=20):
+        rc, out, errout = run(c, timeout=timeout)
+        lines.append(f"$ {' '.join(c)}  (rc={rc})")
+        lines.extend((out + ("\n" + errout if errout else "")).splitlines() or ["<пусто>"])
+
+    def file(p, grep=None, limit=400):
+        lines.append(f"--- {p}")
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                content = f.read().splitlines()
+            if grep:
+                content = [ln for ln in content if re.search(grep, ln)]
+            lines.extend(content[:limit] or ["<пусто>"])
+        except OSError as e:
+            lines.append(f"<нет: {e.strerror}>")
+
+    head("Сбор отчёта...")
+    sec("Система")
+    lines.append(f"zapret2-linux {VERSION}, zapret2 {ZAPRET_VERSION}, python {sys.version.split()[0]}")
+    cmd(["uname", "-a"])
+    file("/etc/os-release", grep=r"^(PRETTY_NAME|VERSION_ID)=")
+    cmd(["sh", "-c", "lsmod | grep -E 'nfnetlink_queue|nft_queue|xt_NFQUEUE|connbytes|nft_ct|nf_tables' || true"])
+    cmd(["sh", "-c", "sysctl net.netfilter.nf_conntrack_tcp_be_liberal net.ipv6.conf.all.disable_ipv6 2>&1"])
+    cmd(["ip", "-4", "route", "show", "default"])
+    cmd(["ip", "-6", "route", "show", "default"])
+
+    sec("nfqws2")
+    cmd(["sh", "-c", "ps -eo pid,user,args | grep '[n]fqws2' || echo 'nfqws2 не запущен'"])
+    cmd([nfqws2_path(), "--version"])
+    file(os.path.join(ZAPRET_TARGET, "init.log"))
+    file(os.path.join(ZAPRET_TARGET, "config"))
+
+    sec("Правила перехвата")
+    if which("nft"):
+        cmd(["sh", "-c", "nft list ruleset 2>&1 | grep -iE 'table|chain|queue|zapret' | head -80"])
+    if which("iptables-save"):
+        cmd(["sh", "-c", "iptables-save 2>/dev/null | grep -iE 'NFQUEUE|zapret' | head -40"])
+        cmd(["sh", "-c", "ip6tables-save 2>/dev/null | grep -iE 'NFQUEUE|zapret' | head -40"])
+
+    sec("DNS и hosts")
+    file("/etc/resolv.conf", grep=r"^\s*(nameserver|search|options)")
+    file(HOSTS_PATH, grep=r"youtube|googlevideo|ytimg|discord|DoH")
+    if which("resolvectl"):
+        cmd(["sh", "-c", "resolvectl status 2>&1 | grep -E 'DNS Servers|Current DNS|DNSSEC|DNSOverTLS' | head -20"])
+
+    sec("Списки")
+    for name in ("zapret-hosts-user.txt", "zapret-hosts-auto.txt", "zapret-hosts-user-exclude.txt",
+                 WARP_LIST_FILE):
+        p = os.path.join(ipset_dir(), name)
+        doms = list_entries(p)
+        hit = [d for d in doms if re.search(r"youtube|googlevideo|ytimg|ggpht|discord", d)]
+        lines.append(f"{name}: {len(doms)} записей; YouTube/Discord: {', '.join(hit) or '—'}")
+    lines.append(f"WARP: {'включён' if warp_enabled() else 'выключен'}, "
+                 f"{'работает' if warp_running() else 'не запущен'}")
+    file(warp_path("last-error.txt"))
+
+    # Проверка сайтов с отладочным журналом nfqws2: перезапускаем nfqws2 с
+    # теми же параметрами + --debug, правила перехвата остаются на месте.
+    debug_log = "/tmp/zapret2-nfqws2-debug.log"
+    rc, pids, _ = run(["pgrep", "-f", nfqws2_path()])
+    pid = pids.split()[0] if rc == 0 and pids.strip() else None
+    args = None
+    if pid:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode() for a in f.read().split(b"\0") if a]
+        except OSError:
+            args = None
+    dbg_proc = None
+    if args:
+        info("nfqws2 перезапускается с отладочным журналом на время проверок...")
+        run(["kill", pid])
+        time.sleep(1)
+        try:
+            os.remove(debug_log)
+        except OSError:
+            pass
+        dbg_args = [a for a in args if a != "--daemon"] + [f"--debug=@{debug_log}"]
+        dbg_proc = subprocess.Popen(dbg_args, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+        time.sleep(1.5)
+
+    sec("Проверка сайтов (" + ("через nfqws2 с отладкой" if dbg_proc else "nfqws2 НЕ запущен") + ")")
+    for host in REPORT_TARGETS:
+        for fam in (4, 6):
+            res = _probe_tls(host, fam)
+            lines.append(f"IPv{fam} {host:<38} {res}")
+        # Тот же сайт по адресу из DoH: отделяет подмену DNS от проблемы DPI.
+        doh_ips = doh_query(host, "A", timeout=5)
+        if doh_ips:
+            lines.append(f"DoH  {host:<38} {_probe_tls(host, 4, ip=doh_ips[0])}")
+        else:
+            lines.append(f"DoH  {host:<38} DoH не ответил")
+            sys.stdout.write(".")
+            sys.stdout.flush()
+    print()
+
+    if dbg_proc:
+        dbg_proc.terminate()
+        try:
+            dbg_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            dbg_proc.kill()
+        info("Возврат nfqws2 в обычный режим...")
+        run_init("stop")
+        run_init("start")
+        sec("Отладочный журнал nfqws2 (последние 600 строк)")
+        lines.extend(file_tail(debug_log, 600) or ["<пусто>"])
+
+    sec("Отладочный журнал: сводка")
+    tail = file_tail(debug_log, 100000) if dbg_proc else []
+    for pat in ("desync profile", "hostname", "lua_desync", "rawsend", "ERROR", "error"):
+        lines.append(f"{pat}: {sum(1 for ln in tail if pat in ln)}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o644)
+    ok(f"Отчёт сохранён: {path}")
+    info("Пришлите этот файл — по нему видно, на каком этапе ломается доступ.")
+    info("Личных данных в нём нет: только конфигурация, правила и результаты проверок.")
+    return path
 
 
 # ----------------------------------------------------------------------------
@@ -2536,6 +2733,7 @@ ACTIONS = {
     "deps": install_dependencies,
     "doh": doh_update,
     "diagnose": diagnose,
+    "report": collect_report,
     "update": script_update,
     "uninstall": uninstall,
     "warp-on": None,
@@ -2567,6 +2765,7 @@ def main():
   deps       установить отсутствующие зависимости
   doh        обновить DNS через DoH (hosts)
   diagnose   диагностика ресурсов
+  report     подробный отчёт для поиска неисправностей (файл в /tmp)
   update     обновить сам скрипт из GitHub
   uninstall  удалить из системы
   warp-on      включить WARP для сайтов, которые не открывает zapret
