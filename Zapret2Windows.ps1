@@ -47,7 +47,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.6.0'
+$script:ScriptVersion='1.6.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -445,8 +445,12 @@ function Write-LaunchConfig {
     if(-not (Test-Path -LiteralPath $warpList)){ $null=Merge-ListFile $warpList $script:SeedTunnel }
     # Соединение с самим сервером туннеля zapret тоже не трогает.
     $tunnelServers=Join-Path $lists 'ipset-tunnel-servers.txt'
-    $srvEx=@()
-    if(@(Get-ListEntries $tunnelServers).Count){ $srvEx=@("--ipset-exclude=$tunnelServers") }
+    # Туда же входит диапазон FakeIP: трафик, идущий в туннель, zapret не трогает.
+    # Домены из списка туннеля по имени НЕ исключаются: если браузер обошёл DNS
+    # туннеля (свой DNS через HTTPS, старый адрес в памяти) и пошёл на сайт
+    # напрямую, zapret остаётся запасным путём, как до переноса.
+    $null=Merge-ListFile $tunnelServers $script:TunnelIpsetHeader
+    $srvEx=@("--ipset-exclude=$tunnelServers")
     $sni=$script:WhiteSni
     # Если пользователь удалил файл подсетей - профиль хостингов не включаем.
     $useHosting=$false
@@ -475,7 +479,7 @@ function Write-LaunchConfig {
 
       # [1] HTTP
       '--filter-tcp=80','--filter-l7=http',
-      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude","--hostlist-exclude=$warpList",
+      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude",
       '--out-range=-d10','--payload=http_req',
       '--lua-desync=fake:blob=fake_default_http:tcp_md5',
       '--lua-desync=multisplit:pos=method+2'
@@ -488,7 +492,7 @@ function Write-LaunchConfig {
         # Профиль должен стоять ДО [3]: профиль с autohostlist забирает
         # себе любой поток, у которого известно имя.
         '--new','--filter-tcp=443','--filter-l7=tls',"--ipset=$hosting",
-        "--hostlist-exclude=$exclude","--hostlist-exclude=$blocked","--hostlist-exclude=$auto","--hostlist-exclude=$warpList",
+        "--hostlist-exclude=$exclude","--hostlist-exclude=$blocked","--hostlist-exclude=$auto",
         '--out-range=-d10','--payload=tls_client_hello',
         "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:tls_mod=rnd,dupsid,sni=${sni}:repeats=6",
         '--lua-desync=multidisorder:pos=1,midsld'
@@ -500,7 +504,7 @@ function Write-LaunchConfig {
       # проходит: 2 сбоя (ретрансмиссии ClientHello или RST от DPI) - и
       # домен переключается на следующую стратегию. Стратегия 1 - прежняя.
       '--new','--filter-tcp=443','--filter-l7=tls',
-      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude","--hostlist-exclude=$warpList",
+      "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude",
       '--out-range=-d10',
       '--in-range=-s5556','--lua-desync=circular:fails=2:retrans=2:nld=2',
       '--in-range=x','--payload=tls_client_hello',
@@ -515,7 +519,7 @@ function Write-LaunchConfig {
       # а их мы больше не перехватываем (иначе весь QUIC-трафик YouTube шёл
       # бы через winws2). Выученные TCP-домены применяются и к QUIC.
       '--new','--filter-udp=443','--filter-l7=quic',
-      "--hostlist=$blocked","--hostlist=$auto","--hostlist-exclude=$exclude","--hostlist-exclude=$warpList",
+      "--hostlist=$blocked","--hostlist=$auto","--hostlist-exclude=$exclude",
       '--payload=quic_initial','--lua-desync=fake:blob=fake_default_quic:repeats=6',
 
       # [5] Голос/медиа Discord: IP-discovery (STUN-подобный) и STUN/WireGuard.
@@ -526,13 +530,13 @@ function Write-LaunchConfig {
       '--payload=stun,discord_ip_discovery,wireguard_initiation,wireguard_cookie',
       '--lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2'
     )
-    # Исключение серверов туннеля - в каждый TCP-профиль (перед его --new).
+    # Исключение адресов туннеля - в каждый профиль TCP и QUIC (перед его --new).
     if($srvEx.Count){
         $fixed=New-Object System.Collections.Generic.List[string]
         $tcp=$false
         foreach($a in $wsArgs){
             if($a -eq '--new'){ if($tcp){ $fixed.Add($srvEx[0]) }; $tcp=$false }
-            elseif($a -like '--filter-tcp=*'){ $tcp=$true }
+            elseif($a -like '--filter-tcp=*' -or $a -eq '--filter-udp=443'){ $tcp=$true }
             $fixed.Add($a)
         }
         if($tcp){ $fixed.Add($srvEx[0]) }
@@ -1220,6 +1224,16 @@ $script:TunnelFake4='10.249.0.0/16'
 $script:TunnelFake4Prefix='10.249.'
 $script:TunnelFake6='fd7a:7a70:fa4e::/64'
 $script:TunnelNrptComment='Zapret2Tunnel'
+$script:TunnelIpsetHeader=@(
+    '# Адреса, которые zapret не трогает: трафик в туннель (FakeIP) и серверы туннеля.',
+    '# Файл создаётся автоматически.',
+    $script:TunnelFake4,
+    $script:TunnelFake6
+)
+# Firefox спрашивает этот домен у системного DNS; ответ "нет такого домена"
+# выключает его встроенный DNS через HTTPS (если тот включён по умолчанию, а
+# не вручную). Иначе Firefox узнаёт адреса сайтов мимо туннеля.
+$script:DohCanary='use-application-dns.net'
 $script:SupportedFormats='конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; несколько ссылок или подписка (адрес https://... либо base64); JSON sing-box (outbound или целый конфиг); JSON Xray (outbound или целый конфиг). Транспорт XHTTP и конфиги Xray работают через xray-core, остальное - через sing-box'
 # xray-core: только для профилей, которые sing-box не умеет (транспорт XHTTP,
 # конфиги Xray). Работает локальным прокси, в который sing-box отправляет трафик.
@@ -1916,7 +1930,7 @@ function Update-TunnelServers {
         foreach($ip in $cand){ if(-not $ips.Contains($ip)){ $ips.Add($ip) } }
     }
     $p=Get-TunnelPaths
-    $lines=@('# Серверы туннеля: zapret их не трогает. Файл создаётся автоматически.')+$ips.ToArray()
+    $lines=@($script:TunnelIpsetHeader)+$ips.ToArray()
     [IO.File]::WriteAllLines($p.Servers,$lines,[Text.UTF8Encoding]::new($false))
 }
 
@@ -2085,6 +2099,7 @@ function Set-TunnelDns {
     $d=@(Get-ListEntries $p.List)
     if(-not $d.Count){ return }
     $ns=@(); foreach($x in $d){ $ns+=$x; $ns+=".$x" }
+    $ns+=$script:DohCanary
     try {
         # Группами: у одного правила NRPT ограничено число пространств имён.
         for($i=0;$i -lt $ns.Count;$i+=40){
@@ -2125,7 +2140,10 @@ function Write-TunnelConfig {
                 # Настоящие адреса сайтов из списка ищем через сам туннель.
                 [ordered]@{ type='tcp'; tag='tunnel-dns'; server='1.1.1.1'; detour='tunnel' }
             )
-            rules=@([ordered]@{ inbound=@('tun-in'); rule_set=@('tunnel-domains'); query_type=@('A','AAAA'); server='fakeip' })
+            rules=@(
+                [ordered]@{ domain=@($script:DohCanary); action='predefined'; rcode='NXDOMAIN' },
+                [ordered]@{ inbound=@('tun-in'); rule_set=@('tunnel-domains'); query_type=@('A','AAAA'); server='fakeip' }
+            )
             final='local'
         }
         inbounds=@(
