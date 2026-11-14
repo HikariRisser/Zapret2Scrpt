@@ -1676,7 +1676,7 @@ function Find-WarpEndpoint {
     # Автоподбор узла Cloudflare. Этап 1: по случайному адресу из каждой
     # подсети WARP на порту 2408. Этап 2 (если рабочих мало): другие
     # официальные порты WARP - провайдер может резать отдельные порты.
-    param([string[]]$Skip=@())
+    param([string[]]$Skip=@(),[switch]$NoAutostart)
     $p=Get-WarpPaths
     $wasRunning=(Get-WarpStatus).Running
     Stop-Warp -Quiet
@@ -1740,7 +1740,16 @@ function Find-WarpEndpoint {
     if($ranked.Count -gt 1){
         Write-Host ('  Остальные: ' + ((@($ranked | Select-Object -Skip 1 -First 3) | ForEach-Object { "$($_.endpoint) $($_.ms) мс" }) -join ', ')) -ForegroundColor DarkGray
     }
-    if($wasRunning){ Start-Warp }
+    # Узел найден - прежняя ошибка больше не актуальна.
+    Clear-WarpError
+    # После ручного подбора сразу запускаем WARP, если он включён и обход
+    # работает (или WARP работал до подбора) - иначе меню показывало бы
+    # "не запущен" и старую ошибку, будто подбор ничего не дал.
+    if(-not $NoAutostart){
+        if($wasRunning -or ((Get-WarpStatus).Enabled -and (Get-Status).Running)){ Start-Warp }
+        elseif((Get-WarpStatus).Enabled){ Write-Host '  WARP запустится вместе с обходом (пункт [2] главного меню).' -ForegroundColor DarkGray }
+        else { Write-Host '  WARP выключен: включите его в меню WARP, пункт [1].' -ForegroundColor DarkGray }
+    }
     return $ranked[0].endpoint
 }
 
@@ -1834,7 +1843,7 @@ function Start-Warp {
     Stop-Warp -Quiet
     $st=Read-JsonFile $p.State
     $ep=if($st){ $st.best } else { $null }
-    if(-not $ep){ $ep=Find-WarpEndpoint }
+    if(-not $ep){ $ep=Find-WarpEndpoint -NoAutostart }
     if(-not $ep){ return }
     Write-Host "  Запуск sing-box (узел $ep)..." -ForegroundColor Yellow
     $r=Start-WarpProcess $ep
@@ -1842,7 +1851,7 @@ function Start-Warp {
         # Узел перестал отвечать (заблокирован или ушёл) - подбираем новый.
         Write-Host "  Узел $ep не отвечает, подбираю другой..." -ForegroundColor Yellow
         Stop-Warp -Quiet
-        $ep=Find-WarpEndpoint -Skip @($ep)
+        $ep=Find-WarpEndpoint -Skip @($ep) -NoAutostart
         $r=if($ep){ Start-WarpProcess $ep } else { 'crash' }
     }
     if($r -ne 'ok'){

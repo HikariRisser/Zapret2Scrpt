@@ -2359,7 +2359,7 @@ def test_warp_endpoint(endpoint):
             ulog.close()
 
 
-def find_warp_endpoint(skip=()):
+def find_warp_endpoint(skip=(), autostart=True):
     """Автоподбор узла Cloudflare: подсети WARP x официальные порты."""
     import random
     was_running = warp_running()
@@ -2431,8 +2431,18 @@ def find_warp_endpoint(skip=()):
     ok(f"Лучший узел: {results[0]['endpoint']} (задержка {results[0]['ms']} мс)")
     if len(results) > 1:
         info("Остальные: " + ", ".join(f"{r['endpoint']} {r['ms']} мс" for r in results[1:4]))
-    if was_running:
-        start_warp()
+    # Узел найден — прежняя ошибка больше не актуальна.
+    clear_warp_error()
+    # После ручного подбора сразу запускаем WARP, если он включён и обход
+    # работает (или WARP работал до подбора) — иначе меню показывало бы
+    # «не запущен» и старую ошибку, будто подбор ничего не дал.
+    if autostart:
+        if was_running or (warp_enabled() and nfqws2_running()):
+            start_warp()
+        elif warp_enabled():
+            info("WARP запустится вместе с обходом (пункт [2] главного меню).")
+        else:
+            info("WARP выключен: включите его в меню WARP, пункт [1].")
     return results[0]["endpoint"]
 
 
@@ -2598,7 +2608,7 @@ def start_warp():
             warn(str(e).splitlines()[0])
     stop_warp(quiet=True)
     st = read_json(warp_path("state.json")) or {}
-    ep = st.get("best") or find_warp_endpoint()
+    ep = st.get("best") or find_warp_endpoint(autostart=False)
     if not ep:
         return
     head(f"Запуск sing-box (узел {ep})...")
@@ -2606,7 +2616,7 @@ def start_warp():
     if r == "notunnel":
         warn(f"Узел {ep} не отвечает, подбираю другой...")
         stop_warp(quiet=True)
-        ep = find_warp_endpoint(skip=(ep,))
+        ep = find_warp_endpoint(skip=(ep,), autostart=False)
         r = start_warp_process(ep) if ep else "crash"
     if r != "ok":
         stop_warp(quiet=True)
