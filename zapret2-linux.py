@@ -35,7 +35,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -541,10 +541,12 @@ def build_config():
     excl_list = os.path.join(ipd, "zapret-hosts-user-exclude.txt")
     hosting = os.path.join(ipd, HOSTING_IPSET_FILE)
     sni = WHITE_SNI
+    # Домены, переведённые в WARP, zapret не трогает: их трафик идёт в туннель.
+    wx = f"--hostlist-exclude={os.path.join(ipd, WARP_LIST_FILE)}"
 
     profiles = [
         # [1] HTTP
-        "--filter-tcp=80 --filter-l7=http <HOSTLIST> --payload=http_req "
+        f"--filter-tcp=80 --filter-l7=http <HOSTLIST> {wx} --payload=http_req "
         "--lua-desync=fake:blob=fake_default_http:tcp_md5 "
         "--lua-desync=multisplit:pos=method+2",
     ]
@@ -555,14 +557,14 @@ def build_config():
         profiles.append(
             f"--filter-tcp=443 --filter-l7=tls --ipset={hosting} "
             f"--hostlist-exclude={excl_list} --hostlist-exclude={user_list} "
-            f"--hostlist-exclude={auto_list} --payload=tls_client_hello "
+            f"--hostlist-exclude={auto_list} {wx} --payload=tls_client_hello "
             f"--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:"
             f"tls_mod=rnd,dupsid,sni={sni}:repeats=6 "
             "--lua-desync=multidisorder:pos=1,midsld")
     profiles += [
         # [3] TLS для доменов из списков: автоперебор стратегий (circular)
         # отдельно для каждого домена 2-го уровня. Стратегия 1 — прежняя.
-        "--filter-tcp=443 --filter-l7=tls <HOSTLIST> "
+        f"--filter-tcp=443 --filter-l7=tls <HOSTLIST> {wx} "
         "--in-range=-s5556 --lua-desync=circular:fails=2:retrans=2:nld=2 "
         "--in-range=x --payload=tls_client_hello "
         "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6:strategy=1 "
@@ -575,7 +577,7 @@ def build_config():
 
         # [4] QUIC: без автообучения (как в официальном config.default),
         # выученные TCP-домены применяются и здесь.
-        "--filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> --payload=quic_initial "
+        f"--filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> {wx} --payload=quic_initial "
         "--lua-desync=fake:blob=fake_default_quic:repeats=6",
 
         # [5] Голос/медиа Discord, STUN, WireGuard
@@ -590,7 +592,8 @@ def build_config():
 
 NFQWS2_ENABLE=1
 NFQWS2_PORTS_TCP=80,443
-NFQWS2_PORTS_UDP=443,3478,50000-50099,19294-19344
+# 2408,500,1701,4500 — порты WARP: zapret маскирует рукопожатие WireGuard
+NFQWS2_PORTS_UDP=443,3478,50000-50099,19294-19344,2408,500,1701,4500
 
 # Сколько первых пакетов соединения отдавать nfqws2 (connbytes).
 # Без этих переменных init-скрипт zapret2 НЕ создаёт правила перехвата
@@ -670,6 +673,8 @@ def seed_lists():
     if n:
         info(f"добавлено подсетей хостингов: {n}")
 
+    merge_list_file(os.path.join(ipset_dir(), WARP_LIST_FILE), SEED_WARP)
+
     auto = os.path.join(ipset_dir(), "zapret-hosts-auto.txt")
     if not os.path.isfile(auto):
         open(auto, "w", encoding="utf-8").close()
@@ -711,6 +716,11 @@ def start_bypass():
     time.sleep(2)
     if nfqws2_running():
         ok("Обход запущен, nfqws2 работает")
+        if warp_enabled():
+            try:
+                start_warp()
+            except Exception as e:
+                warn(f"WARP не запущен: {e}")
     else:
         raise RuntimeError(
             "nfqws2 не запустился.\n"
@@ -725,6 +735,7 @@ def stop_bypass():
         warn("Среда не установлена")
         return
     head("Остановка обхода...")
+    stop_warp(quiet=True)
     run([init_script(), "stop"], timeout=120)
     time.sleep(1)
     if nfqws2_running():
@@ -735,6 +746,8 @@ def stop_bypass():
 
 
 def status_line():
+    if os.path.isdir(warp_dir()):
+        warp_status_line()
     running = nfqws2_running()
     state = _c(C.GREEN, "работает") if running else _c(C.RED, "остановлен")
     enabled = "включён" if service_enabled() else "выключен"
@@ -1196,6 +1209,9 @@ def doh_update():
     with open(user_list, encoding="utf-8", errors="replace") as f:
         domains = [ln.strip() for ln in f
                    if ln.strip() and not ln.strip().startswith("#")]
+    # Домены WARP разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
+    in_warp = set(list_entries(warp_list_path()))
+    domains = [d for d in domains if d.lower() not in in_warp]
 
     # hosts сопоставляет точное имя: www-варианты нужны отдельно
     targets = []
@@ -1459,7 +1475,7 @@ def uninstall(assume_yes=False):
     print()
     print("  Будет удалено:")
     print("    - процесс nfqws2 и правила файрвола")
-    print("    - служба systemd (автозапуск)")
+    print("    - службы systemd (автозапуск, WARP)")
     print(f"    - каталог {ZAPRET_TARGET}")
     n_marked = count_marked()
     if n_marked:
@@ -1485,7 +1501,15 @@ def uninstall(assume_yes=False):
     run(["pkill", "-f", nfqws2_path()])
     time.sleep(1)
 
+    stop_warp(quiet=True)
+
     head("[2/4] Удаление службы...")
+    run(["systemctl", "disable", WARP_SERVICE], timeout=60)
+    if os.path.isfile(WARP_UNIT_PATH):
+        try:
+            os.remove(WARP_UNIT_PATH)
+        except OSError:
+            pass
     run(["systemctl", "disable", SERVICE_NAME], timeout=60)
     run(["systemctl", "stop", SERVICE_NAME], timeout=60)
     if os.path.isfile(UNIT_PATH):
@@ -1527,6 +1551,656 @@ def uninstall(assume_yes=False):
     else:
         warn("Часть компонентов осталась — повторите удаление.")
     print()
+
+
+# ----------------------------------------------------------------------------
+#  WARP через sing-box: запасной маршрут для сайтов, с которыми не
+#  справляется zapret (блокировка по IP, обрыв «16 КБ», недоступность).
+#
+#  В TUN sing-box маршрутизируется ТОЛЬКО диапазон FakeIP (198.18.0.0/15):
+#  домены из списка WARP получают FakeIP от DNS sing-box и уходят в туннель
+#  WireGuard к Cloudflare, весь остальной трафик идёт мимо sing-box, через
+#  zapret. Узел Cloudflare подбирается автоматически по задержке.
+# ----------------------------------------------------------------------------
+
+SING_BOX_VERSION = "1.14.4"
+WARP_SERVICE = "zapret2win-warp"
+WARP_UNIT_PATH = f"/etc/systemd/system/{WARP_SERVICE}.service"
+WARP_MIXED_PORT = 40480
+WARP_PROBE_PORT = 40481
+WARP_PREFIXES = ["162.159.192", "162.159.193", "162.159.195",
+                 "188.114.96", "188.114.97", "188.114.98", "188.114.99"]
+WARP_PORTS = [2408, 500, 1701, 4500]
+WARP_API = "https://api.cloudflareclient.com/v0a5641/reg"
+WARP_HEADERS = {
+    "User-Agent": "1.1.1.1/6.38.9-5641 (Android 16.0.0)",
+    "CF-Client-Version": "a-6.38.9-5641",
+}
+WARP_LIST_FILE = "zapret2win-hosts-warp.txt"
+SEED_WARP = [
+    "# Сайты, которые открываются через WARP (sing-box), а не через zapret.",
+    "# Пополняется автоматически (меню WARP -> [3]) или вручную, по домену в строке.",
+]
+BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+
+
+def warp_dir():
+    return os.path.join(ZAPRET_TARGET, "warp")
+
+
+def warp_path(name):
+    return os.path.join(warp_dir(), name)
+
+
+def warp_list_path():
+    return os.path.join(ipset_dir(), WARP_LIST_FILE)
+
+
+def singbox_path():
+    return warp_path("sing-box")
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, obj, mode=0o600):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.chmod(path, mode)
+
+
+def list_entries(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            out = []
+            for ln in f:
+                d = ln.strip().lower()
+                if d and not d.startswith("#") and d not in out:
+                    out.append(d)
+            return out
+    except OSError:
+        return []
+
+
+def singbox_arch():
+    m = platform.machine().lower()
+    return {
+        "x86_64": "amd64", "amd64": "amd64",
+        "aarch64": "arm64", "arm64": "arm64",
+        "armv7l": "armv7", "armv7": "armv7",
+        "i386": "386", "i686": "386",
+        "riscv64": "riscv64",
+    }.get(m)
+
+
+def install_singbox():
+    """Скачивает официальную сборку sing-box с GitHub (один раз)."""
+    os.makedirs(warp_dir(), exist_ok=True)
+    exe = singbox_path()
+    if os.access(exe, os.X_OK):
+        rc, out, _ = run([exe, "version"], timeout=15)
+        if rc == 0 and SING_BOX_VERSION in out:
+            return
+    arch = singbox_arch()
+    if not arch:
+        raise RuntimeError(f"нет сборки sing-box для архитектуры {platform.machine()}")
+    name = f"sing-box-{SING_BOX_VERSION}-linux-{arch}"
+    url = (f"https://github.com/SagerNet/sing-box/releases/download/"
+           f"v{SING_BOX_VERSION}/{name}.tar.gz")
+    head(f"Скачивание sing-box {SING_BOX_VERSION}...")
+    info(url)
+    import tarfile
+    tmpdir = tempfile.mkdtemp(prefix="sing-box-")
+    try:
+        tpath = os.path.join(tmpdir, "sb.tar.gz")
+        download(url, tpath)
+        with tarfile.open(tpath, "r:gz") as tf:
+            member = tf.getmember(f"{name}/sing-box")
+            src = tf.extractfile(member)
+            stop_warp(quiet=True)
+            with open(exe + ".new", "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        os.chmod(exe + ".new", 0o755)
+        os.replace(exe + ".new", exe)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    ok(f"sing-box установлен: {exe}")
+
+
+def warp_register():
+    """Регистрирует бесплатное устройство WARP (как приложение 1.1.1.1)."""
+    rc, out, errout = run([singbox_path(), "generate", "wg-keypair"], timeout=15)
+    priv = pub = None
+    for ln in out.splitlines():
+        if ln.startswith("PrivateKey:"):
+            priv = ln.split(":", 1)[1].strip()
+        elif ln.startswith("PublicKey:"):
+            pub = ln.split(":", 1)[1].strip()
+    if not priv or not pub:
+        raise RuntimeError(f"sing-box не сгенерировал ключи WireGuard: {errout}")
+
+    body = json.dumps({
+        "fcm_token": "", "install_id": "", "key": pub, "locale": "en_US",
+        "model": "PC", "tos": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "serial_number": "", "os_version": "16.0.0",
+        "key_type": "curve25519", "tunnel_type": "wireguard",
+    }).encode()
+    head("Регистрация устройства WARP...")
+    headers = dict(WARP_HEADERS)
+    headers["Content-Type"] = "application/json; charset=UTF-8"
+    try:
+        req = urllib.request.Request(WARP_API, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        cfg = data.get("config")
+        if not cfg and data.get("id") and data.get("token"):
+            h2 = dict(WARP_HEADERS)
+            h2["Authorization"] = f"Bearer {data['token']}"
+            req = urllib.request.Request(f"{WARP_API}/{data['id']}", headers=h2)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            cfg = data.get("config")
+    except Exception as e:
+        raise RuntimeError(
+            f"не удалось зарегистрировать WARP: {e}\n"
+            "Можно импортировать готовый WireGuard-конфиг WARP (wgcf, WarpGen): "
+            "--action warp-import --warp-config <файл>")
+    if not cfg or not cfg.get("peers"):
+        raise RuntimeError("ответ WARP не содержит конфигурации туннеля")
+    reserved = [0, 0, 0]
+    try:
+        import base64
+        reserved = list(base64.b64decode(cfg.get("client_id", "")))[:3] or [0, 0, 0]
+    except Exception:
+        pass
+    addrs = cfg.get("interface", {}).get("addresses", {})
+    write_json(warp_path("account.json"), {
+        "private_key": priv,
+        "peer_public_key": cfg["peers"][0]["public_key"],
+        "address_v4": addrs.get("v4"),
+        "address_v6": addrs.get("v6"),
+        "reserved": reserved,
+        "device_id": data.get("id"),
+        "token": data.get("token"),
+        "source": "register",
+    })
+    ok("Устройство WARP зарегистрировано")
+
+
+def warp_import(path):
+    """Импорт WireGuard-конфига WARP (wgcf-profile.conf, WarpGen и т.п.)."""
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"файл конфига не найден: {path}")
+    kv = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            m = re.match(r"^\s*([A-Za-z]+)\s*=\s*(.+?)\s*$", ln)
+            if m:
+                kv[m.group(1).lower()] = m.group(2)
+    if not kv.get("privatekey") or not kv.get("publickey"):
+        raise RuntimeError("в конфиге нет PrivateKey/PublicKey")
+    v4 = v6 = None
+    for a in kv.get("address", "").split(","):
+        a = re.sub(r"/\d+$", "", a.strip())
+        if ":" in a:
+            v6 = a
+        elif a:
+            v4 = a
+    reserved = [0, 0, 0]
+    parts = [int(x) for x in re.split(r"[,\s]+", kv.get("reserved", "")) if x.isdigit()]
+    if len(parts) == 3:
+        reserved = parts
+    os.makedirs(warp_dir(), exist_ok=True)
+    write_json(warp_path("account.json"), {
+        "private_key": kv["privatekey"], "peer_public_key": kv["publickey"],
+        "address_v4": v4, "address_v6": v6, "reserved": reserved, "source": "import",
+    })
+    try:
+        os.remove(warp_path("state.json"))
+    except OSError:
+        pass
+    ok("Конфиг WARP импортирован, узел будет подобран заново")
+
+
+def warp_endpoint_json(acc, endpoint):
+    ip, port = endpoint.rsplit(":", 1)
+    addr = []
+    if acc.get("address_v4"):
+        addr.append(f"{acc['address_v4']}/32")
+    if acc.get("address_v6"):
+        addr.append(f"{acc['address_v6']}/128")
+    return {
+        "type": "wireguard", "tag": "warp", "mtu": 1280,
+        "address": addr,
+        "private_key": acc["private_key"],
+        "peers": [{
+            "address": ip, "port": int(port),
+            "public_key": acc["peer_public_key"],
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "persistent_keepalive_interval": 25,
+            "reserved": [int(x) for x in acc.get("reserved", [0, 0, 0])],
+        }],
+    }
+
+
+def write_warp_rules():
+    """rule-set для sing-box из списка WARP; sing-box перечитывает его сам."""
+    doms = list_entries(warp_list_path()) or ["warp.invalid"]
+    write_json(warp_path("rules-warp.json"),
+               {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
+
+
+def ipv6_available():
+    return os.path.isfile("/proc/net/if_inet6")
+
+
+def build_warp_config(endpoint):
+    acc = read_json(warp_path("account.json"))
+    write_warp_rules()
+    # Без IPv6 в системе sing-box не сможет назначить TUN v6-адрес и упадёт.
+    v6 = ipv6_available()
+    fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15"}
+    if v6:
+        fake["inet6_range"] = "fc00::/18"
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"type": "local", "tag": "local"},
+                fake,
+                {"type": "udp", "tag": "warp-dns", "server": "1.1.1.1", "detour": "warp"},
+            ],
+            "rules": [{"inbound": ["tun-in"], "rule_set": ["warp-domains"],
+                       "query_type": ["A", "AAAA"], "server": "fakeip"}],
+            "final": "local",
+        },
+        "endpoints": [warp_endpoint_json(acc, endpoint)],
+        "inbounds": [
+            {
+                "type": "tun", "tag": "tun-in", "interface_name": "zapret2warp",
+                "address": ["172.19.0.1/30"] + (["fdfe:dcba:9876::1/126"] if v6 else []),
+                "mtu": 1400,
+                "auto_route": True,
+                # В TUN идут только FakeIP: остальной трафик мимо sing-box.
+                "route_address": ["198.18.0.0/15"] + (["fc00::/18"] if v6 else []),
+            },
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
+             "listen_port": WARP_MIXED_PORT},
+        ],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {
+            "rule_set": [{"type": "local", "tag": "warp-domains", "format": "source",
+                          "path": warp_path("rules-warp.json")}],
+            "rules": [
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+                {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "warp-dns"},
+                {"inbound": ["tun-in", "mixed-in"], "outbound": "warp"},
+            ],
+            "final": "direct",
+            "auto_detect_interface": True,
+            "default_domain_resolver": "local",
+        },
+        "experimental": {"cache_file": {"enabled": True, "path": warp_path("cache.db"),
+                                        "store_fakeip": True}},
+    }
+
+
+def warp_trace(port, timeout=5.0):
+    """http://1.1.1.1/cdn-cgi/trace через прокси sing-box: мс или -1."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}"}))
+    t0 = time.monotonic()
+    try:
+        with opener.open("http://1.1.1.1/cdn-cgi/trace", timeout=timeout) as r:
+            text = r.read(4096).decode("utf-8", "replace")
+        if re.search(r"warp=(on|plus)", text):
+            return int((time.monotonic() - t0) * 1000)
+    except Exception:
+        pass
+    return -1
+
+
+def wait_local_port(port, timeout=4.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if tcp_ok("127.0.0.1", port, timeout=0.3):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def test_warp_endpoint(endpoint):
+    """Пробный туннель: 3 запроса, задержка — лучший из 2-го и 3-го."""
+    acc = read_json(warp_path("account.json"))
+    probe = warp_path("probe.json")
+    write_json(probe, {
+        "log": {"level": "error"},
+        "endpoints": [warp_endpoint_json(acc, endpoint)],
+        "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
+                      "listen_port": WARP_PROBE_PORT}],
+        "route": {"final": "warp", "auto_detect_interface": True},
+    })
+    proc = subprocess.Popen([singbox_path(), "run", "-c", probe],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if not wait_local_port(WARP_PROBE_PORT):
+            return -1
+        if warp_trace(WARP_PROBE_PORT, 4.0) < 0:
+            return -1
+        times = [t for t in (warp_trace(WARP_PROBE_PORT, 3.0) for _ in range(2)) if t >= 0]
+        return min(times) if times else -1
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def find_warp_endpoint(skip=()):
+    """Автоподбор узла Cloudflare: подсети WARP x официальные порты."""
+    import random
+    was_running = warp_running()
+    stop_warp(quiet=True)
+    cands = ["162.159.192.1:2408"] + [f"{p}.{random.randint(1, 254)}:2408" for p in WARP_PREFIXES]
+    results = []
+    head("Подбор узла Cloudflare WARP...")
+
+    def check(ep):
+        if ep in skip:
+            return
+        sys.stdout.write(f"    {ep:<22} ")
+        sys.stdout.flush()
+        ms = test_warp_endpoint(ep)
+        if ms >= 0:
+            results.append({"endpoint": ep, "ms": ms})
+            print(_c(C.GREEN, f"{ms} мс"))
+        else:
+            print(_c(C.GRAY, "нет ответа"))
+
+    for c in cands:
+        check(c)
+    if len(results) < 2:
+        for port in WARP_PORTS[1:]:
+            for p in WARP_PREFIXES:
+                check(f"{p}.{random.randint(1, 254)}:{port}")
+                if len(results) >= 3:
+                    break
+            if len(results) >= 3:
+                break
+    results.sort(key=lambda r: r["ms"])
+    if not results:
+        err("Ни один узел WARP не ответил — возможно, WireGuard к Cloudflare заблокирован.")
+        info("Попробуйте с запущенным zapret (он маскирует рукопожатие) или импортируйте "
+             "другой конфиг: --action warp-import --warp-config <файл>")
+        return None
+    write_json(warp_path("state.json"), {"best": results[0]["endpoint"], "ranked": results,
+                                         "tested": datetime.now().isoformat(timespec="seconds")})
+    ok(f"Лучший узел: {results[0]['endpoint']} ({results[0]['ms']} мс)")
+    if was_running:
+        start_warp()
+    return results[0]["endpoint"]
+
+
+def warp_running():
+    rc, _, _ = run(["systemctl", "is-active", "--quiet", WARP_SERVICE], timeout=10)
+    return rc == 0
+
+
+def warp_enabled():
+    return os.path.isfile(warp_path("enabled"))
+
+
+def warp_unit_content():
+    return f"""[Unit]
+Description=Zapret2 WARP (sing-box) for sites zapret can't open
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={singbox_path()} run -c {warp_path('config.json')}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def start_warp_process(endpoint):
+    write_json(warp_path("config.json"), build_warp_config(endpoint))
+    rc, out, errout = run([singbox_path(), "check", "-c", warp_path("config.json")], timeout=30)
+    if rc != 0:
+        raise RuntimeError(f"конфиг sing-box не прошёл проверку:\n{errout or out}")
+    with open(WARP_UNIT_PATH, "w", encoding="utf-8") as f:
+        f.write(warp_unit_content())
+    run(["systemctl", "daemon-reload"], timeout=60)
+    run(["systemctl", "restart", WARP_SERVICE], timeout=60)
+    if not wait_local_port(WARP_MIXED_PORT, 6.0):
+        return False
+    return warp_trace(WARP_MIXED_PORT, 6.0) >= 0
+
+
+def start_warp():
+    ensure_root(sys.argv)
+    if not which("systemctl"):
+        raise RuntimeError("для WARP нужен systemd (sing-box запускается как служба)")
+    if not os.access(singbox_path(), os.X_OK):
+        install_singbox()
+    if not os.path.isfile(warp_path("account.json")):
+        warp_register()
+    stop_warp(quiet=True)
+    st = read_json(warp_path("state.json")) or {}
+    ep = st.get("best") or find_warp_endpoint()
+    if not ep:
+        return
+    if not start_warp_process(ep):
+        warn(f"Узел {ep} не отвечает, подбираю другой...")
+        stop_warp(quiet=True)
+        ep = find_warp_endpoint(skip=(ep,))
+        if not ep or not start_warp_process(ep):
+            stop_warp(quiet=True)
+            err("WARP не запущен: туннель не устанавливается")
+            return
+    if warp_enabled():
+        run(["systemctl", "enable", WARP_SERVICE], timeout=60)
+    flush_dns()
+    ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
+
+
+def stop_warp(quiet=False):
+    if os.path.isfile(WARP_UNIT_PATH):
+        run(["systemctl", "stop", WARP_SERVICE], timeout=60)
+    run(["pkill", "-f", f"{singbox_path()} run"])
+    if not quiet:
+        ok("WARP остановлен")
+
+
+def enable_warp(assume_yes=False):
+    ensure_root(sys.argv)
+    os.makedirs(warp_dir(), exist_ok=True)
+    os.makedirs(ipset_dir(), exist_ok=True)
+    merge_list_file(warp_list_path(), SEED_WARP)
+    with open(warp_path("enabled"), "w") as f:
+        f.write("1")
+    start_warp()
+    if warp_running():
+        ans = "y"
+        if not assume_yes:
+            try:
+                ans = input("  Проверить сайты из списков и перенести в WARP те, "
+                            "что не открываются через zapret? (Y/n) ").strip().lower()
+            except EOFError:
+                ans = "y"
+        if ans not in ("n", "no", "н", "нет"):
+            update_warp_routes()
+
+
+def disable_warp():
+    ensure_root(sys.argv)
+    try:
+        os.remove(warp_path("enabled"))
+    except OSError:
+        pass
+    stop_warp()
+    if os.path.isfile(WARP_UNIT_PATH):
+        run(["systemctl", "disable", WARP_SERVICE], timeout=60)
+    flush_dns()
+
+
+def https_probe(domain, proxy=None, timeout=8.0):
+    """
+    Успех — получен HTTP-ответ и прочитано 64 КБ тела (или оно кончилось
+    раньше): так ловится и обрыв «16 КБ». Код ответа не важен.
+    """
+    handlers = [urllib.request.ProxyHandler({"https": proxy} if proxy else {}),
+                urllib.request.HTTPSHandler(context=ssl.create_default_context())]
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect, *handlers)
+    req = urllib.request.Request(f"https://{domain}/", headers={"User-Agent": BROWSER_UA})
+    try:
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            resp = e  # 3xx/4xx/5xx — сеть до сайта работает
+        total = 0
+        while total < 65536:
+            chunk = resp.read(16384)
+            if not chunk:
+                return True
+            total += len(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def https_batch(domains, proxy=None):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return dict(zip(domains, ex.map(lambda d: https_probe(d, proxy), domains)))
+
+
+def remove_hosts_domains(domains):
+    """Убирает из нашего блока hosts строки доменов, переносимых в WARP."""
+    names = set()
+    for d in domains:
+        names.add(d.lower())
+        names.add("www." + d.lower())
+    out, inside, changed = [], False, False
+    for ln in read_hosts():
+        if re.match(r"^\s*#.*DoH begin", ln):
+            inside = True
+        elif re.match(r"^\s*#.*DoH end", ln):
+            inside = False
+        elif inside:
+            parts = ln.split()
+            if len(parts) >= 2 and not ln.lstrip().startswith("#") and parts[1].lower() in names:
+                changed = True
+                continue
+        out.append(ln)
+    if changed:
+        write_hosts(out)
+
+
+def update_warp_routes():
+    """WARP там, где не справляется zapret: перенос неоткрывающихся сайтов."""
+    ensure_root(sys.argv)
+    if not warp_running():
+        err("WARP не запущен")
+        return
+    if not nfqws2_running():
+        warn("zapret не запущен — в WARP попадут и сайты, которые zapret открыл бы сам")
+    in_warp = set(list_entries(warp_list_path()))
+    excl = set(list_entries(os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt")))
+    cands = []
+    for name in ("zapret-hosts-user.txt", "zapret-hosts-auto.txt"):
+        for d in list_entries(os.path.join(ipset_dir(), name)):
+            if d not in in_warp and d not in excl and d not in cands:
+                cands.append(d)
+    if not cands:
+        info("Нечего проверять")
+        return
+    head(f"Проверка {len(cands)} сайтов через zapret...")
+    direct = https_batch(cands)
+    failed = [d for d in cands if not direct[d]]
+    info(f"открываются через zapret: {len(cands) - len(failed)}, не открываются: {len(failed)}")
+    if not failed:
+        ok("WARP не нужен ни одному сайту из списков")
+        return
+    head("Проверка неоткрывшихся через WARP...")
+    via = https_batch(failed, proxy=f"http://127.0.0.1:{WARP_MIXED_PORT}")
+    move = [d for d in failed if via[d]]
+    dead = [d for d in failed if not via[d]]
+    if move:
+        merge_list_file(warp_list_path(), move)
+        write_warp_rules()
+        remove_hosts_domains(move)
+        flush_dns()
+        ok("Перенесено в WARP: " + ", ".join(move))
+    if dead:
+        info("Не открываются и через WARP (нет сайта на корне домена, геоблок или сбой): "
+             + ", ".join(dead))
+    info(f"Список WARP: {warp_list_path()} (можно править вручную)")
+
+
+def warp_status_line():
+    st = read_json(warp_path("state.json")) or {}
+    state = (_c(C.GREEN, f"работает, узел {st.get('best')}") if warp_running()
+             else _c(C.GRAY, "не запущен"))
+    print(f"  WARP: {'включён' if warp_enabled() else 'выключен'} | {state} | "
+          f"сайтов в списке: {len(list_entries(warp_list_path()))}")
+
+
+def warp_menu():
+    while True:
+        print()
+        warp_status_line()
+        en = warp_enabled()
+        print(f"  [1] {'Выключить' if en else 'Включить'} WARP")
+        print("  [2] Подобрать лучший узел Cloudflare заново")
+        print("  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret")
+        print("  [4] Добавить домен в WARP вручную")
+        print("  [5] Импортировать WireGuard-конфиг WARP (если регистрация не проходит)")
+        print("  [0] Назад")
+        try:
+            ch = input("\n  Выбор: ").strip()
+        except EOFError:
+            return
+        if ch == "1":
+            disable_warp() if en else enable_warp()
+        elif ch == "2":
+            find_warp_endpoint()
+        elif ch == "3":
+            update_warp_routes()
+        elif ch == "4":
+            d = input("  Домен (например, example.com): ").strip().lower()
+            if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
+                merge_list_file(warp_list_path(), [d])
+                write_warp_rules()
+                remove_hosts_domains([d])
+                flush_dns()
+                ok(f"{d} добавлен в WARP")
+            else:
+                err("Некорректный домен")
+        elif ch == "5":
+            warp_import(input("  Путь к .conf: ").strip())
+            if warp_enabled():
+                start_warp()
+        elif ch == "0":
+            return
+
 
 
 # ----------------------------------------------------------------------------
@@ -1589,6 +2263,7 @@ def menu():
         print("  [8] Выученные домены и журналы")
         print(f"  [9] Обновить скрипт (у вас {VERSION})")
         print(_c(C.YELLOW, "  [10] Удалить из системы"))
+        print("  [11] WARP для сайтов, которые не открывает zapret")
         print("  [0] Выход")
 
         try:
@@ -1631,6 +2306,8 @@ def menu():
             elif choice == "10":
                 uninstall()
                 pause()
+            elif choice == "11":
+                warp_menu()
             elif choice == "0":
                 return
         except KeyboardInterrupt:
@@ -1686,6 +2363,11 @@ ACTIONS = {
     "diagnose": diagnose,
     "update": script_update,
     "uninstall": uninstall,
+    "warp-on": None,
+    "warp-off": None,
+    "warp-scan": None,
+    "warp-routes": None,
+    "warp-import": None,
 }
 
 
@@ -1711,6 +2393,11 @@ def main():
   diagnose   диагностика ресурсов
   update     обновить сам скрипт из GitHub
   uninstall  удалить из системы
+  warp-on      включить WARP для сайтов, которые не открывает zapret
+  warp-off     выключить WARP
+  warp-scan    подобрать лучший узел Cloudflare WARP
+  warp-routes  проверить сайты и перенести неоткрывающиеся в WARP
+  warp-import  импортировать WireGuard-конфиг WARP (--warp-config <файл>)
 
 Примеры:
   sudo python3 zapret2-linux.py
@@ -1722,6 +2409,7 @@ def main():
         "--action", "-a", default="menu", choices=sorted(ACTIONS.keys()),
         help="действие (по умолчанию: menu)",
     )
+    parser.add_argument("--warp-config", help="путь к WireGuard-конфигу WARP для warp-import")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="не задавать вопросов подтверждения")
     parser.add_argument("--version", "-V", action="version",
@@ -1741,6 +2429,22 @@ def main():
     if action == "status":
         show_status_block()
         print()
+        return 0
+
+    warp_actions = {
+        "warp-on": lambda: enable_warp(assume_yes=args.yes),
+        "warp-off": disable_warp,
+        "warp-scan": lambda: (ensure_root(sys.argv), find_warp_endpoint()),
+        "warp-routes": update_warp_routes,
+        "warp-import": lambda: (ensure_root(sys.argv), warp_import(args.warp_config)),
+    }
+    if action in warp_actions:
+        try:
+            warp_actions[action]()
+        except Exception as e:
+            print()
+            err(str(e))
+            return 1
         return 0
 
     func = ACTIONS[action]
