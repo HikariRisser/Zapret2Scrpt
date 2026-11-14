@@ -33,11 +33,12 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.7"
+VERSION = "1.5.0"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -566,8 +567,14 @@ def build_config():
     excl_list = os.path.join(ipd, "zapret-hosts-user-exclude.txt")
     hosting = os.path.join(ipd, HOSTING_IPSET_FILE)
     sni = WHITE_SNI
-    # Домены, переведённые в WARP, zapret не трогает: их трафик идёт в туннель.
-    wx = f"--hostlist-exclude={os.path.join(ipd, WARP_LIST_FILE)}"
+    # Домены, переведённые в туннель, zapret не трогает: их трафик идёт на сервер.
+    wx = f"--hostlist-exclude={os.path.join(ipd, TUNNEL_LIST_FILE)}"
+    # Соединение с самим сервером туннеля zapret тоже не трогает.
+    if list_entries(tunnel_servers_path()):
+        wx += f" --ipset-exclude={tunnel_servers_path()}"
+    # Порты серверов WireGuard: zapret маскирует их рукопожатие.
+    wg_ports = "".join("," + p for p in tunnel_wg_ports()
+                       if p not in ("443", "3478", "51820", "88", "1224", "500", "4500"))
 
     profiles = [
         # [1] HTTP
@@ -617,8 +624,8 @@ def build_config():
 
 NFQWS2_ENABLE=1
 NFQWS2_PORTS_TCP=80,443
-# 2408,500,1701,4500 — порты WARP: zapret маскирует рукопожатие WireGuard
-NFQWS2_PORTS_UDP=443,3478,50000-50099,19294-19344,2408,500,1701,4500
+# 51820,88,1224,500,4500 — порты WireGuard (в т. ч. Proton VPN): zapret маскирует рукопожатие
+NFQWS2_PORTS_UDP=443,3478,50000-50099,19294-19344,51820,88,1224,500,4500{wg_ports}
 
 # Сколько первых пакетов соединения отдавать nfqws2 (connbytes).
 # Без этих переменных init-скрипт zapret2 НЕ создаёт правила перехвата
@@ -705,7 +712,8 @@ def seed_lists():
     if n:
         info(f"добавлено подсетей хостингов: {n}")
 
-    merge_list_file(os.path.join(ipset_dir(), WARP_LIST_FILE), SEED_WARP)
+    cleanup_legacy_warp()
+    merge_list_file(tunnel_list_path(), SEED_TUNNEL)
 
     auto = os.path.join(ipset_dir(), "zapret-hosts-auto.txt")
     if not os.path.isfile(auto):
@@ -771,8 +779,8 @@ def start_bypass():
             + "\n".join(errs) + f"\nПолный журнал: {os.path.join(ZAPRET_TARGET, 'init.log')}")
     if nfqws2_running():
         ok("Обход запущен, nfqws2 работает")
-        if warp_enabled():
-            start_warp_background()
+        if tunnel_enabled():
+            start_tunnel_background()
     else:
         raise RuntimeError(
             "nfqws2 не запустился.\n"
@@ -787,7 +795,7 @@ def stop_bypass():
         warn("Среда не установлена")
         return
     head("Остановка обхода...")
-    stop_warp(quiet=True)
+    stop_tunnel(quiet=True)
     run_init("stop")
     time.sleep(1)
     if nfqws2_running():
@@ -798,8 +806,8 @@ def stop_bypass():
 
 
 def status_line():
-    if os.path.isdir(warp_dir()):
-        warp_status_line()
+    if os.path.isdir(tunnel_dir()):
+        tunnel_status_line()
     running = nfqws2_running()
     state = _c(C.GREEN, "работает") if running else _c(C.RED, "остановлен")
     enabled = "включён" if service_enabled() else "выключен"
@@ -1261,9 +1269,9 @@ def doh_update():
     with open(user_list, encoding="utf-8", errors="replace") as f:
         domains = [ln.strip() for ln in f
                    if ln.strip() and not ln.strip().startswith("#")]
-    # Домены WARP разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
-    in_warp = set(list_entries(warp_list_path()))
-    domains = [d for d in domains if d.lower() not in in_warp]
+    # Домены туннеля разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
+    in_tunnel = set(list_entries(tunnel_list_path()))
+    domains = [d for d in domains if d.lower() not in in_tunnel]
 
     # hosts сопоставляет точное имя: www-варианты нужны отдельно
     targets = []
@@ -1500,40 +1508,41 @@ def collect_report():
 
     sec("Списки")
     for name in ("zapret-hosts-user.txt", "zapret-hosts-auto.txt", "zapret-hosts-user-exclude.txt",
-                 WARP_LIST_FILE):
+                 TUNNEL_LIST_FILE):
         p = os.path.join(ipset_dir(), name)
         doms = list_entries(p)
         hit = [d for d in doms if re.search(r"youtube|googlevideo|ytimg|ggpht|discord", d)]
         lines.append(f"{name}: {len(doms)} записей; YouTube/Discord: {', '.join(hit) or '—'}")
-    lines.append(f"WARP: {'включён' if warp_enabled() else 'выключен'}, "
-                 f"{'работает' if warp_running() else 'не запущен'}")
-    file(warp_path("last-error.txt"))
+    lines.append(f"Туннель: {'включён' if tunnel_enabled() else 'выключен'}, "
+                 f"{'работает' if tunnel_running() else 'не запущен'}")
+    file(tunnel_path("last-error.txt"))
 
     sec("Другие туннели")
-    cmd(["sh", "-c", "ip -br link 2>&1 | grep -iE 'tun|wg|tap|warp|throne|nekoray|hiddify|sing' || echo 'нет'"])
+    cmd(["sh", "-c", "ip -br link 2>&1 | grep -iE 'tun|wg|tap|throne|nekoray|hiddify|sing' || echo 'нет'"])
     cmd(["sh", "-c", "ps -eo pid,args | grep -iE '[s]ing-box|[x]ray|[t]hrone|[n]ekoray|[h]iddify|[c]lash|[m]ihomo' | cut -c1-160 || true"])
 
-    sec("WARP: журналы")
-    st = read_json(warp_path("state.json")) or {}
-    lines.append(f"state: best={st.get('best')} tested={st.get('tested')} ranked={st.get('ranked')}")
-    lines.append(f"usque: {'есть' if os.path.isfile(usque_path()) else 'нет'}, "
-                 f"регистрация MASQUE: {'есть' if os.path.isfile(usque_config()) else 'нет'}, "
-                 f"регистрация WireGuard: {'есть' if os.path.isfile(warp_path('account.json')) else 'нет'}")
-    uc = read_json(usque_config()) or {}
-    lines.append("usque endpoints: " + ", ".join(
-        f"{k}={uc.get(k)}" for k in ("endpoint_v4", "endpoint_v6", "endpoint_h2_v4", "endpoint_h2_v6")))
-    if os.path.isfile(usque_path()):
-        cmd([usque_path(), "version"])
-    for name in ("probe-usque.log", "probe.log", "start.log"):
+    sec("Туннель: журналы")
+    st = read_json(tunnel_path("state.json")) or {}
+    lines.append(f"state: active={st.get('active')} tested={st.get('tested')} ranked={st.get('ranked')}")
+    for p in load_profiles():      # без ключей и паролей: только тип и адрес
+        host, port, _ = profile_server(p)
+        ob = p.get("outbound", {})
+        extra = []
+        if isinstance(ob.get("tls"), dict):
+            extra.append("tls" + ("+reality" if "reality" in ob["tls"] else ""))
+        if isinstance(ob.get("transport"), dict):
+            extra.append(str(ob["transport"].get("type")))
+        lines.append(f"профиль: {p.get('type')} {host}:{port} {' '.join(extra)} источник={p.get('source')}")
+    lines.append("серверы в исключениях zapret: " + (", ".join(list_entries(tunnel_servers_path())) or "—"))
+    for name in ("probe.log", "start.log"):
         lines.append(f"--- {name}")
-        lines.extend(file_tail(warp_path(name), 60) or ["<пусто>"])
-    cmd(["sh", "-c", f"resolvectl status {WARP_TUN} 2>&1 | head -12"])
-    cmd(["sh", "-c", f"ip rule 2>&1 | head -12; ip route get {WARP_FAKE4_PREFIX}0.1 2>&1"])
-    for d in list_entries(warp_list_path())[:3]:
+        lines.extend(file_tail(tunnel_path(name), 60) or ["<пусто>"])
+    cmd(["sh", "-c", f"resolvectl status {TUNNEL_TUN} 2>&1 | head -12"])
+    cmd(["sh", "-c", f"ip rule 2>&1 | head -12; ip route get {TUNNEL_FAKE4_PREFIX}0.1 2>&1"])
+    for d in list_entries(tunnel_list_path())[:3]:
         cmd(["sh", "-c", f"resolvectl query {shlex.quote(d)} 2>&1 | head -4"])
         lines.append(f"через TUN {d}: {_probe_tls(d, 4)}")
-    for svc in (USQUE_SERVICE, WARP_SERVICE):
-        cmd(["journalctl", "-u", svc, "-n", "40", "--no-pager", "-o", "cat"])
+    cmd(["journalctl", "-u", TUNNEL_SERVICE, "-n", "40", "--no-pager", "-o", "cat"])
 
     # Проверка сайтов с отладочным журналом nfqws2: перезапускаем nfqws2 с
     # теми же параметрами + --debug, правила перехвата остаются на месте.
@@ -1750,7 +1759,7 @@ def uninstall(assume_yes=False):
     print()
     print("  Будет удалено:")
     print("    - процесс nfqws2 и правила файрвола")
-    print("    - службы systemd (автозапуск, WARP)")
+    print("    - службы systemd (автозапуск, туннель)")
     print(f"    - каталог {ZAPRET_TARGET}")
     n_marked = count_marked()
     if n_marked:
@@ -1776,16 +1785,16 @@ def uninstall(assume_yes=False):
     run(["pkill", "-f", nfqws2_path()])
     time.sleep(1)
 
-    stop_warp(quiet=True)
+    stop_tunnel(quiet=True)
+    cleanup_legacy_warp()
 
     head("[2/4] Удаление службы...")
-    for svc, unit in ((WARP_SERVICE, WARP_UNIT_PATH), (USQUE_SERVICE, USQUE_UNIT_PATH)):
-        run(["systemctl", "disable", svc], timeout=60)
-        if os.path.isfile(unit):
-            try:
-                os.remove(unit)
-            except OSError:
-                pass
+    run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
+    if os.path.isfile(TUNNEL_UNIT_PATH):
+        try:
+            os.remove(TUNNEL_UNIT_PATH)
+        except OSError:
+            pass
     run(["systemctl", "disable", SERVICE_NAME], timeout=60)
     run(["systemctl", "stop", SERVICE_NAME], timeout=60)
     if os.path.isfile(UNIT_PATH):
@@ -1830,51 +1839,67 @@ def uninstall(assume_yes=False):
 
 
 # ----------------------------------------------------------------------------
-#  WARP через sing-box: запасной маршрут для сайтов, с которыми не
-#  справляется zapret (блокировка по IP, обрыв «16 КБ», недоступность).
+#  Туннель через sing-box: внешний выход для сайтов, с которыми не
+#  справляется zapret (блокировка по IP, запрет самого сервиса для России).
 #
-#  В TUN sing-box маршрутизируется ТОЛЬКО диапазон FakeIP (198.18.0.0/15):
-#  домены из списка WARP получают FakeIP от DNS sing-box и уходят в туннель
-#  WireGuard к Cloudflare, весь остальной трафик идёт мимо sing-box, через
-#  zapret. Узел Cloudflare подбирается автоматически по задержке.
+#  Выход — Proton VPN Free (конфиг WireGuard) или свой сервер (WireGuard,
+#  VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, SOCKS, JSON sing-box,
+#  ссылки и подписки). В TUN sing-box маршрутизируется ТОЛЬКО диапазон
+#  FakeIP: домены из списка туннеля получают FakeIP от DNS sing-box и уходят
+#  на сервер, весь остальной трафик идёт мимо sing-box, через zapret.
 # ----------------------------------------------------------------------------
 
 SING_BOX_VERSION = "1.14.4"
-WARP_SERVICE = "zapret2win-warp"
-WARP_UNIT_PATH = f"/etc/systemd/system/{WARP_SERVICE}.service"
-WARP_MIXED_PORT = 40480
-WARP_PROBE_PORT = 40481
-WARP_PREFIXES = ["162.159.192", "162.159.193", "162.159.195",
-                 "188.114.96", "188.114.97", "188.114.98", "188.114.99"]
-WARP_PORTS = [2408, 500, 1701, 4500]
-WARP_API = "https://api.cloudflareclient.com/v0a5641/reg"
-WARP_HEADERS = {
-    "User-Agent": "1.1.1.1/6.38.9-5641 (Android 16.0.0)",
-    "CF-Client-Version": "a-6.38.9-5641",
-}
-WARP_LIST_FILE = "zapret2win-hosts-warp.txt"
-SEED_WARP = [
-    "# Сайты, которые открываются через WARP (sing-box), а не через zapret.",
-    "# Пополняется автоматически (меню WARP -> [3]) или вручную, по домену в строке.",
+TUNNEL_SERVICE = "zapret2win-tunnel"
+TUNNEL_UNIT_PATH = f"/etc/systemd/system/{TUNNEL_SERVICE}.service"
+TUNNEL_MIXED_PORT = 40480
+TUNNEL_PROBE_PORT = 40481
+TUNNEL_LIST_FILE = "zapret2win-hosts-tunnel.txt"
+TUNNEL_SERVERS_FILE = "zapret2win-ip-tunnel.txt"
+SEED_TUNNEL = [
+    "# Сайты, которые открываются через туннель (sing-box), а не через zapret.",
+    "# Пополняется автоматически (меню туннеля) или вручную, по домену в строке.",
 ]
 BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
+TUNNEL_TUN = "zapret2tun"
+# Свои адреса, диапазон FakeIP и номера таблицы/правил маршрутизации —
+# намеренно НЕ значения sing-box по умолчанию: их используют другие клиенты
+# на sing-box в режиме TUN (Throne, Hiddify, NekoBox...), и при одновременной
+# работе трафик и DNS уходили бы не в тот туннель.
+TUNNEL_TUN_ADDR4 = "172.31.251.1/30"
+TUNNEL_TUN_DNS4 = "172.31.251.2"
+TUNNEL_TUN_ADDR6 = "fd7a:7a70:7761::1/126"
+TUNNEL_FAKE4 = "10.249.0.0/16"
+TUNNEL_FAKE4_PREFIX = "10.249."
+TUNNEL_FAKE6 = "fd7a:7a70:fa4e::/64"
+TUNNEL_RT_TABLE = 2649
+TUNNEL_RT_RULE = 8640
 
-def warp_dir():
-    return os.path.join(ZAPRET_TARGET, "warp")
+# Прежняя реализация (WARP) — только для очистки при обновлении.
+LEGACY_WARP_UNITS = ("zapret2win-warp", "zapret2win-warp-masque")
+LEGACY_WARP_LIST = "zapret2win-hosts-warp.txt"
 
 
-def warp_path(name):
-    return os.path.join(warp_dir(), name)
+def tunnel_dir():
+    return os.path.join(ZAPRET_TARGET, "tunnel")
 
 
-def warp_list_path():
-    return os.path.join(ipset_dir(), WARP_LIST_FILE)
+def tunnel_path(name):
+    return os.path.join(tunnel_dir(), name)
+
+
+def tunnel_list_path():
+    return os.path.join(ipset_dir(), TUNNEL_LIST_FILE)
+
+
+def tunnel_servers_path():
+    return os.path.join(ipset_dir(), TUNNEL_SERVERS_FILE)
 
 
 def singbox_path():
-    return warp_path("sing-box")
+    return tunnel_path("sing-box")
 
 
 def read_json(path):
@@ -1904,6 +1929,58 @@ def list_entries(path):
         return []
 
 
+def file_tail(path, lines=12):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = re.sub(r"\x1b\[[0-9;]*m", "", f.read())  # цвета sing-box
+            return [ln.rstrip() for ln in text.splitlines() if ln.strip()][-lines:]
+    except OSError:
+        return []
+
+
+def cleanup_legacy_warp():
+    """Убирает следы прежней реализации (WARP): службы, процессы, каталог."""
+    old_dir = os.path.join(ZAPRET_TARGET, "warp")
+    for svc in LEGACY_WARP_UNITS:
+        unit = f"/etc/systemd/system/{svc}.service"
+        if os.path.isfile(unit):
+            run(["systemctl", "stop", svc], timeout=60)
+            run(["systemctl", "disable", svc], timeout=60)
+            try:
+                os.remove(unit)
+            except OSError:
+                pass
+            run(["systemctl", "daemon-reload"], timeout=60)
+    if os.path.isdir(old_dir):
+        # Только свои процессы: шаблон «каталог/» задел бы и чужие команды.
+        run(["pkill", "-f", os.path.join(old_dir, "sing-box") + " run"])
+        run(["pkill", "-f", os.path.join(old_dir, "usque") + " -c"])
+        os.makedirs(tunnel_dir(), exist_ok=True)
+        old_sb = os.path.join(old_dir, "sing-box")
+        if os.path.isfile(old_sb) and not os.path.isfile(singbox_path()):
+            try:
+                os.replace(old_sb, singbox_path())   # не скачивать заново
+            except OSError:
+                pass
+        shutil.rmtree(old_dir, ignore_errors=True)
+    old_list = os.path.join(ipset_dir(), LEGACY_WARP_LIST)
+    if os.path.isfile(old_list):
+        # Сайты, которые были в списке WARP, переходят в список туннеля.
+        if not os.path.isfile(tunnel_list_path()):
+            try:
+                os.replace(old_list, tunnel_list_path())
+            except OSError:
+                pass
+        else:
+            merge_list_file(tunnel_list_path(), list_entries(old_list))
+            try:
+                os.remove(old_list)
+            except OSError:
+                pass
+
+
+# --- sing-box ----------------------------------------------------------------
+
 def singbox_arch():
     m = platform.machine().lower()
     return {
@@ -1917,7 +1994,7 @@ def singbox_arch():
 
 def install_singbox():
     """Скачивает официальную сборку sing-box с GitHub (один раз)."""
-    os.makedirs(warp_dir(), exist_ok=True)
+    os.makedirs(tunnel_dir(), exist_ok=True)
     exe = singbox_path()
     if os.access(exe, os.X_OK):
         rc, out, _ = run([exe, "version"], timeout=15)
@@ -1937,9 +2014,8 @@ def install_singbox():
         tpath = os.path.join(tmpdir, "sb.tar.gz")
         download(url, tpath)
         with tarfile.open(tpath, "r:gz") as tf:
-            member = tf.getmember(f"{name}/sing-box")
-            src = tf.extractfile(member)
-            stop_warp(quiet=True)
+            src = tf.extractfile(tf.getmember(f"{name}/sing-box"))
+            stop_tunnel(quiet=True)
             with open(exe + ".new", "wb") as dst:
                 shutil.copyfileobj(src, dst)
         os.chmod(exe + ".new", 0o755)
@@ -1949,197 +2025,656 @@ def install_singbox():
     ok(f"sing-box установлен: {exe}")
 
 
-def warp_register():
-    """Регистрирует бесплатное устройство WARP (как приложение 1.1.1.1)."""
-    rc, out, errout = run([singbox_path(), "generate", "wg-keypair"], timeout=15)
-    priv = pub = None
-    for ln in out.splitlines():
-        if ln.startswith("PrivateKey:"):
-            priv = ln.split(":", 1)[1].strip()
-        elif ln.startswith("PublicKey:"):
-            pub = ln.split(":", 1)[1].strip()
-    if not priv or not pub:
-        raise RuntimeError(f"sing-box не сгенерировал ключи WireGuard: {errout}")
+# --- разбор конфигов и ссылок ------------------------------------------------
+#
+# Каждый профиль: {"name", "source" ("proton" | "custom"), "type",
+# "endpoint" (True для WireGuard), "outbound" (объект sing-box без tag)}.
 
-    body = json.dumps({
-        "fcm_token": "", "install_id": "", "key": pub, "locale": "en_US",
-        "model": "PC", "tos": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-        "serial_number": "", "os_version": "16.0.0",
-        "key_type": "curve25519", "tunnel_type": "wireguard",
-    }).encode()
-    head("Регистрация устройства WARP...")
-    headers = dict(WARP_HEADERS)
-    headers["Content-Type"] = "application/json; charset=UTF-8"
-    try:
-        req = urllib.request.Request(WARP_API, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        cfg = data.get("config")
-        if not cfg and data.get("id") and data.get("token"):
-            h2 = dict(WARP_HEADERS)
-            h2["Authorization"] = f"Bearer {data['token']}"
-            req = urllib.request.Request(f"{WARP_API}/{data['id']}", headers=h2)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            cfg = data.get("config")
-    except Exception as e:
-        raise RuntimeError(
-            f"не удалось зарегистрировать WARP: {e}\n"
-            "Можно импортировать готовый WireGuard-конфиг WARP (wgcf, WarpGen): "
-            "--action warp-import --warp-config <файл>")
-    if not cfg or not cfg.get("peers"):
-        raise RuntimeError("ответ WARP не содержит конфигурации туннеля")
-    reserved = [0, 0, 0]
-    try:
-        import base64
-        reserved = list(base64.b64decode(cfg.get("client_id", "")))[:3] or [0, 0, 0]
-    except Exception:
-        pass
-    addrs = cfg.get("interface", {}).get("addresses", {})
-    write_json(warp_path("account.json"), {
-        "private_key": priv,
-        "peer_public_key": cfg["peers"][0]["public_key"],
-        "address_v4": addrs.get("v4"),
-        "address_v6": addrs.get("v6"),
-        "reserved": reserved,
-        "device_id": data.get("id"),
-        "token": data.get("token"),
-        "source": "register",
-    })
-    ok("Устройство WARP зарегистрировано")
+class ProfileError(Exception):
+    pass
 
 
-def warp_import(path):
-    """Импорт WireGuard-конфига WARP (wgcf-profile.conf, WarpGen и т.п.)."""
-    if not path or not os.path.isfile(path):
-        raise RuntimeError(f"файл конфига не найден: {path}")
-    kv = {}
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for ln in f:
-            m = re.match(r"^\s*([A-Za-z]+)\s*=\s*(.+?)\s*$", ln)
-            if m:
-                kv[m.group(1).lower()] = m.group(2)
-    if not kv.get("privatekey") or not kv.get("publickey"):
-        raise RuntimeError("в конфиге нет PrivateKey/PublicKey")
-    v4 = v6 = None
-    for a in kv.get("address", "").split(","):
-        a = re.sub(r"/\d+$", "", a.strip())
-        if ":" in a:
-            v6 = a
-        elif a:
-            v4 = a
-    reserved = [0, 0, 0]
-    parts = [int(x) for x in re.split(r"[,\s]+", kv.get("reserved", "")) if x.isdigit()]
-    if len(parts) == 3:
-        reserved = parts
-    os.makedirs(warp_dir(), exist_ok=True)
-    write_json(warp_path("account.json"), {
-        "private_key": kv["privatekey"], "peer_public_key": kv["publickey"],
-        "address_v4": v4, "address_v6": v6, "reserved": reserved, "source": "import",
-    })
+def _b64(text):
+    """Base64 в любом варианте (обычный/URL-safe, с выравниванием и без)."""
+    import base64
+    s = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s).decode("utf-8", "replace")
+
+
+def _is_ip(host):
     try:
-        os.remove(warp_path("state.json"))
+        socket.inet_pton(socket.AF_INET6 if ":" in host else socket.AF_INET, host)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def _tls_block(q, host, force=False):
+    """Блок tls для sing-box из параметров ссылки (security, sni, fp, pbk...)."""
+    sec = (q.get("security") or "").lower()
+    if not force and sec not in ("tls", "reality", "xtls"):
+        return None
+    tls = {"enabled": True}
+    sni = q.get("sni") or q.get("peer") or q.get("servername") or ("" if _is_ip(host) else host)
+    if sni:
+        tls["server_name"] = sni
+    if _truthy(q.get("allowInsecure", "")) or _truthy(q.get("insecure", "")) \
+            or _truthy(q.get("allow_insecure", "")):
+        tls["insecure"] = True
+    if q.get("alpn"):
+        tls["alpn"] = [a for a in urllib.parse.unquote(q["alpn"]).split(",") if a]
+    fp = q.get("fp") or q.get("fingerprint")
+    if sec == "reality":
+        if not q.get("pbk"):
+            raise ProfileError("в ссылке Reality нет открытого ключа (pbk)")
+        tls["reality"] = {"enabled": True, "public_key": q["pbk"], "short_id": q.get("sid", "")}
+        fp = fp or "chrome"   # Reality требует uTLS
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    return tls
+
+
+def _transport_block(q):
+    """Блок transport для sing-box (ws, grpc, http, httpupgrade)."""
+    net = (q.get("type") or q.get("net") or "tcp").lower()
+    host = q.get("host", "")
+    path = urllib.parse.unquote(q.get("path", "") or "")
+    if net in ("tcp", "raw", ""):
+        if (q.get("headerType") or "").lower() == "http":
+            tr = {"type": "http", "path": path or "/"}
+            if host:
+                tr["host"] = host.split(",")
+            return tr
+        return None
+    if net == "ws":
+        tr = {"type": "ws", "path": path or "/"}
+        m = re.search(r"[?&]ed=(\d+)", tr["path"])
+        if m:   # раннее отправление данных, запись Xray «?ed=2048»
+            tr["path"] = re.sub(r"[?&]ed=\d+", "", tr["path"]) or "/"
+            tr["max_early_data"] = int(m.group(1))
+            tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        if host:
+            tr["headers"] = {"Host": host}
+        return tr
+    if net == "grpc":
+        return {"type": "grpc", "service_name": q.get("serviceName") or q.get("servicename") or path}
+    if net in ("http", "h2"):
+        tr = {"type": "http", "path": path or "/"}
+        if host:
+            tr["host"] = host.split(",")
+        return tr
+    if net == "httpupgrade":
+        tr = {"type": "httpupgrade", "path": path or "/"}
+        if host:
+            tr["host"] = host
+        return tr
+    if net in ("xhttp", "splithttp"):
+        raise ProfileError("транспорт XHTTP (SplitHTTP) sing-box не поддерживает — "
+                           "нужен другой транспорт на сервере (TCP/Reality, WS, gRPC)")
+    raise ProfileError(f"транспорт «{net}» не поддерживается sing-box")
+
+
+def _split_link(link):
+    """Разбор ссылки вида scheme://userinfo@host:port?query#name."""
+    u = urllib.parse.urlsplit(link.strip())
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query, keep_blank_values=True).items()}
+    name = urllib.parse.unquote(u.fragment or "")
+    try:
+        port = u.port
+    except ValueError:
+        port = None
+    return u, q, name, u.hostname or "", port
+
+
+def _need(host, port, what="адрес сервера и порт"):
+    if not host or not port:
+        raise ProfileError(f"в ссылке нет: {what}")
+
+
+def parse_vless(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    ob = {"type": "vless", "server": host, "server_port": port,
+          "uuid": urllib.parse.unquote(u.username or ""), "packet_encoding": "xudp"}
+    if q.get("flow"):
+        ob["flow"] = q["flow"]
+    tls = _tls_block(q, host)
+    if tls:
+        ob["tls"] = tls
+    tr = _transport_block(q)
+    if tr:
+        ob["transport"] = tr
+    return name or f"VLESS {host}", ob
+
+
+def parse_vmess(link):
+    body = link.strip()[len("vmess://"):]
+    if "@" in body and "?" in body:   # редкая запись vmess://uuid@host:port?...
+        u, q, name, host, port = _split_link(link)
+        _need(host, port)
+        ob = {"type": "vmess", "server": host, "server_port": port,
+              "uuid": urllib.parse.unquote(u.username or ""), "security": q.get("encryption", "auto"),
+              "alter_id": int(q.get("aid", "0") or 0)}
+        tls = _tls_block(q, host)
+    else:
+        try:
+            j = json.loads(_b64(body.split("#")[0]))
+        except ValueError:
+            raise ProfileError("ссылка vmess:// не расшифровывается (ожидался base64 с JSON)")
+        host, port = str(j.get("add", "")), int(j.get("port", 0) or 0)
+        _need(host, port)
+        name = str(j.get("ps", ""))
+        q = {"type": j.get("net", "tcp"), "host": j.get("host", ""), "path": j.get("path", ""),
+             "headerType": j.get("type", ""), "sni": j.get("sni", ""), "alpn": j.get("alpn", ""),
+             "fp": j.get("fp", ""), "security": "tls" if str(j.get("tls", "")).lower() == "tls" else "",
+             "serviceName": j.get("path", "") if j.get("net") == "grpc" else ""}
+        q = {k: v for k, v in q.items() if v}
+        ob = {"type": "vmess", "server": host, "server_port": port, "uuid": str(j.get("id", "")),
+              "security": str(j.get("scy") or "auto"), "alter_id": int(j.get("aid", 0) or 0)}
+        tls = _tls_block(q, q.get("host") or host)
+    if tls:
+        ob["tls"] = tls
+    tr = _transport_block(q)
+    if tr:
+        ob["transport"] = tr
+    return name or f"VMess {host}", ob
+
+
+def parse_trojan(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    ob = {"type": "trojan", "server": host, "server_port": port,
+          "password": urllib.parse.unquote(u.username or "")}
+    if (q.get("security") or "tls").lower() != "none":
+        ob["tls"] = _tls_block(q, host, force=True)
+    tr = _transport_block(q)
+    if tr:
+        ob["transport"] = tr
+    return name or f"Trojan {host}", ob
+
+
+def parse_ss(link):
+    body = link.strip()[len("ss://"):]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = urllib.parse.unquote(frag)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+    body = body.rstrip("/")
+    if "@" not in body:                       # ss://base64(method:pass@host:port)
+        body = _b64(body)
+    cred, _, addr = body.rpartition("@")
+    if ":" not in cred:                       # ss://base64(method:pass)@host:port
+        cred = _b64(urllib.parse.unquote(cred))
+    else:
+        cred = urllib.parse.unquote(cred)
+    method, _, password = cred.partition(":")
+    u = urllib.parse.urlsplit("//" + addr)
+    _need(u.hostname, u.port)
+    ob = {"type": "shadowsocks", "server": u.hostname, "server_port": u.port,
+          "method": method, "password": password}
+    plugin = urllib.parse.parse_qs(query).get("plugin", [""])[0]
+    if plugin:
+        pname, _, popts = plugin.partition(";")
+        pname = {"simple-obfs": "obfs-local", "obfs": "obfs-local"}.get(pname, pname)
+        if pname not in ("obfs-local", "v2ray-plugin"):
+            raise ProfileError(f"плагин Shadowsocks «{pname}» sing-box не поддерживает")
+        ob["plugin"] = pname
+        ob["plugin_opts"] = popts
+    return name or f"Shadowsocks {u.hostname}", ob
+
+
+def parse_hysteria2(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    pwd = urllib.parse.unquote(u.username or "")
+    if u.password:
+        pwd += ":" + urllib.parse.unquote(u.password)
+    ob = {"type": "hysteria2", "server": host, "server_port": port, "password": pwd,
+          "tls": _tls_block(q, host, force=True)}
+    if q.get("obfs") and q.get("obfs") != "none":
+        ob["obfs"] = {"type": q["obfs"], "password": q.get("obfs-password", "")}
+    return name or f"Hysteria2 {host}", ob
+
+
+def parse_hysteria(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    ob = {"type": "hysteria", "server": host, "server_port": port,
+          "up_mbps": int(float(q.get("upmbps", "20") or 20)),
+          "down_mbps": int(float(q.get("downmbps", "100") or 100)),
+          "tls": _tls_block(q, host, force=True)}
+    if q.get("auth"):
+        ob["auth_str"] = q["auth"]
+    if q.get("obfsParam"):
+        ob["obfs"] = q["obfsParam"]
+    return name or f"Hysteria {host}", ob
+
+
+def parse_tuic(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    ob = {"type": "tuic", "server": host, "server_port": port,
+          "uuid": urllib.parse.unquote(u.username or ""),
+          "password": urllib.parse.unquote(u.password or ""),
+          "congestion_control": q.get("congestion_control") or q.get("congestion-control") or "bbr",
+          "tls": _tls_block(q, host, force=True)}
+    mode = q.get("udp_relay_mode") or q.get("udp-relay-mode")
+    if mode:
+        ob["udp_relay_mode"] = mode
+    return name or f"TUIC {host}", ob
+
+
+def parse_anytls(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    ob = {"type": "anytls", "server": host, "server_port": port,
+          "password": urllib.parse.unquote(u.username or ""),
+          "tls": _tls_block(q, host, force=True)}
+    return name or f"AnyTLS {host}", ob
+
+
+def parse_socks(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    user, pwd = urllib.parse.unquote(u.username or ""), urllib.parse.unquote(u.password or "")
+    if user and not pwd and ":" not in user:      # socks://base64(user:pass)@host:port
+        try:
+            dec = _b64(user)
+            if ":" in dec:
+                user, _, pwd = dec.partition(":")
+        except Exception:
+            pass
+    ob = {"type": "socks", "server": host, "server_port": port,
+          "version": "4" if u.scheme == "socks4" else "5"}
+    if user:
+        ob["username"], ob["password"] = user, pwd
+    return name or f"SOCKS {host}", ob
+
+
+def _wg_endpoint(private_key, addresses, peer_host, peer_port, public_key,
+                 psk="", mtu=None, reserved=None, keepalive=25, allowed=None):
+    if not (private_key and public_key and peer_host and peer_port and addresses):
+        raise ProfileError("в конфиге WireGuard не хватает PrivateKey, Address, PublicKey или Endpoint")
+    addrs = []
+    for a in addresses:
+        a = a.strip()
+        if a:
+            addrs.append(a if "/" in a else a + ("/128" if ":" in a else "/32"))
+    peer = {"address": peer_host, "port": int(peer_port), "public_key": public_key,
+            "allowed_ips": allowed or ["0.0.0.0/0", "::/0"],
+            "persistent_keepalive_interval": int(keepalive or 25)}
+    if psk:
+        peer["pre_shared_key"] = psk
+    if reserved:
+        peer["reserved"] = reserved
+    return {"type": "wireguard", "mtu": int(mtu or 1408), "address": addrs,
+            "private_key": private_key, "peers": [peer]}
+
+
+def parse_wireguard_conf(text, default_name="WireGuard"):
+    """Обычный конфиг WireGuard (.conf): Proton VPN, свой сервер, любой провайдер."""
+    iface, peer, cur = {}, {}, None
+    for ln in text.splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if low == "[interface]":
+            cur = iface
+        elif low == "[peer]":
+            if peer:      # берём первый [Peer]
+                cur = {}
+            else:
+                cur = peer
+        elif "=" in ln and cur is not None:
+            k, _, v = ln.partition("=")
+            cur[k.strip().lower()] = v.strip()
+    if any(k in iface for k in ("jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4")):
+        raise ProfileError("это конфиг AmneziaWG (параметры Jc/S1/H1…): sing-box его не поддерживает. "
+                           "Нужен обычный WireGuard или другой протокол (VLESS, Shadowsocks…)")
+    ep = peer.get("endpoint", "")
+    u = urllib.parse.urlsplit("//" + ep)
+    reserved = [int(x) for x in re.split(r"[,\s]+", iface.get("reserved", peer.get("reserved", "")))
+                if x.isdigit()]
+    ob = _wg_endpoint(
+        iface.get("privatekey"), iface.get("address", "").split(","), u.hostname, u.port,
+        peer.get("publickey"), psk=peer.get("presharedkey", ""), mtu=iface.get("mtu"),
+        reserved=reserved if len(reserved) == 3 else None,
+        keepalive=peer.get("persistentkeepalive") or 25)
+    return f"{default_name} {u.hostname}", ob
+
+
+def parse_wireguard_link(link):
+    u, q, name, host, port = _split_link(link)
+    _need(host, port)
+    reserved = [int(x) for x in re.split(r"[,\s]+", q.get("reserved", "")) if x.isdigit()]
+    ob = _wg_endpoint(
+        urllib.parse.unquote(u.username or q.get("privatekey", "")),
+        urllib.parse.unquote(q.get("address", q.get("ip", ""))).split(","), host, port,
+        urllib.parse.unquote(q.get("publickey", q.get("peer", ""))),
+        psk=urllib.parse.unquote(q.get("presharedkey", "")), mtu=q.get("mtu"),
+        reserved=reserved if len(reserved) == 3 else None)
+    return name or f"WireGuard {host}", ob
+
+
+LINK_PARSERS = {
+    "vless": parse_vless, "vmess": parse_vmess, "trojan": parse_trojan, "ss": parse_ss,
+    "hysteria2": parse_hysteria2, "hy2": parse_hysteria2, "hysteria": parse_hysteria,
+    "tuic": parse_tuic, "anytls": parse_anytls,
+    "socks": parse_socks, "socks5": parse_socks, "socks4": parse_socks,
+    "wireguard": parse_wireguard_link, "wg": parse_wireguard_link,
+}
+SUPPORTED_FORMATS = ("конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, "
+                     "hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; "
+                     "несколько ссылок или подписка (адрес https://… либо base64); "
+                     "JSON sing-box (outbound или целый конфиг)")
+# Служебные типы sing-box, которые не являются выходом на сервер.
+_NOT_SERVERS = {"direct", "block", "dns", "selector", "urltest", "tor", "ssh"}
+
+
+def parse_singbox_json(text):
+    """Outbound/endpoint sing-box или целый конфиг: берём все серверы из него."""
+    try:
+        j = json.loads(text)
+    except ValueError as e:
+        raise ProfileError(f"JSON не разбирается: {e}")
+    if isinstance(j, dict) and ("inbounds" in j and "routing" in j or "vnext" in json.dumps(j)[:4000]):
+        raise ProfileError("это конфиг Xray/V2Ray, а не sing-box. Возьмите ссылку на сервер "
+                           "(vless://…) или экспортируйте конфиг в формате sing-box")
+    items = []
+    if isinstance(j, list):
+        items = j
+    elif isinstance(j, dict) and ("outbounds" in j or "endpoints" in j):
+        items = list(j.get("endpoints") or []) + list(j.get("outbounds") or [])
+    elif isinstance(j, dict):
+        items = [j]
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get("type") in _NOT_SERVERS or "type" not in it:
+            continue
+        ob = {k: v for k, v in it.items() if k not in ("tag", "detour", "domain_resolver")}
+        name = str(it.get("tag") or f"{it['type']} {it.get('server', '')}").strip()
+        out.append((name, ob))
+    if not out:
+        raise ProfileError("в JSON нет ни одного сервера (outbound с адресом)")
+    return out
+
+
+def parse_profiles(text, source="custom", _depth=0):
+    """
+    Разбирает всё, что дал пользователь: файл, ссылку, список ссылок,
+    подписку. Возвращает (профили, сообщения об ошибках).
+    """
+    text = text.strip().lstrip("﻿")
+    if not text:
+        raise ProfileError("пустой ввод")
+    profiles, errors = [], []
+
+    def add(name, ob):
+        profiles.append({"name": name.strip() or ob.get("type", "сервер"), "source": source,
+                         "type": ob.get("type"), "endpoint": ob.get("type") == "wireguard",
+                         "outbound": ob})
+
+    if re.search(r"(?im)^\s*\[interface\]", text):
+        name, ob = parse_wireguard_conf(text, "Proton VPN" if source == "proton" else "WireGuard")
+        add(name, ob)
+        return profiles, errors
+    if text[0] in "{[":
+        for name, ob in parse_singbox_json(text):
+            add(name, ob)
+        return profiles, errors
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    # Подписка: один адрес http(s)://
+    if len(lines) == 1 and re.match(r"(?i)^https?://", lines[0]) and _depth == 0:
+        try:
+            body = http_get(lines[0], timeout=30).decode("utf-8", "replace")
+        except Exception as e:
+            raise ProfileError(f"подписка не скачалась: {e}")
+        return parse_profiles(body, source, _depth + 1)
+    # Подписка в base64 (нет ни одной «://»)
+    if "://" not in text and _depth < 2:
+        try:
+            dec = _b64(text)
+        except Exception:
+            dec = ""
+        if "://" in dec or "[Interface]" in dec:
+            return parse_profiles(dec, source, _depth + 1)
+        raise ProfileError("формат не распознан. Поддерживается: " + SUPPORTED_FORMATS)
+
+    for ln in lines:
+        m = re.match(r"^([a-zA-Z0-9]+)://", ln)
+        if not m:
+            continue
+        scheme = m.group(1).lower()
+        parser = LINK_PARSERS.get(scheme)
+        if not parser:
+            errors.append(f"{scheme}://… — формат не поддерживается")
+            continue
+        try:
+            name, ob = parser(ln)
+            add(name, ob)
+        except ProfileError as e:
+            errors.append(f"{scheme}://… — {e}")
+        except Exception as e:
+            errors.append(f"{scheme}://… — ссылка повреждена ({e.__class__.__name__}: {e})")
+    if not profiles and not errors:
+        raise ProfileError("формат не распознан. Поддерживается: " + SUPPORTED_FORMATS)
+    return profiles, errors
+
+
+def profile_server(p):
+    """(хост, порт, это_udp) сервера профиля."""
+    ob = p["outbound"]
+    if p.get("endpoint"):
+        peer = (ob.get("peers") or [{}])[0]
+        return peer.get("address", ""), peer.get("port"), True
+    return ob.get("server", ""), ob.get("server_port"), ob.get("type") in ("hysteria", "hysteria2", "tuic")
+
+
+def load_profiles():
+    return read_json(tunnel_path("profiles.json")) or []
+
+
+def save_profiles(profiles):
+    os.makedirs(tunnel_dir(), exist_ok=True)
+    write_json(tunnel_path("profiles.json"), profiles)
+    update_tunnel_servers(profiles)
+
+
+def update_tunnel_servers(profiles):
+    """
+    Адреса серверов туннеля — в файл исключений zapret: соединение с самим
+    сервером zapret не должен «лечить» подменой SNI и разрезанием (сервер на
+    Hetzner/OVH/DigitalOcean попал бы под профиль хостингов).
+    """
+    ips = []
+    for p in profiles:
+        host = profile_server(p)[0]
+        if not host:
+            continue
+        if _is_ip(host):
+            cand = [host]
+        else:
+            try:
+                cand = sorted({i[4][0] for i in socket.getaddrinfo(host, None)})
+            except OSError:
+                cand = []
+        for ip in cand:
+            if ip not in ips:
+                ips.append(ip)
+    os.makedirs(ipset_dir(), exist_ok=True)
+    with open(tunnel_servers_path(), "w", encoding="utf-8") as f:
+        f.write("# Серверы туннеля: zapret их не трогает. Файл создаётся автоматически.\n")
+        f.write("\n".join(ips) + ("\n" if ips else ""))
+    os.chmod(tunnel_servers_path(), 0o644)
+
+
+def tunnel_wg_ports():
+    """UDP-порты серверов WireGuard: zapret маскирует их рукопожатие."""
+    ports = []
+    for p in load_profiles():
+        host, port, _ = profile_server(p)
+        if p.get("endpoint") and port and str(port) not in ports:
+            ports.append(str(port))
+    return ports
+
+
+def profile_parts(p, tag="tunnel"):
+    """(endpoints, outbounds) для конфига sing-box."""
+    ob = dict(p["outbound"])
+    ob["tag"] = tag
+    return ([ob], []) if p.get("endpoint") else ([], [ob])
+
+
+def validate_profile(p):
+    """Проверяет профиль настоящим sing-box: (годен, текст ошибки)."""
+    eps, obs = profile_parts(p)
+    cfg = {"log": {"level": "error"}, "outbounds": obs + [{"type": "direct", "tag": "direct"}],
+           "route": {"final": "tunnel", "default_domain_resolver": "local"},
+           "dns": {"servers": [{"type": "local", "tag": "local"}]}}
+    if eps:
+        cfg["endpoints"] = eps
+    path = tunnel_path("validate.json")
+    write_json(path, cfg)
+    rc, out, errout = run([singbox_path(), "check", "-c", path], timeout=30)
+    try:
+        os.remove(path)
     except OSError:
         pass
-    ok("Конфиг WARP импортирован, узел будет подобран заново")
+    msg = re.sub(r"\x1b\[[0-9;]*m", "", (errout or out)).strip().splitlines()
+    return rc == 0, (msg[-1] if msg else "")
 
 
-def warp_endpoint_json(acc, endpoint):
-    ip, port = endpoint.rsplit(":", 1)
-    addr = []
-    if acc.get("address_v4"):
-        addr.append(f"{acc['address_v4']}/32")
-    if acc.get("address_v6"):
-        addr.append(f"{acc['address_v6']}/128")
-    return {
-        "type": "wireguard", "tag": "warp", "mtu": 1280,
-        "address": addr,
-        "private_key": acc["private_key"],
-        "peers": [{
-            "address": ip, "port": int(port),
-            "public_key": acc["peer_public_key"],
-            "allowed_ips": ["0.0.0.0/0", "::/0"],
-            "persistent_keepalive_interval": 25,
-            "reserved": [int(x) for x in acc.get("reserved", [0, 0, 0])],
-        }],
-    }
+def import_profiles(text, source="custom", replace=False):
+    """Разбирает ввод, проверяет профили sing-box и сохраняет годные."""
+    ensure_root(sys.argv)
+    cleanup_legacy_warp()
+    if not os.access(singbox_path(), os.X_OK):
+        install_singbox()
+    profiles, errors = parse_profiles(text, source)
+    good = []
+    for p in profiles:
+        valid, why = validate_profile(p)
+        if valid:
+            good.append(p)
+        else:
+            errors.append(f"{p['name']} — sing-box не принял профиль: {why}")
+    for e in errors:
+        warn(e)
+    if not good:
+        raise ProfileError("ни один профиль не подошёл")
+    if len(good) > 40:
+        warn(f"В подписке {len(good)} серверов — беру первые 40.")
+        good = good[:40]
+    existing = [] if replace else load_profiles()
+    names = {p["name"] for p in existing}
+    for p in good:
+        base, n = p["name"], 2
+        while p["name"] in names:      # одинаковые имена различаем номером
+            p["name"] = f"{base} ({n})"
+            n += 1
+        names.add(p["name"])
+        existing.append(p)
+    save_profiles(existing)
+    ok(f"Добавлено профилей: {len(good)}. Всего: {len(existing)}")
+    for p in good:
+        host, port, _ = profile_server(p)
+        info(f"{p['name']}  [{p['type']}]  {host}:{port}")
+    # zapret должен узнать о новых серверах (исключения, порты WireGuard).
+    write_config()
+    if nfqws2_running():
+        info("Перезапуск обхода, чтобы zapret учёл серверы туннеля...")
+        run_init("stop")
+        run_init("start")
+    try:
+        os.remove(tunnel_path("state.json"))    # выбрать лучший профиль заново
+    except OSError:
+        pass
+    return good
 
 
-def write_warp_rules():
-    """rule-set для sing-box из списка WARP; sing-box перечитывает его сам."""
-    doms = list_entries(warp_list_path()) or ["warp.invalid"]
-    write_json(warp_path("rules-warp.json"),
+def read_user_input(value):
+    """Путь к файлу -> его содержимое; иначе сам текст (ссылка, base64, JSON)."""
+    value = value.strip().strip("'\"")
+    path = os.path.expanduser(value)
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    if "\n" not in value and "://" not in value and not value.startswith(("{", "[")) \
+            and ("/" in value or value.endswith((".conf", ".json", ".txt"))):
+        raise ProfileError(f"файл не найден: {path}")
+    return value
+
+
+# --- конфигурация sing-box ---------------------------------------------------
+
+def ipv6_available():
+    return os.path.isfile("/proc/net/if_inet6")
+
+
+def write_tunnel_rules():
+    """rule-set для sing-box из списка туннеля; sing-box перечитывает его сам."""
+    doms = list_entries(tunnel_list_path()) or ["tunnel.invalid"]
+    write_json(tunnel_path("rules.json"),
                {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
-    write_warp_dns_script()
-    if warp_tun_exists():
-        apply_warp_dns()
+    write_tunnel_dns_script()
+    if tunnel_tun_exists():
+        apply_tunnel_dns()
 
 
-WARP_TUN = "zapret2warp"
-# Свои адреса, диапазон FakeIP и номера таблицы/правил маршрутизации —
-# намеренно НЕ значения sing-box по умолчанию (172.19.0.1/30, 198.18.0.0/15,
-# таблица 2022, правила с 9000). Их же используют другие клиенты на
-# sing-box в режиме TUN (Throne, Hiddify, NekoBox...): при одновременной
-# работе адреса и таблицы совпадали, и трафик/DNS уходил не в тот туннель.
-WARP_TUN_ADDR4 = "172.31.251.1/30"
-WARP_TUN_DNS4 = "172.31.251.2"
-WARP_TUN_ADDR6 = "fd7a:7a70:7761::1/126"
-WARP_FAKE4 = "10.249.0.0/16"
-WARP_FAKE4_PREFIX = "10.249."
-WARP_FAKE6 = "fd7a:7a70:fa4e::/64"
-WARP_RT_TABLE = 2649
-WARP_RT_RULE = 8640
+def tunnel_dns_script_path():
+    return tunnel_path("dns-setup.sh")
 
 
-def warp_dns_script_path():
-    return warp_path("dns-setup.sh")
-
-
-def write_warp_dns_script():
+def write_tunnel_dns_script():
     """
-    Скрипт, который направляет DNS-запросы доменов из списка WARP в sing-box.
-
-    Системный резолвер (systemd-resolved) сам в TUN не ходит: он шлёт запросы
-    DNS-серверу сетевой карты, и домены WARP получали обычные адреса вместо
-    FakeIP — в туннель ничего не попадало, сайты не открывались. Здесь для
-    интерфейса TUN задаются DNS-сервер sing-box и «маршрутные домены»
-    (~домен): запросы только этих доменов и их поддоменов идут в sing-box,
-    остальной DNS не меняется. Выполняется и службой (ExecStartPost), чтобы
-    настройка переживала перезагрузку.
+    Скрипт, который направляет DNS-запросы доменов из списка туннеля в sing-box.
+    systemd-resolved сам в TUN не ходит, поэтому для интерфейса TUN задаются
+    DNS-сервер sing-box и «маршрутные домены» (~домен): в sing-box идут запросы
+    только этих доменов и их поддоменов, остальной DNS не меняется.
     """
     script = f"""#!/bin/sh
-# Сгенерировано zapret2-linux: DNS доменов WARP -> sing-box (FakeIP)
-IF={WARP_TUN}
-LIST='{warp_list_path()}'
+# Сгенерировано zapret2-linux: DNS доменов туннеля -> sing-box (FakeIP)
+IF={TUNNEL_TUN}
+LIST='{tunnel_list_path()}'
 command -v resolvectl >/dev/null 2>&1 || exit 0
 i=0
 while [ $i -lt 30 ] && ! ip link show "$IF" >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
 ip link show "$IF" >/dev/null 2>&1 || exit 0
 DOMS=$(grep -v '^[[:space:]]*#' "$LIST" 2>/dev/null | tr -d ' \\t\\r' | grep . | sed 's/^/~/' | tr '\\n' ' ')
-resolvectl dns "$IF" {WARP_TUN_DNS4} || exit 0
+resolvectl dns "$IF" {TUNNEL_TUN_DNS4} || exit 0
 if [ -n "$DOMS" ]; then resolvectl domain "$IF" $DOMS; else resolvectl domain "$IF" ""; fi
 resolvectl default-route "$IF" false 2>/dev/null
 resolvectl flush-caches 2>/dev/null
 exit 0
 """
-    os.makedirs(warp_dir(), exist_ok=True)
-    with open(warp_dns_script_path(), "w", encoding="utf-8") as f:
+    os.makedirs(tunnel_dir(), exist_ok=True)
+    with open(tunnel_dns_script_path(), "w", encoding="utf-8") as f:
         f.write(script)
-    os.chmod(warp_dns_script_path(), 0o755)
+    os.chmod(tunnel_dns_script_path(), 0o755)
 
 
-def warp_tun_exists():
-    return os.path.isdir(f"/sys/class/net/{WARP_TUN}")
+def tunnel_tun_exists():
+    return os.path.isdir(f"/sys/class/net/{TUNNEL_TUN}")
 
 
-def apply_warp_dns():
+def apply_tunnel_dns():
     if which("resolvectl"):
-        run(["/bin/sh", warp_dns_script_path()], timeout=40)
+        run(["/bin/sh", tunnel_dns_script_path()], timeout=40)
 
 
-def check_warp_dns():
-    """Проверяет, что домен из списка WARP действительно получает FakeIP."""
-    doms = list_entries(warp_list_path())
+def check_tunnel_dns():
+    """Проверяет, что домен из списка туннеля действительно получает FakeIP."""
+    doms = list_entries(tunnel_list_path())
     if not doms:
         return
     try:
@@ -2147,238 +2682,114 @@ def check_warp_dns():
     except OSError as e:
         ips = set()
         warn(f"DNS: {doms[0]} не разрешается ({e})")
-    if any(ip.startswith(WARP_FAKE4_PREFIX) for ip in ips):
-        ok(f"DNS доменов WARP идёт в туннель ({doms[0]} -> {sorted(ips)[0]})")
+    if any(ip.startswith(TUNNEL_FAKE4_PREFIX) for ip in ips):
+        ok(f"DNS доменов из списка идёт в туннель ({doms[0]} -> {sorted(ips)[0]})")
         return
     warn(f"DNS: {doms[0]} получает обычный адрес ({', '.join(sorted(ips)) or 'нет'}), "
-         f"а не адрес туннеля {WARP_FAKE4_PREFIX}x.x — сайт пойдёт мимо WARP.")
+         f"а не адрес туннеля {TUNNEL_FAKE4_PREFIX}x.x — сайт пойдёт мимо туннеля.")
     if not which("resolvectl"):
-        info("В системе нет systemd-resolved: автоматическая настройка DNS для WARP не поддерживается.")
+        info("В системе нет systemd-resolved: автоматическая настройка DNS для туннеля не поддерживается.")
     else:
-        info(f"Проверьте: resolvectl status {WARP_TUN}; запись домена в /etc/hosts.")
+        info(f"Проверьте: resolvectl status {TUNNEL_TUN}; запись домена в /etc/hosts.")
 
 
-# --- WARP через MASQUE (usque) ---------------------------------------------
-# Запасной транспорт, когда WireGuard к Cloudflare не проходит. usque —
-# открытая реализация MASQUE-режима клиента WARP: туннель через HTTP/3
-# (QUIC, UDP) или HTTP/2 (обычный TCP 443). usque отдаёт туннель как
-# локальный SOCKS5, sing-box направляет в него домены из списка WARP.
-# «Узел» такого транспорта записывается как masque:<h3|h2>:<порт>.
-
-USQUE_VERSION = "4.2.1"
-USQUE_SERVICE = "zapret2win-warp-masque"
-USQUE_UNIT_PATH = f"/etc/systemd/system/{USQUE_SERVICE}.service"
-USQUE_PORT = 40482
-USQUE_PROBE_PORT = 40483
-MASQUE_VARIANTS = ["masque:h3:443", "masque:h3:4500", "masque:h3:500",
-                   "masque:h3:1701", "masque:h2:443"]
-
-
-def is_masque(endpoint):
-    return str(endpoint).startswith("masque:")
-
-
-def usque_path():
-    return warp_path("usque")
-
-
-def usque_config():
-    return warp_path("usque.json")
-
-
-def usque_arch():
-    return {"amd64": "amd64", "arm64": "arm64", "armv7": "armv7", "386": "386"}.get(singbox_arch() or "")
-
-
-def install_usque():
-    """Скачивает официальную сборку usque с GitHub (один раз)."""
-    exe = usque_path()
-    if os.access(exe, os.X_OK):
-        rc, out, errout = run([exe, "version"], timeout=15)
-        if rc == 0 and USQUE_VERSION in (out + errout):
-            return
-    arch = usque_arch()
-    if not arch:
-        raise RuntimeError(f"нет сборки usque для архитектуры {platform.machine()}")
-    url = (f"https://github.com/Diniboy1123/usque/releases/download/"
-           f"v{USQUE_VERSION}/usque_{USQUE_VERSION}_linux_{arch}.zip")
-    head(f"Скачивание usque {USQUE_VERSION} (WARP через MASQUE)...")
-    info(url)
-    import zipfile
-    os.makedirs(warp_dir(), exist_ok=True)
-    tmpdir = tempfile.mkdtemp(prefix="usque-")
-    try:
-        zpath = os.path.join(tmpdir, "usque.zip")
-        download(url, zpath)
-        with zipfile.ZipFile(zpath) as zf, zf.open("usque") as src, open(exe + ".new", "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        os.chmod(exe + ".new", 0o755)
-        os.replace(exe + ".new", exe)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    ok(f"usque установлен: {exe}")
-
-
-def usque_register():
-    """Регистрация устройства WARP для MASQUE (отдельная от WireGuard)."""
-    if os.path.isfile(usque_config()):
-        return
-    head("Регистрация устройства WARP (MASQUE)...")
-    rc, out, errout = run([usque_path(), "-c", usque_config(), "register", "-a", "-n", "zapret2"],
-                          timeout=90)
-    if rc != 0 or not os.path.isfile(usque_config()):
-        try:
-            os.remove(usque_config())
-        except OSError:
-            pass
-        raise RuntimeError("не удалось зарегистрировать WARP (MASQUE):\n"
-                           + "\n".join((errout or out).splitlines()[-4:]))
-    os.chmod(usque_config(), 0o600)
-    ok("Устройство WARP (MASQUE) зарегистрировано")
-
-
-def usque_args(endpoint, port):
-    _, proto, cport = endpoint.split(":")
-    args = [usque_path(), "-c", usque_config(), "socks", "-b", "127.0.0.1",
-            "-p", str(port), "-P", cport]
-    if proto == "h2":
-        args.append("--http2")
-    return args
-
-
-def masque_outbound(port):
-    return {"type": "socks", "tag": "warp", "server": "127.0.0.1",
-            "server_port": port, "version": "5"}
-
-
-def ensure_masque():
-    """usque установлен и зарегистрирован; False (с сохранённой ошибкой), если нет."""
-    try:
-        install_usque()
-        usque_register()
-        return True
-    except Exception as e:
-        lines = str(e).splitlines() or ["ошибка"]
-        set_warp_error("WARP через MASQUE не подготовлен: " + lines[0], lines[1:])
-        return False
-
-
-def ipv6_available():
-    return os.path.isfile("/proc/net/if_inet6")
-
-
-def build_warp_config(endpoint):
-    masque = is_masque(endpoint)
-    acc = None if masque else read_json(warp_path("account.json"))
-    write_warp_rules()
+def build_tunnel_config(profile):
+    write_tunnel_rules()
+    eps, obs = profile_parts(profile)
     # Без IPv6 в системе sing-box не сможет назначить TUN v6-адрес и упадёт.
     v6 = ipv6_available()
-    fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": WARP_FAKE4}
+    fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": TUNNEL_FAKE4}
     if v6:
-        fake["inet6_range"] = WARP_FAKE6
-    return {
+        fake["inet6_range"] = TUNNEL_FAKE6
+    cfg = {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
             "servers": [
                 {"type": "local", "tag": "local"},
                 fake,
-                # Через SOCKS usque DNS надёжнее по TCP.
-                {"type": "tcp" if masque else "udp", "tag": "warp-dns",
-                 "server": "1.1.1.1", "detour": "warp"},
+                # Настоящие адреса сайтов из списка ищем через сам туннель.
+                {"type": "tcp", "tag": "tunnel-dns", "server": "1.1.1.1", "detour": "tunnel"},
             ],
-            "rules": [{"inbound": ["tun-in"], "rule_set": ["warp-domains"],
+            "rules": [{"inbound": ["tun-in"], "rule_set": ["tunnel-domains"],
                        "query_type": ["A", "AAAA"], "server": "fakeip"}],
             "final": "local",
         },
-        "endpoints": [] if masque else [warp_endpoint_json(acc, endpoint)],
         "inbounds": [
             {
-                "type": "tun", "tag": "tun-in", "interface_name": "zapret2warp",
-                "address": [WARP_TUN_ADDR4] + ([WARP_TUN_ADDR6] if v6 else []),
+                "type": "tun", "tag": "tun-in", "interface_name": TUNNEL_TUN,
+                "address": [TUNNEL_TUN_ADDR4] + ([TUNNEL_TUN_ADDR6] if v6 else []),
                 "mtu": 1400,
                 "auto_route": True,
                 # В TUN идут только FakeIP: остальной трафик мимо sing-box.
-                "route_address": [WARP_FAKE4] + ([WARP_FAKE6] if v6 else []),
-                "iproute2_table_index": WARP_RT_TABLE,
-                "iproute2_rule_index": WARP_RT_RULE,
+                "route_address": [TUNNEL_FAKE4] + ([TUNNEL_FAKE6] if v6 else []),
+                "iproute2_table_index": TUNNEL_RT_TABLE,
+                "iproute2_rule_index": TUNNEL_RT_RULE,
             },
             {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
-             "listen_port": WARP_MIXED_PORT},
+             "listen_port": TUNNEL_MIXED_PORT},
         ],
-        "outbounds": [{"type": "direct", "tag": "direct"}]
-                     + ([masque_outbound(USQUE_PORT)] if masque else []),
+        "outbounds": [{"type": "direct", "tag": "direct"}] + obs,
         "route": {
-            "rule_set": [{"type": "local", "tag": "warp-domains", "format": "source",
-                          "path": warp_path("rules-warp.json")}],
+            "rule_set": [{"type": "local", "tag": "tunnel-domains", "format": "source",
+                          "path": tunnel_path("rules.json")}],
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
-                {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "warp-dns"},
-            ] + ([
-                # usque не принимает UDP от sing-box по SOCKS («udp address is not
-                # associated with tcp»). Отклоняем UDP сразу: браузер мгновенно
-                # переходит с QUIC на обычный TCP вместо ожидания тайм-аута.
-                {"inbound": ["tun-in", "mixed-in"], "network": "udp", "action": "reject"},
-            ] if masque else []) + [
-                {"inbound": ["tun-in", "mixed-in"], "outbound": "warp"},
+                {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "tunnel-dns"},
+                {"inbound": ["tun-in", "mixed-in"], "outbound": "tunnel"},
             ],
             "final": "direct",
             "auto_detect_interface": True,
             "default_domain_resolver": "local",
         },
-        "experimental": {"cache_file": {"enabled": True, "path": warp_path("cache.db"),
+        "experimental": {"cache_file": {"enabled": True, "path": tunnel_path("cache.db"),
                                         "store_fakeip": True}},
     }
+    if eps:
+        cfg["endpoints"] = eps
+    return cfg
 
 
-WARP_TRACE_LAST = ""   # чем закончилась последняя проверка туннеля
-WARP_EXIT = {}         # откуда WARP выходит в интернет: loc (страна), colo (узел), ip
+# --- проверка туннеля ---------------------------------------------------------
+
+TUNNEL_TRACE_LAST = ""   # чем закончилась последняя проверка туннеля
+TUNNEL_EXIT = {}         # откуда туннель выходит в интернет: loc, colo, ip
 
 
-def warp_trace(port, timeout=5.0):
+def tunnel_trace(port, timeout=6.0):
     """
-    Запрос cdn-cgi/trace к 1.1.1.1 через прокси sing-box: мс или -1.
-    Ответ «warp=on» подтверждает, что трафик идёт через WARP.
-
-    Прокси задан и для http, и для https: 1.1.1.1 на 80-м порту может
-    ответить перенаправлением на https, и без https-прокси urllib пошёл бы
-    по нему НАПРЯМУЮ, мимо туннеля (ответ «warp=off» при рабочем туннеле).
+    Запрос https://1.1.1.1/cdn-cgi/trace через прокси sing-box: мс или -1.
+    Ответ содержит страну (loc) и адрес (ip), под которыми туннель виден
+    сайтам. Прокси задан для http и https, чтобы запрос не ушёл напрямую.
     """
-    global WARP_TRACE_LAST
+    global TUNNEL_TRACE_LAST
     proxy = f"http://127.0.0.1:{port}"
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-    for url in ("https://1.1.1.1/cdn-cgi/trace", "http://1.1.1.1/cdn-cgi/trace"):
+    for url in ("https://1.1.1.1/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"):
         t0 = time.monotonic()
         try:
             with opener.open(url, timeout=timeout) as r:
                 text = r.read(4096).decode("utf-8", "replace")
-            m = re.search(r"warp=(\w+)", text)
-            if m and m.group(1) in ("on", "plus"):
-                WARP_TRACE_LAST = f"{url}: warp={m.group(1)}"
+            if "loc=" in text:
+                TUNNEL_EXIT.clear()
                 for key in ("loc", "colo", "ip"):
                     mm = re.search(rf"(?m)^{key}=(\S+)", text)
                     if mm:
-                        WARP_EXIT[key] = mm.group(1)
+                        TUNNEL_EXIT[key] = mm.group(1)
+                TUNNEL_TRACE_LAST = f"{url}: ответ получен, страна {TUNNEL_EXIT.get('loc')}"
                 return int((time.monotonic() - t0) * 1000)
-            WARP_TRACE_LAST = (f"{url}: ответ получен, но " +
-                               (f"warp={m.group(1)}" if m else "без поля warp")
-                               + " — трафик идёт не через WARP")
+            TUNNEL_TRACE_LAST = f"{url}: неожиданный ответ"
         except Exception as e:
-            WARP_TRACE_LAST = f"{url}: {e.__class__.__name__}: {e}"
-            if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e):
-                break   # туннель не отвечает — второй адрес не поможет
+            TUNNEL_TRACE_LAST = f"{url}: {e.__class__.__name__}: {e}"
     return -1
 
 
-def warp_ping(port, tries=3, timeout=3.0):
+def tunnel_ping(port, tries=3, timeout=4.0):
     """
     Задержка через туннель: время установки TCP-соединения с 1.1.1.1:443
     через прокси sing-box (CONNECT), лучший из нескольких замеров, мс.
-    Это примерно один круговой пробег пакета (RTT). Время полного
-    HTTPS-запроса из warp_trace в 3–4 раза больше и для сравнения узлов
-    не годится.
     """
     best = -1
     for _ in range(tries):
@@ -2409,49 +2820,49 @@ def wait_local_port(port, timeout=4.0, proc=None, alive=None):
     return False
 
 
-def test_warp_endpoint(endpoint):
-    """Пробный туннель: 3 запроса, задержка — лучший из 2-го и 3-го."""
-    masque = is_masque(endpoint)
-    probe = warp_path("probe.json")
+def test_profile(profile):
+    """Пробный запуск профиля: (задержка мс или -1, страна выхода)."""
+    global TUNNEL_TRACE_LAST
+    host, port, is_udp = profile_server(profile)
+    # Быстрый отсев: если TCP-порт сервера не отвечает, туннель не поднимется.
+    if host and port and not is_udp:
+        try:
+            socket.create_connection((host, int(port)), timeout=3).close()
+        except OSError as e:
+            TUNNEL_TRACE_LAST = f"сервер {host}:{port} не принимает соединение ({e})"
+            try:
+                os.remove(tunnel_path("probe.log"))
+            except OSError:
+                pass
+            return -1, None
+    eps, obs = profile_parts(profile)
     cfg = {
         "log": {"level": "info"},
+        "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1",
-                      "listen_port": WARP_PROBE_PORT}],
-        "route": {"final": "warp", "auto_detect_interface": True},
+                      "listen_port": TUNNEL_PROBE_PORT}],
+        "outbounds": obs + [{"type": "direct", "tag": "direct"}],
+        "route": {"final": "tunnel", "auto_detect_interface": True,
+                  "default_domain_resolver": "local"},
     }
-    if masque:
-        cfg["outbounds"] = [masque_outbound(USQUE_PROBE_PORT)]
-    else:
-        cfg["endpoints"] = [warp_endpoint_json(read_json(warp_path("account.json")), endpoint)]
+    if eps:
+        cfg["endpoints"] = eps
+    probe = tunnel_path("probe.json")
     write_json(probe, cfg)
-    uproc = ulog = None
-    if masque:
-        ulog = open(warp_path("probe-usque.log"), "w")
-        uproc = subprocess.Popen(usque_args(endpoint, USQUE_PROBE_PORT),
-                                 stdout=ulog, stderr=subprocess.STDOUT)
-    logf = open(warp_path("probe.log"), "w")
+    logf = open(tunnel_path("probe.log"), "w")
     proc = subprocess.Popen([singbox_path(), "run", "-c", probe],
                             stdout=logf, stderr=subprocess.STDOUT)
     try:
-        if uproc and not wait_local_port(USQUE_PROBE_PORT, 8.0, uproc):
-            return -1
-        if not wait_local_port(WARP_PROBE_PORT, 8.0, proc):
-            return -1
-        if masque:
-            # MASQUE-туннель устанавливается дольше WireGuard: даём до 12 с.
-            for _ in range(3):
-                if warp_trace(WARP_PROBE_PORT, 4.0) >= 0:
-                    break
-            else:
-                return -1
-        elif warp_trace(WARP_PROBE_PORT, 4.0) < 0:
-            return -1
-        # Туннель подтверждён (warp=on). Для сравнения узлов меряем задержку.
-        ping = warp_ping(WARP_PROBE_PORT)
-        if ping >= 2:   # 0–1 мс значило бы, что замер не дошёл до туннеля
-            return ping
-        times = [t for t in (warp_trace(WARP_PROBE_PORT, 3.0) for _ in range(2)) if t >= 0]
-        return min(times) if times else -1
+        if not wait_local_port(TUNNEL_PROBE_PORT, 8.0, proc):
+            return -1, None
+        if tunnel_trace(TUNNEL_PROBE_PORT, 6.0) < 0:
+            return -1, None
+        loc = TUNNEL_EXIT.get("loc")
+        ping = tunnel_ping(TUNNEL_PROBE_PORT)
+        if ping >= 2:
+            return ping, loc
+        t = tunnel_trace(TUNNEL_PROBE_PORT, 6.0)
+        return (t if t >= 0 else -1), loc
     finally:
         proc.terminate()
         try:
@@ -2459,110 +2870,76 @@ def test_warp_endpoint(endpoint):
         except subprocess.TimeoutExpired:
             proc.kill()
         logf.close()
-        if uproc:
-            uproc.terminate()
-            try:
-                uproc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                uproc.kill()
-            ulog.close()
 
 
-def find_warp_endpoint(skip=()):
-    """Автоподбор узла Cloudflare: подсети WARP x официальные порты."""
-    import random
-    was_running = warp_running()
-    stop_warp(quiet=True)
-    have_wg = os.path.isfile(warp_path("account.json"))
-    cands = (["162.159.192.1:2408"] + [f"{p}.{random.randint(1, 254)}:2408" for p in WARP_PREFIXES]
-             if have_wg else [])
+def select_profile(skip=(), autostart=True):
+    """Проверяет все профили и выбирает рабочий с наименьшей задержкой."""
+    profiles = load_profiles()
+    if not profiles:
+        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.")
+        return None
+    was_running = tunnel_running()
+    stop_tunnel(quiet=True)
     results = []
-    head("Подбор узла Cloudflare WARP...")
-
-    def check(ep):
-        if ep in skip:
-            return
-        sys.stdout.write(f"    {ep:<22} ")
+    head("Проверка профилей туннеля...")
+    last_fail = []
+    for p in profiles:
+        if p["name"] in skip:
+            continue
+        sys.stdout.write(f"    {p['name'][:40]:<40} ")
         sys.stdout.flush()
-        ms = test_warp_endpoint(ep)
+        ms, loc = test_profile(p)
         if ms >= 0:
-            results.append({"endpoint": ep, "ms": ms})
-            print(_c(C.GREEN, f"{ms} мс"))
+            results.append({"name": p["name"], "ms": ms, "loc": loc})
+            flag = _c(C.YELLOW, " (Россия!)") if loc == "RU" else ""
+            print(_c(C.GREEN, f"{ms} мс, выход: {loc}") + flag)
         else:
             print(_c(C.GRAY, "нет ответа"))
-
-    for c in cands:
-        check(c)
-    if have_wg and len(results) < 2:
-        for port in WARP_PORTS[1:]:
-            for p in WARP_PREFIXES:
-                check(f"{p}.{random.randint(1, 254)}:{port}")
-                if len(results) >= 3:
-                    break
-            if len(results) >= 3:
-                break
+            last_fail = [f"Профиль «{p['name']}»: {TUNNEL_TRACE_LAST}"] + file_tail(tunnel_path("probe.log"), 6)
+    # Зарубежный выход важнее скорости: с российским адресом сервисы,
+    # закрытые для России, не откроются.
+    results.sort(key=lambda r: (r["loc"] == "RU", r["ms"]))
     if not results:
-        # WireGuard не проходит — пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
-        warn("WireGuard к Cloudflare не проходит — пробую WARP через MASQUE...")
-        wg_log = file_tail(warp_path("probe.log"), 3)
-        for stale in ("probe-usque.log", "probe.log"):
-            try:
-                os.remove(warp_path(stale))
-            except OSError:
-                pass
-        if not ensure_masque():
-            # usque не скачался или не зарегистрировался: это и есть причина.
-            # Оставляем её в «Последней ошибке», не затирая общим сообщением.
-            warn("MASQUE недоступен: причина выше.")
-            return None
-        # Проверяем все варианты и берём самый быстрый, а не первый рабочий.
-        for v in MASQUE_VARIANTS:
-            check(v)
-        if not results:
-            set_warp_error(
-                "Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).",
-                ["usque (MASQUE), последняя проба:"]
-                + (file_tail(warp_path("probe-usque.log"), 8) or ["<usque ничего не вывел>"])
-                + ["sing-box, последняя проба MASQUE:"] + file_tail(warp_path("probe.log"), 4)
-                + ["WireGuard, последняя проба:"] + wg_log)
-            warn("Похоже, провайдер блокирует WARP целиком.")
-            info("Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).")
-            return None
-    results.sort(key=lambda r: r["ms"])
-    if not results:
-        set_warp_error("Ни один узел WARP не ответил.",
-                       ["Журнал последней пробы sing-box:"] + file_tail(warp_path("probe.log"), 6))
-        warn("Похоже, провайдер блокирует WARP целиком.")
-        info("Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).")
+        set_tunnel_error("Ни один профиль туннеля не ответил.", last_fail)
+        warn("Сервер недоступен или его протокол блокируется провайдером.")
+        info("Попробуйте при запущенном zapret, другой сервер или другой протокол.")
         return None
-    write_json(warp_path("state.json"), {"best": results[0]["endpoint"], "ranked": results,
-                                         "tested": datetime.now().isoformat(timespec="seconds")})
-    ok(f"Лучший узел: {results[0]['endpoint']} (задержка {results[0]['ms']} мс)")
-    if len(results) > 1:
-        info("Остальные: " + ", ".join(f"{r['endpoint']} {r['ms']} мс" for r in results[1:4]))
-    if was_running:
-        start_warp()
-    return results[0]["endpoint"]
+    best = results[0]
+    write_json(tunnel_path("state.json"), {"active": best["name"], "ranked": results,
+                                           "tested": datetime.now().isoformat(timespec="seconds")})
+    clear_tunnel_error()
+    ok(f"Лучший профиль: {best['name']} (задержка {best['ms']} мс, выход: {best['loc']})")
+    if autostart:
+        if was_running or (tunnel_enabled() and nfqws2_running()):
+            start_tunnel()
+        elif tunnel_enabled():
+            info("Туннель запустится вместе с обходом (пункт [2] главного меню).")
+        else:
+            info("Туннель выключен: включите его в меню туннеля, пункт [1].")
+    return best["name"]
 
 
-def warp_running():
-    rc, _, _ = run(["systemctl", "is-active", "--quiet", WARP_SERVICE], timeout=10)
+# --- запуск и остановка -------------------------------------------------------
+
+def tunnel_running():
+    rc, _, _ = run(["systemctl", "is-active", "--quiet", TUNNEL_SERVICE], timeout=10)
     return rc == 0
 
 
-def warp_enabled():
-    return os.path.isfile(warp_path("enabled"))
+def tunnel_enabled():
+    return os.path.isfile(tunnel_path("enabled"))
 
 
-def usque_unit_content(endpoint):
+def tunnel_unit_content():
     return f"""[Unit]
-Description=Zapret2 WARP over MASQUE (usque)
+Description=Zapret2 tunnel (sing-box) for sites zapret can't open
 After=network-online.target {SERVICE_NAME}.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={' '.join(usque_args(endpoint, USQUE_PORT))}
+ExecStart={singbox_path()} run -c {tunnel_path('config.json')}
+ExecStartPost=-/bin/sh {tunnel_dns_script_path()}
 Restart=on-failure
 RestartSec=5
 
@@ -2571,175 +2948,141 @@ WantedBy=multi-user.target
 """
 
 
-def usque_running():
-    rc, _, _ = run(["systemctl", "is-active", "--quiet", USQUE_SERVICE], timeout=10)
-    return rc == 0
-
-
-def usque_journal(lines=10):
-    rc, out, _ = run(["journalctl", "-u", USQUE_SERVICE, "-n", str(lines),
-                      "--no-pager", "-o", "cat"], timeout=15)
-    return [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
-
-
-def warp_unit_content():
-    return f"""[Unit]
-Description=Zapret2 WARP (sing-box) for sites zapret can't open
-After=network-online.target {SERVICE_NAME}.service {USQUE_SERVICE}.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart={singbox_path()} run -c {warp_path('config.json')}
-ExecStartPost=-/bin/sh {warp_dns_script_path()}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def file_tail(path, lines=12):
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = re.sub(r"\x1b\[[0-9;]*m", "", f.read())  # цвета sing-box
-            return [ln.rstrip() for ln in text.splitlines() if ln.strip()][-lines:]
-    except OSError:
-        return []
-
-
-def set_warp_error(message, details=()):
-    """Запоминает причину сбоя: её видно в меню WARP, а не только при запуске."""
+def set_tunnel_error(message, details=()):
+    """Запоминает причину сбоя: её видно в меню туннеля, а не только при запуске."""
     details = list(details)
-    if WARP_TRACE_LAST and ("узел" in message.lower() or "трафик" in message):
-        details.insert(0, f"Проверка туннеля: {WARP_TRACE_LAST}")
     err(message)
     for ln in details:
         print(_c(C.GRAY, f"    {ln}"))
     try:
-        os.makedirs(warp_dir(), exist_ok=True)
-        with open(warp_path("last-error.txt"), "w", encoding="utf-8") as f:
+        os.makedirs(tunnel_dir(), exist_ok=True)
+        with open(tunnel_path("last-error.txt"), "w", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
             f.write("\n".join(details) + "\n")
     except OSError:
         pass
 
 
-def clear_warp_error():
+def clear_tunnel_error():
     try:
-        os.remove(warp_path("last-error.txt"))
+        os.remove(tunnel_path("last-error.txt"))
     except OSError:
         pass
 
 
 def journal_tail(lines=15):
-    rc, out, _ = run(["journalctl", "-u", WARP_SERVICE, "-n", str(lines),
+    rc, out, _ = run(["journalctl", "-u", TUNNEL_SERVICE, "-n", str(lines),
                       "--no-pager", "-o", "cat"], timeout=15)
+    out = re.sub(r"\x1b\[[0-9;]*m", "", out)
     return [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
 
 
-def start_warp_process(endpoint):
+def find_profile(name):
+    for p in load_profiles():
+        if p["name"] == name:
+            return p
+    return None
+
+
+def start_tunnel_process(profile):
     """
-    'ok', 'crash' (sing-box завершился: ошибка конфига, TUN, прав — перебор
-    узлов не поможет) или 'notunnel' (sing-box работает, но трафик через
-    WARP не идёт — стоит попробовать другой узел).
+    'ok', 'crash' (sing-box завершился: ошибка конфига, TUN, прав) или
+    'notunnel' (sing-box работает, но трафик через сервер не идёт).
     """
-    if is_masque(endpoint):
-        if not ensure_masque():
-            return "crash"
-        with open(USQUE_UNIT_PATH, "w", encoding="utf-8") as f:
-            f.write(usque_unit_content(endpoint))
-        run(["systemctl", "daemon-reload"], timeout=60)
-        run(["systemctl", "reset-failed", USQUE_SERVICE], timeout=30)
-        run(["systemctl", "restart", USQUE_SERVICE], timeout=60)
-        if not wait_local_port(USQUE_PORT, 15.0, alive=usque_running):
-            set_warp_error("usque (MASQUE) не запустился.", usque_journal())
-            return "crash"
-    write_json(warp_path("config.json"), build_warp_config(endpoint))
-    rc, out, errout = run([singbox_path(), "check", "-c", warp_path("config.json")], timeout=30)
+    write_json(tunnel_path("config.json"), build_tunnel_config(profile))
+    rc, out, errout = run([singbox_path(), "check", "-c", tunnel_path("config.json")], timeout=30)
     if rc != 0:
-        set_warp_error("Конфиг sing-box не прошёл проверку.", (errout or out).splitlines())
+        set_tunnel_error("Конфиг sing-box не прошёл проверку.", (errout or out).splitlines())
         return "crash"
-    with open(WARP_UNIT_PATH, "w", encoding="utf-8") as f:
-        f.write(warp_unit_content())
+    with open(TUNNEL_UNIT_PATH, "w", encoding="utf-8") as f:
+        f.write(tunnel_unit_content())
     run(["systemctl", "daemon-reload"], timeout=60)
-    run(["systemctl", "reset-failed", WARP_SERVICE], timeout=30)
-    run(["systemctl", "restart", WARP_SERVICE], timeout=60)
+    run(["systemctl", "reset-failed", TUNNEL_SERVICE], timeout=30)
+    run(["systemctl", "restart", TUNNEL_SERVICE], timeout=60)
     # Создание TUN и маршрутов может занять несколько секунд.
-    if not wait_local_port(WARP_MIXED_PORT, 30.0, alive=warp_running):
-        if warp_running():
-            set_warp_error("sing-box не открыл локальный порт за 30 секунд.", journal_tail())
+    if not wait_local_port(TUNNEL_MIXED_PORT, 30.0, alive=tunnel_running):
+        if tunnel_running():
+            set_tunnel_error("sing-box не открыл локальный порт за 30 секунд.", journal_tail())
         else:
-            set_warp_error("Служба sing-box завершилась при запуске.", journal_tail())
+            set_tunnel_error("Служба sing-box завершилась при запуске.", journal_tail())
         return "crash"
-    for _ in range(5 if is_masque(endpoint) else 3):
-        if not warp_running():
+    for _ in range(3):
+        if not tunnel_running():
             break
-        if warp_trace(WARP_MIXED_PORT, 6.0) >= 0:
-            clear_warp_error()
+        if tunnel_trace(TUNNEL_MIXED_PORT, 6.0) >= 0:
+            clear_tunnel_error()
             return "ok"
         time.sleep(1)
-    if not warp_running():
-        set_warp_error("Служба sing-box завершилась.", journal_tail())
+    if not tunnel_running():
+        set_tunnel_error("Служба sing-box завершилась.", journal_tail())
         return "crash"
-    set_warp_error(f"Через узел {endpoint} не идёт трафик.",
-                   (usque_journal(6) if is_masque(endpoint) else []) + journal_tail(8))
+    set_tunnel_error(f"Через профиль «{profile['name']}» не идёт трафик.",
+                     [f"Проверка туннеля: {TUNNEL_TRACE_LAST}"] + journal_tail(8))
     return "notunnel"
 
 
-def start_warp():
+def start_tunnel():
     ensure_root(sys.argv)
+    cleanup_legacy_warp()
     if not which("systemctl"):
-        set_warp_error("Для WARP нужен systemd (sing-box запускается как служба).")
+        set_tunnel_error("Для туннеля нужен systemd (sing-box запускается как служба).")
+        return
+    if not load_profiles():
+        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.")
         return
     try:
         if not os.access(singbox_path(), os.X_OK):
             install_singbox()
     except Exception as e:
         lines = str(e).splitlines() or ["ошибка"]
-        set_warp_error(lines[0], lines[1:])
+        set_tunnel_error(lines[0], lines[1:])
         return
-    if not os.path.isfile(warp_path("account.json")) and not os.path.isfile(usque_config()):
-        try:
-            warp_register()
-        except Exception as e:
-            # Не фатально: остаётся транспорт MASQUE со своей регистрацией.
-            warn(str(e).splitlines()[0])
-    stop_warp(quiet=True)
-    st = read_json(warp_path("state.json")) or {}
-    ep = st.get("best") or find_warp_endpoint()
-    if not ep:
+    stop_tunnel(quiet=True)
+    st = read_json(tunnel_path("state.json")) or {}
+    profile = find_profile(st.get("active", ""))
+    if not profile:
+        name = select_profile(autostart=False)
+        profile = find_profile(name) if name else None
+    if not profile:
         return
-    head(f"Запуск sing-box (узел {ep})...")
-    r = start_warp_process(ep)
-    if r == "notunnel":
-        warn(f"Узел {ep} не отвечает, подбираю другой...")
-        stop_warp(quiet=True)
-        ep = find_warp_endpoint(skip=(ep,))
-        r = start_warp_process(ep) if ep else "crash"
+    head(f"Запуск туннеля (профиль «{profile['name']}»)...")
+    r = start_tunnel_process(profile)
+    if r == "notunnel" and len(load_profiles()) > 1:
+        warn("Профиль не отвечает, проверяю остальные...")
+        stop_tunnel(quiet=True)
+        name = select_profile(skip=(profile["name"],), autostart=False)
+        profile = find_profile(name) if name else None
+        r = start_tunnel_process(profile) if profile else "crash"
     if r != "ok":
-        stop_warp(quiet=True)
-        err("WARP не запущен. Причина выше; она же в меню WARP и в журнале:")
-        info(f"journalctl -u {WARP_SERVICE}")
+        stop_tunnel(quiet=True)
+        err("Туннель не запущен. Причина выше; она же в меню туннеля и в журнале:")
+        info(f"journalctl -u {TUNNEL_SERVICE}")
         return
-    if warp_enabled():
-        run(["systemctl", "enable", WARP_SERVICE], timeout=60)
-        if is_masque(ep):
-            run(["systemctl", "enable", USQUE_SERVICE], timeout=60)
-        else:
-            run(["systemctl", "disable", USQUE_SERVICE], timeout=60)
-    apply_warp_dns()
+    if tunnel_enabled():
+        run(["systemctl", "enable", TUNNEL_SERVICE], timeout=60)
+    apply_tunnel_dns()
     flush_dns()
-    ok(f"WARP работает через узел {ep}. Сайтов в списке WARP: {len(list_entries(warp_list_path()))}")
-    report_warp_exit()
-    check_warp_dns()
+    ok(f"Туннель работает: «{profile['name']}». Сайтов в списке туннеля: "
+       f"{len(list_entries(tunnel_list_path()))}")
+    report_tunnel_exit()
+    check_tunnel_dns()
 
 
-def warp_starter_pid():
-    """PID фонового запуска WARP, если он ещё идёт."""
+def report_tunnel_exit():
+    """Показывает, из какой страны туннель выходит в интернет."""
+    if not TUNNEL_EXIT:
+        return
+    write_json(tunnel_path("exit.json"), TUNNEL_EXIT, mode=0o644)
+    loc = TUNNEL_EXIT.get("loc", "?")
+    info(f"Выход в интернет: страна {loc}, адрес {TUNNEL_EXIT.get('ip', '?')}")
+    if loc == "RU":
+        warn("Выход — в России: сервисы, которые сами не пускают из России, через туннель не откроются.")
+
+
+def tunnel_starter_pid():
+    """PID фонового запуска туннеля, если он ещё идёт."""
     try:
-        with open(warp_path("starting.pid")) as f:
+        with open(tunnel_path("starting.pid")) as f:
             pid = int(f.read().strip())
         os.kill(pid, 0)
         return pid
@@ -2747,95 +3090,92 @@ def warp_starter_pid():
         return None
 
 
-def start_warp_background():
-    """
-    Запуск WARP следом за zapret, не задерживая сам обход: проверка узла
-    (а при необходимости и подбор нового) идёт в отдельном процессе.
-    """
-    if warp_starter_pid():
-        info("WARP уже запускается в фоне")
+def start_tunnel_background():
+    """Запуск туннеля следом за zapret, не задерживая сам обход."""
+    if tunnel_starter_pid():
+        info("Туннель уже запускается в фоне")
         return
-    log = warp_path("start.log")
-    os.makedirs(warp_dir(), exist_ok=True)
+    log = tunnel_path("start.log")
+    os.makedirs(tunnel_dir(), exist_ok=True)
     with open(log, "w", encoding="utf-8") as f:
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--action", "warp-start"],
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--action", "tunnel-start"],
                              stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
                              start_new_session=True)
-    with open(warp_path("starting.pid"), "w") as f:
+    with open(tunnel_path("starting.pid"), "w") as f:
         f.write(str(p.pid))
-    info(f"WARP запускается в фоне — статус в меню [11], журнал: {log}")
+    info(f"Туннель запускается в фоне — статус в меню [11], журнал: {log}")
 
 
-def warp_start_action():
-    """Действие warp-start: запуск WARP, если он включён (используется фоном)."""
+def tunnel_start_action():
+    """Действие tunnel-start: запуск туннеля, если он включён (используется фоном)."""
     try:
-        if warp_enabled():
-            start_warp()
+        if tunnel_enabled():
+            start_tunnel()
         else:
-            info("WARP выключен")
+            info("Туннель выключен")
     finally:
         try:
-            os.remove(warp_path("starting.pid"))
+            os.remove(tunnel_path("starting.pid"))
         except OSError:
             pass
 
 
-def stop_warp(quiet=False):
-    # Остановка во время фонового запуска WARP: прерываем и запуск, иначе он
-    # поднимет sing-box уже после остановки обхода. Себя не трогаем.
-    pid = warp_starter_pid()
+def stop_tunnel(quiet=False):
+    # Остановка во время фонового запуска: прерываем и запуск. Себя не трогаем.
+    pid = tunnel_starter_pid()
     if pid and pid != os.getpid():
         try:
             os.killpg(pid, signal.SIGTERM)
         except OSError:
             pass
         try:
-            os.remove(warp_path("starting.pid"))
+            os.remove(tunnel_path("starting.pid"))
         except OSError:
             pass
-    if os.path.isfile(WARP_UNIT_PATH):
-        run(["systemctl", "stop", WARP_SERVICE], timeout=60)
+    if os.path.isfile(TUNNEL_UNIT_PATH):
+        run(["systemctl", "stop", TUNNEL_SERVICE], timeout=60)
     run(["pkill", "-f", f"{singbox_path()} run"])
-    if os.path.isfile(USQUE_UNIT_PATH):
-        run(["systemctl", "stop", USQUE_SERVICE], timeout=60)
-    run(["pkill", "-f", f"{usque_path()} -c"])
     if not quiet:
-        ok("WARP остановлен")
+        ok("Туннель остановлен")
 
 
-def enable_warp(assume_yes=False):
+def enable_tunnel(assume_yes=False):
     ensure_root(sys.argv)
-    os.makedirs(warp_dir(), exist_ok=True)
+    cleanup_legacy_warp()
+    os.makedirs(tunnel_dir(), exist_ok=True)
     os.makedirs(ipset_dir(), exist_ok=True)
-    merge_list_file(warp_list_path(), SEED_WARP)
-    with open(warp_path("enabled"), "w") as f:
+    merge_list_file(tunnel_list_path(), SEED_TUNNEL)
+    if not load_profiles():
+        err("Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).")
+        return
+    with open(tunnel_path("enabled"), "w") as f:
         f.write("1")
-    start_warp()
-    if warp_running():
+    start_tunnel()
+    if tunnel_running():
         ans = "y"
         if not assume_yes:
             try:
-                ans = input("  Проверить сайты из списков и перенести в WARP те, "
+                ans = input("  Проверить сайты из списков и перенести в туннель те, "
                             "что не открываются через zapret? (Y/n) ").strip().lower()
             except EOFError:
                 ans = "y"
         if ans not in ("n", "no", "н", "нет"):
-            update_warp_routes()
+            update_tunnel_routes()
 
 
-def disable_warp():
+def disable_tunnel():
     ensure_root(sys.argv)
     try:
-        os.remove(warp_path("enabled"))
+        os.remove(tunnel_path("enabled"))
     except OSError:
         pass
-    stop_warp()
-    if os.path.isfile(WARP_UNIT_PATH):
-        run(["systemctl", "disable", WARP_SERVICE], timeout=60)
-    if os.path.isfile(USQUE_UNIT_PATH):
-        run(["systemctl", "disable", USQUE_SERVICE], timeout=60)
+    stop_tunnel()
+    if os.path.isfile(TUNNEL_UNIT_PATH):
+        run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
     flush_dns()
 
+
+# --- распределение сайтов ----------------------------------------------------
 
 def https_probe(domain, proxy=None, timeout=8.0):
     """
@@ -2874,7 +3214,7 @@ def https_batch(domains, proxy=None):
 
 
 def remove_hosts_domains(domains):
-    """Убирает из нашего блока hosts строки доменов, переносимых в WARP."""
+    """Убирает из нашего блока hosts строки доменов, переносимых в туннель."""
     names = set()
     for d in domains:
         names.add(d.lower())
@@ -2895,20 +3235,27 @@ def remove_hosts_domains(domains):
         write_hosts(out)
 
 
-def update_warp_routes():
-    """WARP там, где не справляется zapret: перенос неоткрывающихся сайтов."""
+def add_tunnel_domains(domains):
+    merge_list_file(tunnel_list_path(), domains)
+    write_tunnel_rules()
+    remove_hosts_domains(domains)
+    flush_dns()
+
+
+def update_tunnel_routes():
+    """Туннель там, где не справляется zapret: перенос неоткрывающихся сайтов."""
     ensure_root(sys.argv)
-    if not warp_running():
-        err("WARP не запущен")
+    if not tunnel_running():
+        err("Туннель не запущен")
         return
     if not nfqws2_running():
-        warn("zapret не запущен — в WARP попадут и сайты, которые zapret открыл бы сам")
-    in_warp = set(list_entries(warp_list_path()))
+        warn("zapret не запущен — в туннель попадут и сайты, которые zapret открыл бы сам")
+    in_tunnel = set(list_entries(tunnel_list_path()))
     excl = set(list_entries(os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt")))
     cands = []
     for name in ("zapret-hosts-user.txt", "zapret-hosts-auto.txt"):
         for d in list_entries(os.path.join(ipset_dir(), name)):
-            if d not in in_warp and d not in excl and d not in cands:
+            if d not in in_tunnel and d not in excl and d not in cands:
                 cands.append(d)
     if not cands:
         info("Нечего проверять")
@@ -2917,149 +3264,185 @@ def update_warp_routes():
     direct = https_batch(cands)
     failed = [d for d in cands if not direct[d]]
     if failed:
-        # Вторая попытка: случайный сбой не должен навсегда увести сайт в WARP
-        # (домены из списка WARP zapret больше не обрабатывает).
+        # Вторая попытка: случайный сбой не должен навсегда увести сайт в туннель
+        # (домены из списка туннеля zapret больше не обрабатывает).
         again = https_batch(failed)
         failed = [d for d in failed if not again[d]]
     info(f"открываются через zapret: {len(cands) - len(failed)}, не открываются: {len(failed)}")
     if not failed:
-        ok("WARP не нужен ни одному сайту из списков")
+        ok("Туннель не нужен ни одному сайту из списков")
         return
-    head("Проверка неоткрывшихся через WARP...")
-    via = https_batch(failed, proxy=f"http://127.0.0.1:{WARP_MIXED_PORT}")
+    head("Проверка неоткрывшихся через туннель...")
+    via = https_batch(failed, proxy=f"http://127.0.0.1:{TUNNEL_MIXED_PORT}")
     move = [d for d in failed if via[d]]
     dead = [d for d in failed if not via[d]]
     if move:
-        merge_list_file(warp_list_path(), move)
-        write_warp_rules()
-        remove_hosts_domains(move)
-        flush_dns()
-        ok("Перенесено в WARP: " + ", ".join(move))
+        add_tunnel_domains(move)
+        ok("Перенесено в туннель: " + ", ".join(move))
         time.sleep(1)   # sing-box перечитывает список
-        check_warp_dns()
+        check_tunnel_dns()
         info("Перезапустите браузер: он помнит старые адреса сайтов. Если в браузере включён "
-             "«Безопасный DNS» (DNS через HTTPS), отключите его — иначе он обходит WARP.")
+             "«Безопасный DNS» (DNS через HTTPS), отключите его — иначе он обходит туннель.")
     if dead:
-        info("Не открываются и через WARP (нет сайта на корне домена, геоблок или сбой): "
+        info("Не открываются и через туннель (нет сайта на корне домена или сбой): "
              + ", ".join(dead))
-    info(f"Список WARP: {warp_list_path()} (можно править вручную)")
+    info(f"Список туннеля: {tunnel_list_path()} (можно править вручную)")
 
 
-def report_warp_exit():
-    """
-    Показывает, из какой страны WARP выходит в интернет. Cloudflare сам
-    выбирает ближайший узел, и из России это обычно российский узел: тогда
-    сайты видят российский адрес, и сервисы, закрытые для России самими
-    владельцами (ChatGPT, Claude, Spotify...), через WARP не откроются —
-    WARP помогает только от блокировок на стороне провайдера.
-    """
-    if not WARP_EXIT:
-        return
-    write_json(warp_path("exit.json"), WARP_EXIT, mode=0o644)
-    loc = WARP_EXIT.get("loc", "?")
-    info(f"Выход WARP в интернет: страна {loc}, узел Cloudflare {WARP_EXIT.get('colo', '?')}, "
-         f"адрес {WARP_EXIT.get('ip', '?')}")
-    if loc == "RU":
-        warn("Выход — российский узел Cloudflare. Сайты, заблокированные провайдером, откроются;")
-        warn("сервисы, которые сами не пускают из России (ChatGPT, Claude, Spotify...), — нет.")
-
-
-def warp_test(domains=None):
-    """Проверка сайтов из списка WARP так, как их видит браузер (через DNS и TUN)."""
+def tunnel_test(domains=None):
+    """Проверка сайтов из списка туннеля так, как их видит браузер (через DNS и TUN)."""
     ensure_root(sys.argv)
-    if not warp_running():
-        err("WARP не запущен")
+    if not tunnel_running():
+        err("Туннель не запущен")
         return
-    doms = domains or list_entries(warp_list_path())
+    doms = domains or list_entries(tunnel_list_path())
     if not doms:
-        info("Список WARP пуст")
+        info("Список туннеля пуст")
         return
-    head("Проверка сайтов из списка WARP (как в браузере)...")
+    head("Проверка сайтов из списка туннеля (как в браузере)...")
     for d in doms:
         try:
             ips = sorted({i[4][0] for i in socket.getaddrinfo(d, 443, socket.AF_INET, socket.SOCK_STREAM)})
         except OSError:
             ips = []
-        via = "в туннель" if any(ip.startswith(WARP_FAKE4_PREFIX) for ip in ips) else "МИМО туннеля"
+        via = "в туннель" if any(ip.startswith(TUNNEL_FAKE4_PREFIX) for ip in ips) else "МИМО туннеля"
         res = _probe_tls(d, 4) if ips else "DNS: имя не разрешается"
         color = C.GREEN if res.startswith("OK") else C.RED
         print(f"    {d:<28} DNS {via:<13} {_c(color, res)}")
     print()
     info("«OK … 403 Forbidden» или страница «недоступно в вашем регионе» — отказ самого сайта, а не блокировка.")
-    ex = read_json(warp_path("exit.json")) or {}
+    ex = read_json(tunnel_path("exit.json")) or {}
     if ex:
-        info(f"Выход WARP: страна {ex.get('loc')}, узел {ex.get('colo')}")
+        info(f"Выход туннеля: страна {ex.get('loc')}, адрес {ex.get('ip')}")
 
 
-def warp_status_line():
-    st = read_json(warp_path("state.json")) or {}
-    if warp_running():
-        state = _c(C.GREEN, f"работает, узел {st.get('best')}")
-    elif warp_starter_pid():
+# --- меню ---------------------------------------------------------------------
+
+PROTON_HELP = """
+  Proton VPN Free — бесплатный тариф без ограничения трафика.
+    1. Зарегистрируйтесь на https://account.protonvpn.com (нужна почта).
+    2. Раздел «Downloads» -> «WireGuard configuration».
+    3. Платформа: Router (или GNU/Linux). Protocol: WireGuard.
+    4. Выберите бесплатный сервер (Free). Для Дальнего Востока ближе Япония (JP).
+    5. Нажмите «Create» и скачайте файл .conf.
+  Можно импортировать несколько файлов (разные страны) — скрипт выберет лучший.
+  Если сайт Proton не открывается, зайдите на него с телефона (мобильный интернет).
+"""
+
+CUSTOM_HELP = f"""
+  Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.
+  Поддерживается: {SUPPORTED_FORMATS}.
+"""
+
+
+def tunnel_status_line():
+    st = read_json(tunnel_path("state.json")) or {}
+    if tunnel_running():
+        state = _c(C.GREEN, f"работает, профиль «{st.get('active')}»")
+    elif tunnel_starter_pid():
         state = _c(C.YELLOW, "запускается...")
     else:
         state = _c(C.GRAY, "не запущен")
-    ex = read_json(warp_path("exit.json")) or {}
-    where = f" | выход: {ex.get('loc')}/{ex.get('colo')}" if ex and warp_running() else ""
-    print(f"  WARP: {'включён' if warp_enabled() else 'выключен'} | {state} | "
-          f"сайтов в списке: {len(list_entries(warp_list_path()))}{where}")
+    ex = read_json(tunnel_path("exit.json")) or {}
+    where = f" | выход: {ex.get('loc')}" if ex and tunnel_running() else ""
+    print(f"  Туннель: {'включён' if tunnel_enabled() else 'выключен'} | {state} | "
+          f"профилей: {len(load_profiles())} | сайтов в списке: "
+          f"{len(list_entries(tunnel_list_path()))}{where}")
 
 
-def warp_menu():
+def show_profiles():
+    profiles = load_profiles()
+    if not profiles:
+        info("Профилей нет")
+        return profiles
+    active = (read_json(tunnel_path("state.json")) or {}).get("active")
+    for i, p in enumerate(profiles, 1):
+        host, port, _ = profile_server(p)
+        mark = _c(C.GREEN, " <- активный") if p["name"] == active else ""
+        src = "Proton" if p.get("source") == "proton" else "свой"
+        print(f"    [{i}] {p['name']}  [{p['type']}, {src}]  {host}:{port}{mark}")
+    return profiles
+
+
+def tunnel_menu():
     while True:
         print()
-        warp_status_line()
-        en = warp_enabled()
-        if en and not warp_running() and not warp_starter_pid():
-            le = file_tail(warp_path("last-error.txt"), 40)
+        tunnel_status_line()
+        en = tunnel_enabled()
+        if en and not tunnel_running() and not tunnel_starter_pid():
+            le = file_tail(tunnel_path("last-error.txt"), 40)
             if le:
                 print(_c(C.RED, "  Последняя ошибка:"))
                 for ln in le:
                     print(_c(C.GRAY, f"    {ln}"))
-        print(f"  [1] {'Выключить' if en else 'Включить'} WARP")
-        print("  [2] Подобрать лучший узел Cloudflare заново")
-        print("  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret")
-        print("  [4] Добавить домен в WARP вручную")
-        print("  [5] Импортировать WireGuard-конфиг WARP (если регистрация не проходит)")
-        print("  [6] Проверить сайты из списка WARP (как в браузере)")
+        print(f"  [1] {'Выключить' if en else 'Включить'} туннель")
+        print("  [2] Proton VPN Free: импортировать конфиг WireGuard")
+        print("  [3] Свой сервер: импортировать конфиг, ссылку или подписку")
+        print("  [4] Проверить профили и выбрать лучший")
+        print("  [5] Проверить сайты и перенести в туннель те, что не открываются через zapret")
+        print("  [6] Добавить домен в туннель вручную")
+        print("  [7] Проверить сайты из списка туннеля (как в браузере)")
+        print("  [8] Профили: показать / удалить")
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
         except EOFError:
             return
-        try:
-            warp_menu_action(ch, en)
-        except Exception as e:
-            set_warp_error(f"Ошибка: {e}")
         if ch == "0":
             return
+        try:
+            tunnel_menu_action(ch, en)
+        except ProfileError as e:
+            err(str(e))
+        except Exception as e:
+            set_tunnel_error(f"Ошибка: {e}")
 
 
-def warp_menu_action(ch, en):
-    """Одно действие меню WARP; исключения перехватывает warp_menu."""
+def tunnel_menu_action(ch, en):
+    """Одно действие меню туннеля; исключения перехватывает tunnel_menu."""
     if ch == "1":
-        disable_warp() if en else enable_warp()
-    elif ch == "2":
-        find_warp_endpoint()
-    elif ch == "3":
-        update_warp_routes()
+        disable_tunnel() if en else enable_tunnel()
+    elif ch in ("2", "3"):
+        print(PROTON_HELP if ch == "2" else CUSTOM_HELP)
+        value = input("  Путь к файлу .conf: " if ch == "2"
+                      else "  Ссылка, путь к файлу или адрес подписки: ").strip()
+        if not value:
+            return
+        import_profiles(read_user_input(value), "proton" if ch == "2" else "custom")
+        select_profile()
     elif ch == "4":
+        select_profile()
+    elif ch == "5":
+        update_tunnel_routes()
+    elif ch == "6":
         d = input("  Домен (например, example.com): ").strip().lower()
         if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
-            merge_list_file(warp_list_path(), [d])
-            write_warp_rules()
-            remove_hosts_domains([d])
-            flush_dns()
-            ok(f"{d} добавлен в WARP")
+            add_tunnel_domains([d])
+            ok(f"{d} добавлен в туннель")
+            if tunnel_running():
+                time.sleep(1)
+                tunnel_test([d])
         else:
             err("Некорректный домен")
-    elif ch == "5":
-        warp_import(input("  Путь к .conf: ").strip())
-        if warp_enabled():
-            start_warp()
-    elif ch == "6":
-        warp_test()
-
+    elif ch == "7":
+        tunnel_test()
+    elif ch == "8":
+        profiles = show_profiles()
+        if not profiles:
+            return
+        n = input("  Номер профиля для удаления (Enter — ничего не удалять): ").strip()
+        if n.isdigit() and 1 <= int(n) <= len(profiles):
+            gone = profiles.pop(int(n) - 1)
+            save_profiles(profiles)
+            st = read_json(tunnel_path("state.json")) or {}
+            if st.get("active") == gone["name"]:
+                stop_tunnel(quiet=True)
+                try:
+                    os.remove(tunnel_path("state.json"))
+                except OSError:
+                    pass
+            write_config()
+            ok(f"Профиль «{gone['name']}» удалён")
 
 
 # ----------------------------------------------------------------------------
@@ -3122,7 +3505,7 @@ def menu():
         print("  [8] Выученные домены и журналы")
         print(f"  [9] Обновить скрипт (у вас {VERSION})")
         print(_c(C.YELLOW, "  [10] Удалить из системы"))
-        print("  [11] WARP для сайтов, которые не открывает zapret")
+        print("  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)")
         print("  [0] Выход")
 
         try:
@@ -3166,7 +3549,7 @@ def menu():
                 uninstall()
                 pause()
             elif choice == "11":
-                warp_menu()
+                tunnel_menu()
             elif choice == "0":
                 return
         except KeyboardInterrupt:
@@ -3223,13 +3606,14 @@ ACTIONS = {
     "report": collect_report,
     "update": script_update,
     "uninstall": uninstall,
-    "warp-on": None,
-    "warp-off": None,
-    "warp-scan": None,
-    "warp-routes": None,
-    "warp-import": None,
-    "warp-start": None,
-    "warp-test": None,
+    "tunnel-on": None,
+    "tunnel-off": None,
+    "tunnel-import": None,
+    "tunnel-select": None,
+    "tunnel-routes": None,
+    "tunnel-test": None,
+    "tunnel-list": None,
+    "tunnel-start": None,
 }
 
 
@@ -3256,13 +3640,15 @@ def main():
   report     подробный отчёт для поиска неисправностей (файл в /tmp)
   update     обновить сам скрипт из GitHub
   uninstall  удалить из системы
-  warp-on      включить WARP для сайтов, которые не открывает zapret
-  warp-off     выключить WARP
-  warp-scan    подобрать лучший узел Cloudflare WARP
-  warp-routes  проверить сайты и перенести неоткрывающиеся в WARP
-  warp-import  импортировать WireGuard-конфиг WARP (--warp-config <файл>)
-  warp-test    проверить сайты из списка WARP так, как их видит браузер
-  warp-start   запустить WARP, если он включён (так обход запускает его следом)
+  tunnel-on      включить туннель для сайтов, которые не открывает zapret
+  tunnel-off     выключить туннель
+  tunnel-import  добавить сервер: --config <файл> или --link <ссылка/подписка>;
+                 с --proton — как конфиг Proton VPN Free
+  tunnel-select  проверить профили и выбрать лучший
+  tunnel-routes  проверить сайты и перенести неоткрывающиеся в туннель
+  tunnel-test    проверить сайты из списка туннеля так, как их видит браузер
+  tunnel-list    показать профили
+  tunnel-start   запустить туннель, если он включён (так обход запускает его следом)
 
 Примеры:
   sudo python3 zapret2-linux.py
@@ -3274,7 +3660,9 @@ def main():
         "--action", "-a", default="menu", choices=sorted(ACTIONS.keys()),
         help="действие (по умолчанию: menu)",
     )
-    parser.add_argument("--warp-config", help="путь к WireGuard-конфигу WARP для warp-import")
+    parser.add_argument("--config", help="tunnel-import: путь к файлу конфига (WireGuard .conf, JSON, список ссылок)")
+    parser.add_argument("--link", help="tunnel-import: ссылка на сервер (vless://… и др.) или адрес подписки")
+    parser.add_argument("--proton", action="store_true", help="tunnel-import: это конфиг Proton VPN Free")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="не задавать вопросов подтверждения")
     parser.add_argument("--version", "-V", action="version",
@@ -3296,14 +3684,22 @@ def main():
         print()
         return 0
 
+    def do_import():
+        src = args.config or args.link
+        if not src:
+            raise ProfileError("укажите --config <файл> или --link <ссылка>")
+        import_profiles(read_user_input(src), "proton" if args.proton else "custom")
+        select_profile()
+
     warp_actions = {
-        "warp-on": lambda: enable_warp(assume_yes=args.yes),
-        "warp-off": disable_warp,
-        "warp-scan": lambda: (ensure_root(sys.argv), find_warp_endpoint()),
-        "warp-routes": update_warp_routes,
-        "warp-import": lambda: (ensure_root(sys.argv), warp_import(args.warp_config)),
-        "warp-start": lambda: (ensure_root(sys.argv), warp_start_action()),
-        "warp-test": warp_test,
+        "tunnel-on": lambda: enable_tunnel(assume_yes=args.yes),
+        "tunnel-off": disable_tunnel,
+        "tunnel-import": do_import,
+        "tunnel-select": lambda: (ensure_root(sys.argv), select_profile()),
+        "tunnel-routes": update_tunnel_routes,
+        "tunnel-test": tunnel_test,
+        "tunnel-list": show_profiles,
+        "tunnel-start": lambda: (ensure_root(sys.argv), tunnel_start_action()),
     }
     if action in warp_actions:
         try:

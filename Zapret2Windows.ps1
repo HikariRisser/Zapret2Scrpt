@@ -14,14 +14,16 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','WarpOn','WarpOff','WarpScan','WarpRoutes','WarpImport','WarpStart')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
     [switch]$KeepLogs,        # с Uninstall/Purge: сохранить копию логов
     [switch]$IncludeProject,  # с Uninstall/Purge: удалить и runtime рабочей папки
     [switch]$Force,           # с Uninstall/Purge: без запроса подтверждения
-    [string]$WarpConfig = ''  # с WarpImport: путь к WireGuard-конфигу WARP
+    [string]$TunnelConfig = '',  # с TunnelImport: путь к файлу (WireGuard .conf, JSON, список ссылок)
+    [string]$TunnelLink = '',    # с TunnelImport: ссылка на сервер или адрес подписки
+    [switch]$Proton              # с TunnelImport: это конфиг Proton VPN Free
 )
 $ErrorActionPreference='Stop'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch {}
@@ -44,7 +46,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.4.7'
+$script:ScriptVersion='1.5.0'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -82,9 +84,9 @@ $script:SeedDomains=@(
     'yt3.googleusercontent.com','ytimg.com'
 )
 $script:SeedExclude=@('localhost','local','example.com')
-$script:SeedWarp=@(
-    '# Сайты, которые открываются через WARP (sing-box), а не через zapret.',
-    '# Пополняется автоматически (меню WARP -> [3]) или вручную, по домену в строке.'
+$script:SeedTunnel=@(
+    '# Сайты, которые открываются через туннель (sing-box), а не через zapret.',
+    '# Пополняется автоматически (меню туннеля) или вручную, по домену в строке.'
 )
 
 # Подсети хостингов, которые ТСПУ режет "по 16 КБ". Для них работает
@@ -249,7 +251,9 @@ function Ensure-Admin {
     $argList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $self),
                '-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
     if($NoAutostart){$argList+='-NoAutostart'}
-    if($WarpConfig){$argList+=@('-WarpConfig',('"{0}"' -f $WarpConfig))}
+    if($TunnelConfig){$argList+=@('-TunnelConfig',('"{0}"' -f $TunnelConfig))}
+    if($TunnelLink){$argList+=@('-TunnelLink',('"{0}"' -f $TunnelLink))}
+    if($Proton){$argList+='-Proton'}
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
     exit
 }
@@ -405,7 +409,8 @@ function Install-Runtime {
     $n=Merge-ListFile (Join-Path $lists 'blocked.txt') $script:SeedDomains
     if($n){Write-Host "  Добавлено доменов в список обхода: $n" -ForegroundColor DarkGray}
     $null=Merge-ListFile (Join-Path $lists 'exclude.txt') $script:SeedExclude
-    $null=Merge-ListFile (Join-Path $lists 'warp.txt') $script:SeedWarp
+    Remove-LegacyWarp
+    $null=Merge-ListFile (Join-Path $lists 'tunnel.txt') $script:SeedTunnel
     $n=Merge-ListFile (Join-Path $lists 'ipset-hosting.txt') $script:SeedHostingIpset
     if($n){Write-Host "  Добавлено подсетей хостингов: $n" -ForegroundColor DarkGray}
     $auto=Join-Path $lists 'autohostlist.txt'
@@ -432,9 +437,13 @@ function Write-LaunchConfig {
     $auto=Join-Path $lists 'autohostlist.txt'
     $exclude=Join-Path $lists 'exclude.txt'
     $hosting=Join-Path $lists 'ipset-hosting.txt'
-    # Домены, переведённые в WARP, zapret не трогает: их трафик идёт в туннель.
-    $warpList=Join-Path $lists 'warp.txt'
-    if(-not (Test-Path -LiteralPath $warpList)){ $null=Merge-ListFile $warpList $script:SeedWarp }
+    # Домены, переведённые в туннель, zapret не трогает: их трафик идёт на сервер.
+    $warpList=Join-Path $lists 'tunnel.txt'
+    if(-not (Test-Path -LiteralPath $warpList)){ $null=Merge-ListFile $warpList $script:SeedTunnel }
+    # Соединение с самим сервером туннеля zapret тоже не трогает.
+    $tunnelServers=Join-Path $lists 'ipset-tunnel-servers.txt'
+    $srvEx=@()
+    if(@(Get-ListEntries $tunnelServers).Count){ $srvEx=@("--ipset-exclude=$tunnelServers") }
     $sni=$script:WhiteSni
     # Если пользователь удалил файл подсетей - профиль хостингов не включаем.
     $useHosting=$false
@@ -514,6 +523,18 @@ function Write-LaunchConfig {
       '--payload=stun,discord_ip_discovery,wireguard_initiation,wireguard_cookie',
       '--lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2'
     )
+    # Исключение серверов туннеля - в каждый TCP-профиль (перед его --new).
+    if($srvEx.Count){
+        $fixed=New-Object System.Collections.Generic.List[string]
+        $tcp=$false
+        foreach($a in $wsArgs){
+            if($a -eq '--new'){ if($tcp){ $fixed.Add($srvEx[0]) }; $tcp=$false }
+            elseif($a -like '--filter-tcp=*'){ $tcp=$true }
+            $fixed.Add($a)
+        }
+        if($tcp){ $fixed.Add($srvEx[0]) }
+        $wsArgs=$fixed.ToArray()
+    }
     [IO.File]::WriteAllLines($cfg,$wsArgs,[Text.UTF8Encoding]::new($false))
 }
 function Start-Zapret {
@@ -533,11 +554,11 @@ function Start-Zapret {
     [IO.File]::WriteAllText((Join-Path $script:TrustedRuntime 'winws2.pid'),[string]$p.Id,[Text.Encoding]::ASCII)
     Write-Host "winws2 запущен, PID $($p.Id). WinDivert обрабатывает сетевой трафик системы." -ForegroundColor Green
     Write-Host 'Автосписок включён: домен добавится после сигналов неуспешного доступа.' -ForegroundColor DarkGray
-    if((Get-WarpStatus).Enabled){ Start-WarpBackground }
+    if((Get-TunnelStatus).Enabled){ Start-TunnelBackground }
 }
 function Stop-Zapret {
     param([switch]$Quiet)
-    Stop-Warp -Quiet
+    Stop-Tunnel -Quiet
     $pidFile=Join-Path $script:TrustedRuntime 'winws2.pid'
     if(Test-Path $pidFile){
         $id=0; [void][int]::TryParse((Get-Content $pidFile -Raw),[ref]$id)
@@ -1164,72 +1185,71 @@ function Toggle-Autostart {
 }
 
 # ============================================================================
-#  WARP через sing-box: запасной маршрут для сайтов, с которыми не
-#  справляется zapret (блокировка по IP, обрыв "16 КБ", полная недоступность).
+#  Туннель через sing-box: внешний выход для сайтов, с которыми не
+#  справляется zapret (блокировка по IP, запрет самого сервиса для России).
+#
+#  Выход - Proton VPN Free (конфиг WireGuard) или свой сервер (WireGuard,
+#  VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, SOCKS, JSON sing-box,
+#  ссылки и подписки).
 #
 #  Схема (скорость остального трафика не страдает):
-#    * sing-box поднимает TUN, но маршрутизирует в него ТОЛЬКО диапазон FakeIP
-#      (198.18.0.0/15) и свой DNS-адрес. Весь прочий трафик идёт мимо
-#      sing-box, напрямую, через zapret.
-#    * DNS-запросы системы обрабатывает sing-box: домены из lists\warp.txt
-#      получают FakeIP и попадают в TUN -> WireGuard-туннель WARP,
-#      остальные разрешаются обычным системным DNS.
-#    * Настоящий адрес домена из warp.txt разрешается DNS 1.1.1.1 ВНУТРИ
-#      туннеля - подмена DNS провайдером на эти домены не действует.
-#    * Узел Cloudflare (IP:порт WARP) подбирается автоматически: пробный
-#      туннель к каждому кандидату и замер задержки через него. При каждом
-#      запуске узел проверяется, нерабочий заменяется следующим.
-#    * zapret помогает и самому WARP: профиль [5] подмешивает фейки к
-#      WireGuard-рукопожатию.
+#    * sing-box поднимает TUN, но маршрутизирует в него ТОЛЬКО диапазон FakeIP.
+#      Весь прочий трафик идёт мимо sing-box, напрямую, через zapret.
+#    * DNS-запросы доменов из lists\tunnel.txt Windows отправляет в sing-box
+#      (правило NRPT): они получают FakeIP и попадают в туннель. Остальной
+#      DNS не меняется.
+#    * Настоящий адрес такого домена ищется через сам туннель.
+#    * zapret эти домены и сам сервер туннеля не трогает.
 # ============================================================================
 
 $script:SingBoxVersion='1.14.4'
-$script:WarpMixedPort=40480     # локальный прокси sing-box для проверок
-$script:WarpProbePort=40481     # порт для пробных туннелей при подборе узла
-# WARP через MASQUE (usque) - запасной транспорт, когда WireGuard к
-# Cloudflare не проходит: туннель через HTTP/3 (QUIC) или HTTP/2 (TCP 443).
-# usque отдаёт туннель как локальный SOCKS5, sing-box направляет в него
-# домены из списка WARP. "Узел" записывается как masque:<h3|h2>:<порт>.
-$script:UsqueVersion='4.2.1'
-$script:UsquePort=40482
-$script:UsqueProbePort=40483
-$script:MasqueVariants=@('masque:h3:443','masque:h3:4500','masque:h3:500','masque:h3:1701','masque:h2:443')
-$script:WarpPrefixes=@('162.159.192','162.159.193','162.159.195','188.114.96','188.114.97','188.114.98','188.114.99')
-$script:WarpPorts=@(2408,500,1701,4500)
-$script:WarpApi='https://api.cloudflareclient.com/v0a5641/reg'
-$script:WarpHeaders=@{ 'CF-Client-Version'='a-6.38.9-5641' }
-$script:WarpUserAgent='1.1.1.1/6.38.9-5641 (Android 16.0.0)'
+$script:TunnelMixedPort=40480    # локальный прокси sing-box для проверок
+$script:TunnelProbePort=40481    # порт для пробного запуска профиля
+$script:TunnelIf='Zapret2Tunnel'
+# Свои адреса и диапазон FakeIP - намеренно НЕ значения sing-box по
+# умолчанию: их используют другие клиенты на sing-box в режиме TUN
+# (Throne, Hiddify, NekoBox...), при одновременной работе был бы конфликт.
+$script:TunnelAddr4='172.31.251.1/30'
+$script:TunnelDns4='172.31.251.2'
+$script:TunnelAddr6='fd7a:7a70:7761::1/126'
+$script:TunnelFake4='10.249.0.0/16'
+$script:TunnelFake4Prefix='10.249.'
+$script:TunnelFake6='fd7a:7a70:fa4e::/64'
+$script:TunnelNrptComment='Zapret2Tunnel'
+$script:SupportedFormats='конфиг WireGuard (.conf); ссылки vless://, vmess://, trojan://, ss://, hysteria2:// (hy2://), hysteria://, tuic://, anytls://, socks5://, wireguard://; несколько ссылок или подписка (адрес https://... либо base64); JSON sing-box (outbound или целый конфиг)'
+$script:TunnelTraceLast=''       # чем закончилась последняя проверка туннеля
+$script:TunnelExit=@{}           # откуда туннель выходит в интернет: loc, ip
 
-function Get-WarpPaths {
-    $d=Join-Path $script:TrustedRuntime 'warp'
+function Get-TunnelPaths {
+    $d=Join-Path $script:TrustedRuntime 'tunnel'
     [pscustomobject]@{
         Dir=$d
         Exe=Join-Path $d 'sing-box.exe'
-        Account=Join-Path $d 'account.json'
-        Usque=Join-Path $d 'usque.exe'
-        UsqueConfig=Join-Path $d 'usque.json'
-        UsqueLog=Join-Path $script:TrustedRuntime 'logs\usque.log'
-        UsqueProbeLog=Join-Path $script:TrustedRuntime 'logs\usque-probe.log'
+        Profiles=Join-Path $d 'profiles.json'
         State=Join-Path $d 'state.json'
+        ExitInfo=Join-Path $d 'exit.json'
         Config=Join-Path $d 'config.json'
         Probe=Join-Path $d 'probe.json'
-        Rules=Join-Path $d 'rules-warp.json'
+        Validate=Join-Path $d 'validate.json'
+        Rules=Join-Path $d 'rules.json'
         Cache=Join-Path $d 'cache.db'
         Pid=Join-Path $d 'sing-box.pid'
         StarterPid=Join-Path $d 'starting.pid'
-        StartLog=Join-Path $script:TrustedRuntime 'logs\warp-start.log'
         Enabled=Join-Path $d 'enabled'
+        LastError=Join-Path $d 'last-error.txt'
         Log=Join-Path $script:TrustedRuntime 'logs\sing-box.log'
         ErrLog=Join-Path $script:TrustedRuntime 'logs\sing-box-stderr.log'
         ProbeLog=Join-Path $script:TrustedRuntime 'logs\sing-box-probe.log'
-        LastError=Join-Path $d 'last-error.txt'
-        List=Join-Path $script:TrustedRuntime 'lists\warp.txt'
+        StartLog=Join-Path $script:TrustedRuntime 'logs\tunnel-start.log'
+        List=Join-Path $script:TrustedRuntime 'lists\tunnel.txt'
+        Servers=Join-Path $script:TrustedRuntime 'lists\ipset-tunnel-servers.txt'
     }
 }
 
 function Write-JsonFile {
     param([string]$Path,$Object)
-    $json=$Object | ConvertTo-Json -Depth 30
+    # -InputObject, а не конвейер: иначе массив из одного элемента стал бы объектом.
+    $json=ConvertTo-Json -InputObject $Object -Depth 30
     [IO.File]::WriteAllText($Path,$json,[Text.UTF8Encoding]::new($false))
 }
 
@@ -1247,11 +1267,64 @@ function Get-ListEntries {
              Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
 }
 
+function Get-FileTail {
+    param([string]$Path,[int]$Lines=12)
+    if(-not (Test-Path -LiteralPath $Path)){ return @() }
+    try {
+        # sing-box держит файл открытым - читаем с FileShare.ReadWrite.
+        $fs=[IO.File]::Open($Path,'Open','Read','ReadWrite')
+        $sr=New-Object IO.StreamReader($fs)
+        $all=$sr.ReadToEnd(); $sr.Close()
+        $all=$all -replace "$([char]27)\[[0-9;]*m",''   # цвета sing-box
+        return @($all -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $Lines)
+    } catch { return @() }
+}
+
+function Set-TunnelError {
+    # Запоминает причину сбоя: её видно в меню туннеля, а не только в момент запуска.
+    param([string]$Message,[string[]]$Details=@())
+    $p=Get-TunnelPaths
+    Write-Host "  $Message" -ForegroundColor Red
+    foreach($l in $Details){ Write-Host "    $l" -ForegroundColor DarkGray }
+    try {
+        New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
+        [IO.File]::WriteAllLines($p.LastError,@("$((Get-Date).ToString('s')) $Message")+$Details,[Text.UTF8Encoding]::new($false))
+    } catch {}
+}
+
+function Clear-TunnelError {
+    Remove-Item (Get-TunnelPaths).LastError -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-LegacyWarp {
+    # Убирает следы прежней реализации (WARP): процессы, каталог, список.
+    $old=Join-Path $script:TrustedRuntime 'warp'
+    $p=Get-TunnelPaths
+    if(Test-Path $old){
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($old,[StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 500
+        New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
+        # sing-box и его библиотеки переносим, чтобы не скачивать заново.
+        Get-ChildItem -Path $old -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'sing-box.exe' -or $_.Extension -eq '.dll' } |
+            ForEach-Object { if(-not (Test-Path (Join-Path $p.Dir $_.Name))){ Move-Item $_.FullName $p.Dir -Force -ErrorAction SilentlyContinue } }
+        Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $oldList=Join-Path $script:TrustedRuntime 'lists\warp.txt'
+    if(Test-Path $oldList){
+        # Сайты из списка WARP переходят в список туннеля.
+        $null=Merge-ListFile $p.List @(Get-Content -LiteralPath $oldList)
+        Remove-Item $oldList -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-SingBox {
+    # Скачивает официальную сборку sing-box с GitHub (один раз).
     # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
     $ErrorActionPreference='Continue'
-    # Скачивает официальную сборку sing-box с GitHub (один раз).
-    $p=Get-WarpPaths
+    $p=Get-TunnelPaths
     New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
     if(Test-Path $p.Exe){
         $v=(& $p.Exe version 2>$null | Select-Object -First 1)
@@ -1272,229 +1345,607 @@ function Install-SingBox {
         Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
         $inner=Join-Path $tmp $name
         if(-not (Test-Path (Join-Path $inner 'sing-box.exe'))){ throw "В архиве нет sing-box.exe: $url" }
-        Stop-Warp -Quiet
+        Stop-Tunnel -Quiet
         Copy-Item (Join-Path $inner '*') $p.Dir -Recurse -Force
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host "  sing-box установлен: $($p.Exe)" -ForegroundColor Green
 }
 
-function New-WarpAccount {
-    # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
-    $ErrorActionPreference='Continue'
-    # Регистрирует бесплатное устройство WARP (как приложение 1.1.1.1).
-    $p=Get-WarpPaths
-    $kp=@(& $p.Exe generate wg-keypair)
-    $priv=($kp | Where-Object { $_ -like 'PrivateKey:*' }) -replace '^PrivateKey:\s*',''
-    $pub=($kp | Where-Object { $_ -like 'PublicKey:*' }) -replace '^PublicKey:\s*',''
-    if(-not $priv -or -not $pub){ throw 'sing-box не сгенерировал ключи WireGuard.' }
-    $body=[ordered]@{
-        fcm_token=''; install_id=''; key=$pub; locale='en_US'; model='PC'
-        tos=(Get-Date).ToString('yyyy-MM-ddTHH:mm:ss.fffzzz'); serial_number=''
-        os_version='16.0.0'; key_type='curve25519'; tunnel_type='wireguard'
-    } | ConvertTo-Json
-    Write-Host '  Регистрация устройства WARP...' -ForegroundColor Yellow
-    [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-    try {
-        $r=Invoke-RestMethod -Method Post -Uri $script:WarpApi -Headers $script:WarpHeaders -UserAgent $script:WarpUserAgent `
-             -ContentType 'application/json; charset=UTF-8' -Body $body -TimeoutSec 30 -ErrorAction Stop
-    } catch {
-        throw ("Не удалось зарегистрировать WARP: " + $_.Exception.Message +
-               "`nМожно импортировать готовый WireGuard-конфиг WARP (wgcf, WarpGen): -Action WarpImport -WarpConfig <файл>")
-    }
-    $cfg=$r.config
-    if(-not $cfg -and $r.id -and $r.token){
-        $r=Invoke-RestMethod -Uri "$($script:WarpApi)/$($r.id)" -Headers @{ 'CF-Client-Version'=$script:WarpHeaders['CF-Client-Version']; Authorization="Bearer $($r.token)" } `
-             -UserAgent $script:WarpUserAgent -TimeoutSec 30 -ErrorAction Stop
-        $cfg=$r.config
-    }
-    if(-not $cfg -or -not $cfg.peers){ throw 'Ответ WARP не содержит конфигурации туннеля.' }
-    $reserved=@(0,0,0)
-    if($cfg.client_id){ try { $reserved=@([Convert]::FromBase64String($cfg.client_id) | ForEach-Object { [int]$_ }) } catch {} }
-    $acc=[ordered]@{
-        private_key=$priv
-        peer_public_key=$cfg.peers[0].public_key
-        address_v4=$cfg.interface.addresses.v4
-        address_v6=$cfg.interface.addresses.v6
-        reserved=$reserved
-        device_id=$r.id
-        token=$r.token
-        source='register'
-    }
-    Write-JsonFile $p.Account $acc
-    Write-Host '  Устройство WARP зарегистрировано.' -ForegroundColor Green
+# --- разбор конфигов и ссылок -------------------------------------------------
+#
+# Профиль: name, source ('proton' | 'custom'), type, endpoint ($true для
+# WireGuard), outbound (объект sing-box без tag).
+
+function ConvertFrom-AnyBase64 {
+    # Base64 в любом варианте (обычный/URL-safe, с выравниванием и без).
+    param([string]$Text)
+    $s=($Text -replace '\s','').Replace('-','+').Replace('_','/')
+    $s+=('=' * ((4 - $s.Length % 4) % 4))
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))
 }
 
-function Import-WarpConfig {
-    # Импорт WireGuard-конфига WARP (wgcf-profile.conf, WarpGen и т.п.).
-    param([string]$Path)
-    if(-not $Path -or -not (Test-Path -LiteralPath $Path)){ throw "Файл конфига не найден: $Path" }
-    $kv=@{}
-    foreach($l in Get-Content -LiteralPath $Path){
-        if($l -match '^\s*([A-Za-z]+)\s*=\s*(.+?)\s*$'){ $kv[$Matches[1].ToLowerInvariant()]=$Matches[2] }
+function Test-IpLiteral {
+    param([string]$HostName)
+    $ip=$null
+    return [Net.IPAddress]::TryParse($HostName,[ref]$ip)
+}
+
+function Test-Truthy { param($v) return (@('1','true','yes') -contains "$v".ToLowerInvariant()) }
+
+function Split-ServerLink {
+    # scheme://userinfo@host:port?query#name -> объект с полями.
+    param([string]$Link)
+    $u=[uri]$Link.Trim()
+    $q=@{}
+    foreach($pair in $u.Query.TrimStart('?') -split '&'){
+        if(-not $pair){ continue }
+        $kv=$pair -split '=',2
+        $k=[uri]::UnescapeDataString($kv[0])
+        if(-not $q.ContainsKey($k)){ $q[$k]=if($kv.Count -gt 1){ [uri]::UnescapeDataString($kv[1].Replace('+',' ')) } else { '' } }
     }
-    if(-not $kv['privatekey'] -or -not $kv['publickey']){ throw 'В конфиге нет PrivateKey/PublicKey.' }
-    $v4=$null; $v6=$null
-    foreach($a in ($kv['address'] -split ',')){
-        $a=$a.Trim() -replace '/\d+$',''
-        if($a -match ':'){ $v6=$a } elseif($a){ $v4=$a }
+    $user=''; $pass=''
+    if($u.UserInfo){
+        $ui=$u.UserInfo -split ':',2
+        $user=[uri]::UnescapeDataString($ui[0])
+        if($ui.Count -gt 1){ $pass=[uri]::UnescapeDataString($ui[1]) }
     }
-    $reserved=@(0,0,0)
-    if($kv['reserved']){
-        $parts=@($kv['reserved'] -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
-        if($parts.Count -eq 3){ $reserved=$parts }
+    [pscustomobject]@{
+        Scheme=$u.Scheme.ToLowerInvariant(); User=$user; Pass=$pass
+        Host=$u.DnsSafeHost; Port=$(if($u.Port -gt 0){ $u.Port } else { 0 })
+        Q=$q; Name=[uri]::UnescapeDataString($u.Fragment.TrimStart('#'))
     }
-    $p=Get-WarpPaths
+}
+
+function Assert-Server {
+    param($L)
+    if(-not $L.Host -or -not $L.Port){ throw 'в ссылке нет адреса сервера или порта' }
+}
+
+function New-TlsBlock {
+    # Блок tls для sing-box из параметров ссылки (security, sni, fp, pbk...).
+    param($Q,[string]$HostName,[switch]$Force)
+    $sec="$($Q['security'])".ToLowerInvariant()
+    if(-not $Force -and (@('tls','reality','xtls') -notcontains $sec)){ return $null }
+    $tls=[ordered]@{ enabled=$true }
+    $sni=$Q['sni']; if(-not $sni){ $sni=$Q['peer'] }; if(-not $sni){ $sni=$Q['servername'] }
+    if(-not $sni -and -not (Test-IpLiteral $HostName)){ $sni=$HostName }
+    if($sni){ $tls.server_name=$sni }
+    if((Test-Truthy $Q['allowInsecure']) -or (Test-Truthy $Q['insecure']) -or (Test-Truthy $Q['allow_insecure'])){ $tls.insecure=$true }
+    if($Q['alpn']){ $tls.alpn=@($Q['alpn'] -split ',' | Where-Object { $_ }) }
+    $fp=$Q['fp']; if(-not $fp){ $fp=$Q['fingerprint'] }
+    if($sec -eq 'reality'){
+        if(-not $Q['pbk']){ throw 'в ссылке Reality нет открытого ключа (pbk)' }
+        $tls.reality=[ordered]@{ enabled=$true; public_key=$Q['pbk']; short_id="$($Q['sid'])" }
+        if(-not $fp){ $fp='chrome' }    # Reality требует uTLS
+    }
+    if($fp){ $tls.utls=[ordered]@{ enabled=$true; fingerprint=$fp } }
+    return $tls
+}
+
+function New-TransportBlock {
+    # Блок transport для sing-box (ws, grpc, http, httpupgrade).
+    param($Q)
+    $net="$($Q['type'])".ToLowerInvariant(); if(-not $net){ $net="$($Q['net'])".ToLowerInvariant() }
+    if(-not $net){ $net='tcp' }
+    $h="$($Q['host'])"; $path="$($Q['path'])"
+    switch($net){
+        { $_ -in @('tcp','raw') } {
+            if("$($Q['headerType'])".ToLowerInvariant() -eq 'http'){
+                $tr=[ordered]@{ type='http'; path=$(if($path){$path}else{'/'}) }
+                if($h){ $tr.host=@($h -split ',') }
+                return $tr
+            }
+            return $null
+        }
+        'ws' {
+            $tr=[ordered]@{ type='ws'; path=$(if($path){$path}else{'/'}) }
+            if($tr.path -match '[?&]ed=(\d+)'){   # раннее отправление данных, запись Xray "?ed=2048"
+                $ed=[int]$Matches[1]
+                $tr.path=($tr.path -replace '[?&]ed=\d+',''); if(-not $tr.path){ $tr.path='/' }
+                $tr.max_early_data=$ed; $tr.early_data_header_name='Sec-WebSocket-Protocol'
+            }
+            if($h){ $tr.headers=[ordered]@{ Host=$h } }
+            return $tr
+        }
+        'grpc' {
+            $svc=$Q['serviceName']; if(-not $svc){ $svc=$Q['servicename'] }; if(-not $svc){ $svc=$path }
+            return [ordered]@{ type='grpc'; service_name="$svc" }
+        }
+        { $_ -in @('http','h2') } {
+            $tr=[ordered]@{ type='http'; path=$(if($path){$path}else{'/'}) }
+            if($h){ $tr.host=@($h -split ',') }
+            return $tr
+        }
+        'httpupgrade' {
+            $tr=[ordered]@{ type='httpupgrade'; path=$(if($path){$path}else{'/'}) }
+            if($h){ $tr.host=$h }
+            return $tr
+        }
+        { $_ -in @('xhttp','splithttp') } {
+            throw 'транспорт XHTTP (SplitHTTP) sing-box не поддерживает - нужен другой транспорт на сервере (TCP/Reality, WS, gRPC)'
+        }
+        default { throw "транспорт '$net' не поддерживается sing-box" }
+    }
+}
+
+function New-Profile {
+    param([string]$Name,$Outbound,[string]$Source)
+    if(-not $Name){ $Name="$($Outbound.type)" }
+    [pscustomobject]@{ name=$Name.Trim(); source=$Source; type="$($Outbound.type)"; endpoint=("$($Outbound.type)" -eq 'wireguard'); outbound=$Outbound }
+}
+
+function New-WgEndpoint {
+    param([string]$PrivateKey,[string[]]$Addresses,[string]$PeerHost,[int]$PeerPort,[string]$PublicKey,
+          [string]$Psk='',$Mtu=$null,$Reserved=$null,$Keepalive=25)
+    if(-not ($PrivateKey -and $PublicKey -and $PeerHost -and $PeerPort -and $Addresses)){
+        throw 'в конфиге WireGuard не хватает PrivateKey, Address, PublicKey или Endpoint'
+    }
+    $addrs=@()
+    foreach($a in $Addresses){
+        $a=$a.Trim(); if(-not $a){ continue }
+        if($a -notmatch '/'){ $a+=$(if($a -match ':'){'/128'}else{'/32'}) }
+        $addrs+=$a
+    }
+    $peer=[ordered]@{ address=$PeerHost; port=$PeerPort; public_key=$PublicKey
+                      allowed_ips=@('0.0.0.0/0','::/0'); persistent_keepalive_interval=[int]$(if($Keepalive){$Keepalive}else{25}) }
+    if($Psk){ $peer.pre_shared_key=$Psk }
+    if($Reserved){ $peer.reserved=@($Reserved) }
+    return [ordered]@{ type='wireguard'; mtu=[int]$(if($Mtu){$Mtu}else{1408}); address=@($addrs); private_key=$PrivateKey; peers=@($peer) }
+}
+
+function ConvertFrom-WireGuardConf {
+    # Обычный конфиг WireGuard (.conf): Proton VPN, свой сервер, любой провайдер.
+    param([string]$Text,[string]$DefaultName='WireGuard')
+    $iface=@{}; $peer=@{}; $cur=$null; $peerSeen=$false
+    foreach($ln in $Text -split "`r?`n"){
+        $ln=($ln -split '#',2)[0].Trim()
+        if(-not $ln){ continue }
+        if($ln -ieq '[Interface]'){ $cur=$iface; continue }
+        if($ln -ieq '[Peer]'){ if($peerSeen){ $cur=@{} } else { $cur=$peer; $peerSeen=$true }; continue }
+        if($ln -match '^([^=]+?)\s*=\s*(.*)$' -and $null -ne $cur){ $cur[$Matches[1].Trim().ToLowerInvariant()]=$Matches[2].Trim() }
+    }
+    foreach($k in @('jc','jmin','jmax','s1','s2','h1','h2','h3','h4')){
+        if($iface.ContainsKey($k)){
+            throw 'это конфиг AmneziaWG (параметры Jc/S1/H1...): sing-box его не поддерживает. Нужен обычный WireGuard или другой протокол (VLESS, Shadowsocks...)'
+        }
+    }
+    $ep="$($peer['endpoint'])"
+    $h=''; $port=0
+    if($ep -match '^\[(.+)\]:(\d+)$'){ $h=$Matches[1]; $port=[int]$Matches[2] }
+    elseif($ep -match '^(.+):(\d+)$'){ $h=$Matches[1]; $port=[int]$Matches[2] }
+    $resText="$($iface['reserved'])"; if(-not $resText){ $resText="$($peer['reserved'])" }
+    $reserved=@($resText -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+    $ob=New-WgEndpoint -PrivateKey "$($iface['privatekey'])" -Addresses @("$($iface['address'])" -split ',') -PeerHost $h -PeerPort $port `
+          -PublicKey "$($peer['publickey'])" -Psk "$($peer['presharedkey'])" -Mtu $iface['mtu'] `
+          -Reserved $(if($reserved.Count -eq 3){$reserved}else{$null}) -Keepalive $peer['persistentkeepalive']
+    return ,@("$DefaultName $h",$ob)
+}
+
+function ConvertFrom-ServerLink {
+    # Одна ссылка -> @(имя, outbound). Бросает исключение с понятным текстом.
+    param([string]$Link)
+    $scheme=($Link -split '://',2)[0].ToLowerInvariant()
+    switch($scheme){
+        'vless' {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $ob=[ordered]@{ type='vless'; server=$l.Host; server_port=$l.Port; uuid=$l.User; packet_encoding='xudp' }
+            if($l.Q['flow']){ $ob.flow=$l.Q['flow'] }
+            $tls=New-TlsBlock $l.Q $l.Host; if($tls){ $ob.tls=$tls }
+            $tr=New-TransportBlock $l.Q; if($tr){ $ob.transport=$tr }
+            return ,@($(if($l.Name){$l.Name}else{"VLESS $($l.Host)"}),$ob)
+        }
+        'vmess' {
+            $body=$Link.Trim().Substring(8)
+            if($body -match '@' -and $body -match '\?'){
+                $l=Split-ServerLink $Link; Assert-Server $l
+                $ob=[ordered]@{ type='vmess'; server=$l.Host; server_port=$l.Port; uuid=$l.User; security='auto'; alter_id=0 }
+                $q=$l.Q; $name=$l.Name; $h=$l.Host
+                $tls=New-TlsBlock $q $h
+            } else {
+                try { $j=(ConvertFrom-AnyBase64 (($body -split '#',2)[0])) | ConvertFrom-Json }
+                catch { throw 'ссылка vmess:// не расшифровывается (ожидался base64 с JSON)' }
+                $h="$($j.add)"; $port=0; [void][int]::TryParse("$($j.port)",[ref]$port)
+                if(-not $h -or -not $port){ throw 'в ссылке нет адреса сервера или порта' }
+                $name="$($j.ps)"
+                $q=@{}
+                if($j.net){ $q['type']="$($j.net)" }; if($j.host){ $q['host']="$($j.host)" }; if($j.path){ $q['path']="$($j.path)" }
+                if($j.type){ $q['headerType']="$($j.type)" }; if($j.sni){ $q['sni']="$($j.sni)" }; if($j.alpn){ $q['alpn']="$($j.alpn)" }
+                if($j.fp){ $q['fp']="$($j.fp)" }
+                if("$($j.tls)".ToLowerInvariant() -eq 'tls'){ $q['security']='tls' }
+                if("$($j.net)" -eq 'grpc' -and $j.path){ $q['serviceName']="$($j.path)" }
+                $aid=0; [void][int]::TryParse("$($j.aid)",[ref]$aid)
+                $ob=[ordered]@{ type='vmess'; server=$h; server_port=$port; uuid="$($j.id)"; security=$(if($j.scy){"$($j.scy)"}else{'auto'}); alter_id=$aid }
+                $tls=New-TlsBlock $q $(if($q['host']){$q['host']}else{$h})
+            }
+            if($tls){ $ob.tls=$tls }
+            $tr=New-TransportBlock $q; if($tr){ $ob.transport=$tr }
+            return ,@($(if($name){$name}else{"VMess $h"}),$ob)
+        }
+        'trojan' {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $ob=[ordered]@{ type='trojan'; server=$l.Host; server_port=$l.Port; password=$l.User }
+            if("$($l.Q['security'])".ToLowerInvariant() -ne 'none'){ $ob.tls=New-TlsBlock $l.Q $l.Host -Force }
+            $tr=New-TransportBlock $l.Q; if($tr){ $ob.transport=$tr }
+            return ,@($(if($l.Name){$l.Name}else{"Trojan $($l.Host)"}),$ob)
+        }
+        'ss' {
+            $body=$Link.Trim().Substring(5); $name=''; $query=''
+            if($body -match '#'){ $parts=$body -split '#',2; $body=$parts[0]; $name=[uri]::UnescapeDataString($parts[1]) }
+            if($body -match '\?'){ $parts=$body -split '\?',2; $body=$parts[0]; $query=$parts[1] }
+            $body=$body.TrimEnd('/')
+            if($body -notmatch '@'){ $body=ConvertFrom-AnyBase64 $body }       # ss://base64(method:pass@host:port)
+            $at=$body.LastIndexOf('@')
+            $cred=$body.Substring(0,$at); $addr=$body.Substring($at+1)
+            if($cred -notmatch ':'){ $cred=ConvertFrom-AnyBase64 ([uri]::UnescapeDataString($cred)) }   # ss://base64(method:pass)@host:port
+            else { $cred=[uri]::UnescapeDataString($cred) }
+            $mp=$cred -split ':',2
+            $h=''; $port=0
+            if($addr -match '^\[(.+)\]:(\d+)$'){ $h=$Matches[1]; $port=[int]$Matches[2] }
+            elseif($addr -match '^(.+):(\d+)$'){ $h=$Matches[1]; $port=[int]$Matches[2] }
+            if(-not $h -or -not $port){ throw 'в ссылке нет адреса сервера или порта' }
+            $ob=[ordered]@{ type='shadowsocks'; server=$h; server_port=$port; method=$mp[0]; password=$(if($mp.Count -gt 1){$mp[1]}else{''}) }
+            if($query -match '(?:^|&)plugin=([^&]+)'){
+                $plugin=[uri]::UnescapeDataString($Matches[1]); $pp=$plugin -split ';',2
+                $pn=$pp[0]; if($pn -in @('simple-obfs','obfs')){ $pn='obfs-local' }
+                if($pn -notin @('obfs-local','v2ray-plugin')){ throw "плагин Shadowsocks '$pn' sing-box не поддерживает" }
+                $ob.plugin=$pn; $ob.plugin_opts=$(if($pp.Count -gt 1){$pp[1]}else{''})
+            }
+            return ,@($(if($name){$name}else{"Shadowsocks $h"}),$ob)
+        }
+        { $_ -in @('hysteria2','hy2') } {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $pw=$l.User; if($l.Pass){ $pw+=":$($l.Pass)" }
+            $ob=[ordered]@{ type='hysteria2'; server=$l.Host; server_port=$l.Port; password=$pw; tls=(New-TlsBlock $l.Q $l.Host -Force) }
+            if($l.Q['obfs'] -and $l.Q['obfs'] -ne 'none'){ $ob.obfs=[ordered]@{ type=$l.Q['obfs']; password="$($l.Q['obfs-password'])" } }
+            return ,@($(if($l.Name){$l.Name}else{"Hysteria2 $($l.Host)"}),$ob)
+        }
+        'hysteria' {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $up=20; $down=100
+            if($l.Q['upmbps']){ $up=[int][double]$l.Q['upmbps'] }; if($l.Q['downmbps']){ $down=[int][double]$l.Q['downmbps'] }
+            $ob=[ordered]@{ type='hysteria'; server=$l.Host; server_port=$l.Port; up_mbps=$up; down_mbps=$down; tls=(New-TlsBlock $l.Q $l.Host -Force) }
+            if($l.Q['auth']){ $ob.auth_str=$l.Q['auth'] }
+            if($l.Q['obfsParam']){ $ob.obfs=$l.Q['obfsParam'] }
+            return ,@($(if($l.Name){$l.Name}else{"Hysteria $($l.Host)"}),$ob)
+        }
+        'tuic' {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $cc=$l.Q['congestion_control']; if(-not $cc){ $cc=$l.Q['congestion-control'] }; if(-not $cc){ $cc='bbr' }
+            $ob=[ordered]@{ type='tuic'; server=$l.Host; server_port=$l.Port; uuid=$l.User; password=$l.Pass; congestion_control=$cc; tls=(New-TlsBlock $l.Q $l.Host -Force) }
+            $mode=$l.Q['udp_relay_mode']; if(-not $mode){ $mode=$l.Q['udp-relay-mode'] }
+            if($mode){ $ob.udp_relay_mode=$mode }
+            return ,@($(if($l.Name){$l.Name}else{"TUIC $($l.Host)"}),$ob)
+        }
+        'anytls' {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $ob=[ordered]@{ type='anytls'; server=$l.Host; server_port=$l.Port; password=$l.User; tls=(New-TlsBlock $l.Q $l.Host -Force) }
+            return ,@($(if($l.Name){$l.Name}else{"AnyTLS $($l.Host)"}),$ob)
+        }
+        { $_ -in @('socks','socks5','socks4') } {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $user=$l.User; $pass=$l.Pass
+            if($user -and -not $pass -and $user -notmatch ':'){      # socks://base64(user:pass)@host:port
+                try { $dec=ConvertFrom-AnyBase64 $user; if($dec -match ':'){ $up=$dec -split ':',2; $user=$up[0]; $pass=$up[1] } } catch {}
+            }
+            $ob=[ordered]@{ type='socks'; server=$l.Host; server_port=$l.Port; version=$(if($scheme -eq 'socks4'){'4'}else{'5'}) }
+            if($user){ $ob.username=$user; $ob.password=$pass }
+            return ,@($(if($l.Name){$l.Name}else{"SOCKS $($l.Host)"}),$ob)
+        }
+        { $_ -in @('wireguard','wg') } {
+            $l=Split-ServerLink $Link; Assert-Server $l
+            $reserved=@("$($l.Q['reserved'])" -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+            $priv=$l.User; if(-not $priv){ $priv=$l.Q['privatekey'] }
+            $pub=$l.Q['publickey']; if(-not $pub){ $pub=$l.Q['peer'] }
+            $addr=$l.Q['address']; if(-not $addr){ $addr=$l.Q['ip'] }
+            $ob=New-WgEndpoint -PrivateKey "$priv" -Addresses @("$addr" -split ',') -PeerHost $l.Host -PeerPort $l.Port -PublicKey "$pub" `
+                  -Psk "$($l.Q['presharedkey'])" -Mtu $l.Q['mtu'] -Reserved $(if($reserved.Count -eq 3){$reserved}else{$null})
+            return ,@($(if($l.Name){$l.Name}else{"WireGuard $($l.Host)"}),$ob)
+        }
+        default { throw 'формат не поддерживается' }
+    }
+}
+
+function ConvertFrom-SingBoxJson {
+    # Outbound/endpoint sing-box или целый конфиг: берём все серверы из него.
+    param([string]$Text,[string]$Source)
+    try { $j=$Text | ConvertFrom-Json } catch { throw ("JSON не разбирается: " + $_.Exception.Message) }
+    if($Text -match '"vnext"' -or ($Text -match '"inbounds"' -and $Text -match '"routing"')){
+        throw 'это конфиг Xray/V2Ray, а не sing-box. Возьмите ссылку на сервер (vless://...) или экспортируйте конфиг в формате sing-box'
+    }
+    $items=@()
+    if($j -is [array]){ $items=@($j) }
+    elseif($j.PSObject.Properties['outbounds'] -or $j.PSObject.Properties['endpoints']){ $items=@($j.endpoints)+@($j.outbounds) }
+    else { $items=@($j) }
+    $skip=@('direct','block','dns','selector','urltest','tor','ssh')
+    $out=New-Object System.Collections.Generic.List[object]
+    foreach($it in $items){
+        if(-not $it -or -not $it.PSObject.Properties['type'] -or ($skip -contains "$($it.type)")){ continue }
+        $ob=[ordered]@{}
+        foreach($prop in $it.PSObject.Properties){ if(@('tag','detour','domain_resolver') -notcontains $prop.Name){ $ob[$prop.Name]=$prop.Value } }
+        $name="$($it.tag)"; if(-not $name){ $name="$($it.type) $($it.server)" }
+        $out.Add((New-Profile $name $ob $Source))
+    }
+    if(-not $out.Count){ throw 'в JSON нет ни одного сервера (outbound с адресом)' }
+    return ,$out.ToArray()
+}
+
+function ConvertTo-Profiles {
+    <#
+      Разбирает всё, что дал пользователь: файл, ссылку, список ссылок,
+      подписку. Возвращает объект: Profiles (массив) и Errors (массив строк).
+    #>
+    param([string]$Text,[string]$Source='custom',[int]$Depth=0)
+    $Text=$Text.Trim().TrimStart([char]0xFEFF)
+    if(-not $Text){ throw 'пустой ввод' }
+    $profiles=New-Object System.Collections.Generic.List[object]
+    $errors=New-Object System.Collections.Generic.List[string]
+    if($Text -match '(?im)^\s*\[interface\]'){
+        $r=ConvertFrom-WireGuardConf $Text $(if($Source -eq 'proton'){'Proton VPN'}else{'WireGuard'})
+        $profiles.Add((New-Profile $r[0] $r[1] $Source))
+        return [pscustomobject]@{ Profiles=$profiles.ToArray(); Errors=$errors.ToArray() }
+    }
+    if($Text[0] -eq '{' -or $Text[0] -eq '['){
+        foreach($pr in (ConvertFrom-SingBoxJson $Text $Source)){ $profiles.Add($pr) }
+        return [pscustomobject]@{ Profiles=$profiles.ToArray(); Errors=$errors.ToArray() }
+    }
+    $lines=@($Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' })
+    # Подписка: один адрес http(s)://
+    if($lines.Count -eq 1 -and $lines[0] -match '^(?i)https?://' -and $Depth -eq 0){
+        try {
+            [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+            $body=(Invoke-WebRequest -Uri $lines[0] -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop).Content
+            if($body -is [byte[]]){ $body=[Text.Encoding]::UTF8.GetString($body) }
+        } catch { throw ("подписка не скачалась: " + $_.Exception.Message) }
+        return (ConvertTo-Profiles -Text "$body" -Source $Source -Depth ($Depth+1))
+    }
+    # Подписка в base64 (нет ни одной "://")
+    if($Text -notmatch '://' -and $Depth -lt 2){
+        $dec=''
+        try { $dec=ConvertFrom-AnyBase64 $Text } catch {}
+        if($dec -match '://' -or $dec -match '\[Interface\]'){ return (ConvertTo-Profiles -Text $dec -Source $Source -Depth ($Depth+1)) }
+        throw ("формат не распознан. Поддерживается: " + $script:SupportedFormats)
+    }
+    foreach($ln in $lines){
+        if($ln -notmatch '^([a-zA-Z0-9]+)://'){ continue }
+        $scheme=$Matches[1].ToLowerInvariant()
+        try {
+            $r=ConvertFrom-ServerLink $ln
+            $profiles.Add((New-Profile $r[0] $r[1] $Source))
+        } catch { $errors.Add("${scheme}://... - " + $_.Exception.Message) }
+    }
+    if(-not $profiles.Count -and -not $errors.Count){ throw ("формат не распознан. Поддерживается: " + $script:SupportedFormats) }
+    return [pscustomobject]@{ Profiles=$profiles.ToArray(); Errors=$errors.ToArray() }
+}
+
+function Get-ProfileServer {
+    # Хост и порт сервера профиля.
+    param($Prof)
+    $ob=$Prof.outbound
+    if($Prof.endpoint){
+        $peer=@($ob.peers)[0]
+        return [pscustomobject]@{ Host="$($peer.address)"; Port=$peer.port; Udp=$true }
+    }
+    return [pscustomobject]@{ Host="$($ob.server)"; Port=$ob.server_port; Udp=(@('hysteria','hysteria2','tuic') -contains "$($ob.type)") }
+}
+
+function Get-TunnelProfiles {
+    $j=Read-JsonFile (Get-TunnelPaths).Profiles
+    if(-not $j){ return @() }
+    return @($j.profiles | Where-Object { $_ })
+}
+
+function Save-TunnelProfiles {
+    param([object[]]$Profiles)
+    $p=Get-TunnelPaths
     New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
-    Write-JsonFile $p.Account ([ordered]@{
-        private_key=$kv['privatekey']; peer_public_key=$kv['publickey']
-        address_v4=$v4; address_v6=$v6; reserved=$reserved; source='import'
-    })
-    Remove-Item $p.State -Force -ErrorAction SilentlyContinue
-    Write-Host '  Конфиг WARP импортирован. Узел будет подобран заново.' -ForegroundColor Green
+    Write-JsonFile $p.Profiles ([ordered]@{ profiles=@($Profiles) })
+    Update-TunnelServers $Profiles
 }
 
-function Test-Masque { param([string]$Endpoint) return ($Endpoint -like 'masque:*') }
+function Update-TunnelServers {
+    <#
+      Адреса серверов туннеля - в файл исключений zapret: соединение с самим
+      сервером zapret не должен "лечить" подменой SNI и разрезанием (сервер на
+      Hetzner/OVH/DigitalOcean попал бы под профиль хостингов).
+    #>
+    param([object[]]$Profiles)
+    $ips=New-Object System.Collections.Generic.List[string]
+    foreach($pr in $Profiles){
+        $h=(Get-ProfileServer $pr).Host
+        if(-not $h){ continue }
+        $cand=@()
+        if(Test-IpLiteral $h){ $cand=@($h) }
+        else { try { $cand=@([Net.Dns]::GetHostAddresses($h) | ForEach-Object { $_.IPAddressToString }) } catch { $cand=@() } }
+        foreach($ip in $cand){ if(-not $ips.Contains($ip)){ $ips.Add($ip) } }
+    }
+    $p=Get-TunnelPaths
+    $lines=@('# Серверы туннеля: zapret их не трогает. Файл создаётся автоматически.')+$ips.ToArray()
+    [IO.File]::WriteAllLines($p.Servers,$lines,[Text.UTF8Encoding]::new($false))
+}
 
-function Install-Usque {
-    # Скачивает официальную сборку usque с GitHub (один раз).
+function Get-ProfileParts {
+    # endpoints и outbounds для конфига sing-box (профиль получает tag 'tunnel').
+    param($Prof)
+    $ob=[ordered]@{}
+    # Только что разобранный профиль - словарь, прочитанный из файла - объект.
+    if($Prof.outbound -is [System.Collections.IDictionary]){ foreach($k in @($Prof.outbound.Keys)){ $ob[$k]=$Prof.outbound[$k] } }
+    else { foreach($prop in $Prof.outbound.PSObject.Properties){ $ob[$prop.Name]=$prop.Value } }
+    $ob['tag']='tunnel'
+    if($Prof.endpoint){ return [pscustomobject]@{ Endpoints=@($ob); Outbounds=@() } }
+    return [pscustomobject]@{ Endpoints=@(); Outbounds=@($ob) }
+}
+
+function Test-ProfileConfig {
+    # Проверяет профиль настоящим sing-box. Возвращает '' или текст ошибки.
+    param($Prof)
     $ErrorActionPreference='Continue'
-    $p=Get-WarpPaths
-    New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
-    if(Test-Path $p.Usque){
-        $v=(& $p.Usque version 2>&1 | Out-String)
-        if($v -match [regex]::Escape($script:UsqueVersion)){ return }
+    $p=Get-TunnelPaths
+    $parts=Get-ProfileParts $Prof
+    $cfg=[ordered]@{
+        log=[ordered]@{ level='error' }
+        dns=[ordered]@{ servers=@([ordered]@{ type='local'; tag='local' }) }
+        outbounds=@($parts.Outbounds)+@([ordered]@{ type='direct'; tag='direct' })
+        route=[ordered]@{ final='tunnel'; default_domain_resolver='local' }
     }
-    $arch=$env:PROCESSOR_ARCHITEW6432; if(-not $arch){ $arch=$env:PROCESSOR_ARCHITECTURE }
-    $uArch=switch($arch){ 'AMD64' {'amd64'} 'ARM64' {'arm64'} 'x86' {'386'} default {'amd64'} }
-    $url="https://github.com/Diniboy1123/usque/releases/download/v$($script:UsqueVersion)/usque_$($script:UsqueVersion)_windows_$uArch.zip"
-    $tmp=Join-Path $env:TEMP ("usque-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-    try {
-        Write-Host "  Скачивание usque $($script:UsqueVersion) (WARP через MASQUE)..." -ForegroundColor Yellow
-        Write-Host "    $url" -ForegroundColor DarkGray
-        [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-        $zip=Join-Path $tmp 'usque.zip'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
-        Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
-        $exe=Get-ChildItem -Path $tmp -Recurse -Filter 'usque.exe' | Select-Object -First 1
-        if(-not $exe){ throw "В архиве нет usque.exe: $url" }
-        Copy-Item $exe.FullName $p.Usque -Force
-    } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-    Write-Host "  usque установлен: $($p.Usque)" -ForegroundColor Green
+    if($parts.Endpoints.Count){ $cfg.endpoints=@($parts.Endpoints) }
+    Write-JsonFile $p.Validate $cfg
+    $out=& $p.Exe check -c $p.Validate 2>&1
+    $rc=$LASTEXITCODE
+    Remove-Item $p.Validate -Force -ErrorAction SilentlyContinue
+    if($rc -eq 0){ return '' }
+    $msg=@($out | ForEach-Object { "$_" -replace "$([char]27)\[[0-9;]*m",'' } | Where-Object { $_.Trim() })
+    if($msg.Count){ return $msg[-1] }
+    return 'ошибка конфигурации'
 }
 
-function Register-Usque {
-    # Регистрация устройства WARP для MASQUE (отдельная от WireGuard).
-    $ErrorActionPreference='Continue'
-    $p=Get-WarpPaths
-    if(Test-Path $p.UsqueConfig){ return }
-    Write-Host '  Регистрация устройства WARP (MASQUE)...' -ForegroundColor Yellow
-    $out=& $p.Usque -c $p.UsqueConfig register -a -n zapret2 2>&1
-    if($LASTEXITCODE -ne 0 -or -not (Test-Path $p.UsqueConfig)){
-        Remove-Item $p.UsqueConfig -Force -ErrorAction SilentlyContinue
-        throw ("Не удалось зарегистрировать WARP (MASQUE):`n" + (($out | Select-Object -Last 4 | ForEach-Object { "$_" }) -join "`n"))
+function Import-TunnelProfiles {
+    # Разбирает ввод, проверяет профили sing-box и сохраняет годные.
+    param([string]$Text,[string]$Source='custom')
+    Ensure-Admin
+    Remove-LegacyWarp
+    $p=Get-TunnelPaths
+    if(-not (Test-Path $p.Exe)){ Install-SingBox }
+    $parsed=ConvertTo-Profiles -Text $Text -Source $Source
+    $good=New-Object System.Collections.Generic.List[object]
+    $errors=New-Object System.Collections.Generic.List[string]
+    foreach($e in $parsed.Errors){ $errors.Add($e) }
+    foreach($pr in $parsed.Profiles){
+        $why=Test-ProfileConfig $pr
+        if(-not $why){ $good.Add($pr) } else { $errors.Add("$($pr.name) - sing-box не принял профиль: $why") }
     }
-    Write-Host '  Устройство WARP (MASQUE) зарегистрировано.' -ForegroundColor Green
-}
-
-function Initialize-Masque {
-    # usque установлен и зарегистрирован; $false (с сохранённой ошибкой), если нет.
-    try { Install-Usque; Register-Usque; return $true }
-    catch {
-        $m=$_.Exception.Message -split "`n"
-        Set-WarpError ('WARP через MASQUE не подготовлен: ' + $m[0]) @($m | Select-Object -Skip 1)
-        return $false
+    foreach($e in $errors){ Write-Host "  ! $e" -ForegroundColor Yellow }
+    if(-not $good.Count){ throw 'ни один профиль не подошёл' }
+    if($good.Count -gt 40){
+        Write-Host "  ! В подписке $($good.Count) серверов - беру первые 40." -ForegroundColor Yellow
+        $good=New-Object System.Collections.Generic.List[object] (,@($good | Select-Object -First 40))
     }
-}
-
-function Get-UsqueArgs {
-    param([string]$Endpoint,[int]$Port)
-    $parts=$Endpoint -split ':'
-    $a=@('-c',"`"$((Get-WarpPaths).UsqueConfig)`"",'socks','-b','127.0.0.1','-p',"$Port",'-P',$parts[2])
-    if($parts[1] -eq 'h2'){ $a+='--http2' }
-    return $a
-}
-
-function New-MasqueOutbound {
-    param([int]$Port)
-    [ordered]@{ type='socks'; tag='warp'; server='127.0.0.1'; server_port=$Port; version='5' }
-}
-
-function Stop-Usque {
-    $p=Get-WarpPaths
-    for($i=0;$i -lt 10;$i++){
-        $procs=@(Get-CimInstance Win32_Process -Filter "Name='usque.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ExecutablePath -eq $p.Usque })
-        if(-not $procs.Count){ break }
-        $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Milliseconds 300
+    $existing=New-Object System.Collections.Generic.List[object]
+    foreach($x in (Get-TunnelProfiles)){ $existing.Add($x) }
+    $names=New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($x in $existing){ [void]$names.Add($x.name) }
+    foreach($pr in $good){
+        $base=$pr.name; $n=2
+        while($names.Contains($pr.name)){ $pr.name="$base ($n)"; $n++ }    # одинаковые имена различаем номером
+        [void]$names.Add($pr.name)
+        $existing.Add($pr)
     }
-}
-
-function New-WarpEndpointJson {
-    param($Acc,[string]$Endpoint)
-    $ip,$port=$Endpoint -split ':'
-    $addr=@()
-    if($Acc.address_v4){ $addr+="$($Acc.address_v4)/32" }
-    if($Acc.address_v6){ $addr+="$($Acc.address_v6)/128" }
-    [ordered]@{
-        type='wireguard'; tag='warp'; mtu=1280
-        address=$addr
-        private_key=$Acc.private_key
-        peers=@([ordered]@{
-            address=$ip; port=[int]$port
-            public_key=$Acc.peer_public_key
-            allowed_ips=@('0.0.0.0/0','::/0')
-            persistent_keepalive_interval=25
-            reserved=@($Acc.reserved | ForEach-Object { [int]$_ })
-        })
+    Save-TunnelProfiles $existing.ToArray()
+    Write-Host "  Добавлено профилей: $($good.Count). Всего: $($existing.Count)" -ForegroundColor Green
+    foreach($pr in $good){ $s=Get-ProfileServer $pr; Write-Host "    $($pr.name)  [$($pr.type)]  $($s.Host):$($s.Port)" -ForegroundColor DarkGray }
+    # zapret должен узнать о новых серверах (исключения).
+    Write-LaunchConfig
+    if((Get-Status).Running){
+        Write-Host '  Перезапуск обхода, чтобы zapret учёл серверы туннеля...' -ForegroundColor DarkGray
+        Stop-Zapret -Quiet
+        Start-Zapret
     }
+    Remove-Item $p.State -Force -ErrorAction SilentlyContinue     # выбрать лучший профиль заново
 }
 
-function Write-WarpRules {
-    # rule-set для sing-box из lists\warp.txt; sing-box перечитывает его сам.
-    $p=Get-WarpPaths
+function Read-UserInput {
+    # Путь к файлу -> его содержимое; иначе сам текст (ссылка, base64, JSON).
+    param([string]$Value)
+    $Value=$Value.Trim().Trim('"').Trim("'")
+    if($Value -and $Value -notmatch "`n" -and $Value -notmatch '://' -and (Test-Path -LiteralPath $Value -PathType Leaf)){
+        return [IO.File]::ReadAllText($Value)
+    }
+    if($Value -notmatch '://' -and $Value -notmatch '^[\{\[]' -and ($Value -match '[\\/]' -or $Value -match '\.(conf|json|txt)$')){
+        throw "файл не найден: $Value"
+    }
+    return $Value
+}
+
+# --- конфигурация sing-box ----------------------------------------------------
+
+function Write-TunnelRules {
+    # rule-set для sing-box из lists\tunnel.txt; sing-box перечитывает его сам.
+    $p=Get-TunnelPaths
     $d=@(Get-ListEntries $p.List)
-    if(-not $d.Count){ $d=@('warp.invalid') }   # пустое правило sing-box не примет
-    Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=$d }) })
+    if(-not $d.Count){ $d=@('tunnel.invalid') }   # пустое правило sing-box не примет
+    Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
+    if((Get-TunnelStatus).Running){ Set-TunnelDns }
 }
 
-function Write-WarpConfig {
-    param([string]$Endpoint)
-    $p=Get-WarpPaths
-    $masque=Test-Masque $Endpoint
-    $acc=if($masque){ $null } else { Read-JsonFile $p.Account }
-    Write-WarpRules
+function Remove-TunnelDns {
+    try {
+        Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq $script:TunnelNrptComment } |
+            ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
+function Set-TunnelDns {
+    <#
+      DNS-запросы доменов из списка туннеля Windows должна отправлять в
+      sing-box, иначе они получат обычные адреса и пойдут мимо туннеля.
+      Правило NRPT делает это только для этих доменов и их поддоменов;
+      остальной DNS не меняется.
+    #>
+    $p=Get-TunnelPaths
+    Remove-TunnelDns
+    $d=@(Get-ListEntries $p.List)
+    if(-not $d.Count){ return }
+    $ns=@(); foreach($x in $d){ $ns+=$x; $ns+=".$x" }
+    try {
+        # Группами: у одного правила NRPT ограничено число пространств имён.
+        for($i=0;$i -lt $ns.Count;$i+=40){
+            $chunk=@($ns[$i..([Math]::Min($i+39,$ns.Count-1))])
+            Add-DnsClientNrptRule -Namespace $chunk -NameServers $script:TunnelDns4 -Comment $script:TunnelNrptComment -ErrorAction Stop | Out-Null
+        }
+    } catch {
+        Write-Host ('  ! Не удалось задать правило DNS для туннеля: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
+    & ipconfig.exe /flushdns | Out-Null
+}
+
+function Test-TunnelDns {
+    # Проверяет, что домен из списка туннеля действительно получает FakeIP.
+    $d=@(Get-ListEntries (Get-TunnelPaths).List)
+    if(-not $d.Count){ return }
+    $ips=@()
+    try { $ips=@(Resolve-DnsName -Name $d[0] -Type A -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) } catch {}
+    if(@($ips | Where-Object { $_.StartsWith($script:TunnelFake4Prefix) }).Count){
+        Write-Host "  DNS доменов из списка идёт в туннель ($($d[0]) -> $($ips[0]))" -ForegroundColor Green
+    } else {
+        Write-Host "  ! DNS: $($d[0]) получает обычный адрес ($($ips -join ', ')), а не адрес туннеля $($script:TunnelFake4Prefix)x.x - сайт пойдёт мимо туннеля." -ForegroundColor Yellow
+        Write-Host '    Проверьте: Get-DnsClientNrptRule; запись домена в файле hosts.' -ForegroundColor DarkGray
+    }
+}
+
+function Write-TunnelConfig {
+    param($Prof)
+    $p=Get-TunnelPaths
+    Write-TunnelRulesFileOnly
+    $parts=Get-ProfileParts $Prof
     $cfg=[ordered]@{
         log=[ordered]@{ level='warn'; timestamp=$true; output=$p.Log }
         dns=[ordered]@{
             servers=@(
                 [ordered]@{ type='local'; tag='local' },
-                [ordered]@{ type='fakeip'; tag='fakeip'; inet4_range='198.18.0.0/15'; inet6_range='fc00::/18' },
-                [ordered]@{ type='udp'; tag='warp-dns'; server='1.1.1.1'; detour='warp' }
+                [ordered]@{ type='fakeip'; tag='fakeip'; inet4_range=$script:TunnelFake4; inet6_range=$script:TunnelFake6 },
+                # Настоящие адреса сайтов из списка ищем через сам туннель.
+                [ordered]@{ type='tcp'; tag='tunnel-dns'; server='1.1.1.1'; detour='tunnel' }
             )
-            rules=@([ordered]@{ inbound=@('tun-in'); rule_set=@('warp-domains'); query_type=@('A','AAAA'); server='fakeip' })
+            rules=@([ordered]@{ inbound=@('tun-in'); rule_set=@('tunnel-domains'); query_type=@('A','AAAA'); server='fakeip' })
             final='local'
         }
-        endpoints=@()
         inbounds=@(
             [ordered]@{
-                type='tun'; tag='tun-in'; interface_name='Zapret2WARP'
-                address=@('172.19.0.1/30','fdfe:dcba:9876::1/126'); mtu=1400
-                auto_route=$true; strict_route=$true; stack='gvisor'
+                type='tun'; tag='tun-in'; interface_name=$script:TunnelIf
+                address=@($script:TunnelAddr4,$script:TunnelAddr6); mtu=1400
+                auto_route=$true; strict_route=$false; stack='gvisor'
                 # В TUN идут только FakeIP: остальной трафик мимо sing-box.
-                route_address=@('198.18.0.0/15','fc00::/18')
+                route_address=@($script:TunnelFake4,$script:TunnelFake6)
             },
-            [ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:WarpMixedPort }
+            [ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:TunnelMixedPort }
         )
-        outbounds=@([ordered]@{ type='direct'; tag='direct' })
+        outbounds=@([ordered]@{ type='direct'; tag='direct' })+@($parts.Outbounds)
         route=[ordered]@{
-            rule_set=@([ordered]@{ type='local'; tag='warp-domains'; format='source'; path=$p.Rules })
+            rule_set=@([ordered]@{ type='local'; tag='tunnel-domains'; format='source'; path=$p.Rules })
             rules=@(
                 [ordered]@{ action='sniff' },
                 [ordered]@{ protocol='dns'; action='hijack-dns' },
-                [ordered]@{ inbound=@('tun-in','mixed-in'); action='resolve'; server='warp-dns' },
-                [ordered]@{ inbound=@('tun-in','mixed-in'); outbound='warp' }
+                [ordered]@{ inbound=@('tun-in','mixed-in'); action='resolve'; server='tunnel-dns' },
+                [ordered]@{ inbound=@('tun-in','mixed-in'); outbound='tunnel' }
             )
             final='direct'
             auto_detect_interface=$true
@@ -1502,62 +1953,18 @@ function Write-WarpConfig {
         }
         experimental=[ordered]@{ cache_file=[ordered]@{ enabled=$true; path=$p.Cache; store_fakeip=$true } }
     }
-    if($masque){
-        $cfg.Remove('endpoints')
-        $cfg.outbounds=@($cfg.outbounds)+@(New-MasqueOutbound $script:UsquePort)
-        $cfg.dns.servers[2].type='tcp'   # через SOCKS usque DNS надёжнее по TCP
-        # usque не принимает UDP от sing-box по SOCKS. Отклоняем UDP сразу:
-        # браузер мгновенно переходит с QUIC на TCP вместо ожидания тайм-аута.
-        $r=@($cfg.route.rules)
-        $cfg.route.rules=@($r[0..2])+@([ordered]@{ inbound=@('tun-in','mixed-in'); network='udp'; action='reject' })+@($r[3])
-    } else {
-        $cfg.endpoints=@(New-WarpEndpointJson $acc $Endpoint)
-    }
+    if($parts.Endpoints.Count){ $cfg.endpoints=@($parts.Endpoints) }
     Write-JsonFile $p.Config $cfg
 }
 
-function Write-WarpProbeConfig {
-    param([string]$Endpoint,[int]$Port)
-    $p=Get-WarpPaths
-    $cfg=[ordered]@{
-        log=[ordered]@{ level='info' }
-        inbounds=@([ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$Port })
-        route=[ordered]@{ final='warp'; auto_detect_interface=$true }
-    }
-    if(Test-Masque $Endpoint){ $cfg.outbounds=@(New-MasqueOutbound $script:UsqueProbePort) }
-    else { $cfg.endpoints=@(New-WarpEndpointJson (Read-JsonFile $p.Account) $Endpoint) }
-    Write-JsonFile $p.Probe $cfg
+function Write-TunnelRulesFileOnly {
+    $p=Get-TunnelPaths
+    $d=@(Get-ListEntries $p.List)
+    if(-not $d.Count){ $d=@('tunnel.invalid') }
+    Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
 }
 
-function Get-FileTail {
-    param([string]$Path,[int]$Lines=12)
-    if(-not (Test-Path -LiteralPath $Path)){ return @() }
-    try {
-        # sing-box держит файл открытым - читаем с FileShare.ReadWrite.
-        $fs=[IO.File]::Open($Path,'Open','Read','ReadWrite')
-        $sr=New-Object IO.StreamReader($fs)
-        $all=$sr.ReadToEnd(); $sr.Close()
-        $all=$all -replace "$([char]27)\[[0-9;]*m",''   # цвета sing-box
-        return @($all -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $Lines)
-    } catch { return @() }
-}
-
-function Set-WarpError {
-    # Запоминает причину сбоя: её видно в меню WARP, а не только в момент запуска.
-    param([string]$Message,[string[]]$Details=@())
-    $p=Get-WarpPaths
-    if($script:WarpTraceLast -and $Message -match 'узел|трафик'){ $Details=@("Проверка туннеля: $($script:WarpTraceLast)")+$Details }
-    Write-Host "  $Message" -ForegroundColor Red
-    foreach($l in $Details){ Write-Host "    $l" -ForegroundColor DarkGray }
-    try {
-        New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
-        [IO.File]::WriteAllLines($p.LastError,@("$((Get-Date).ToString('s')) $Message")+$Details,[Text.UTF8Encoding]::new($false))
-    } catch {}
-}
-
-function Clear-WarpError {
-    Remove-Item (Get-WarpPaths).LastError -Force -ErrorAction SilentlyContinue
-}
+# --- проверка туннеля ----------------------------------------------------------
 
 function Wait-LocalPort {
     param([int]$Port,[int]$TimeoutMs=4000,$Process=$null)
@@ -1570,20 +1977,17 @@ function Wait-LocalPort {
     return $false
 }
 
-$script:WarpTraceLast=''   # чем закончилась последняя проверка туннеля
-
-function Invoke-WarpTrace {
+function Invoke-TunnelTrace {
     <#
-      Запрос cdn-cgi/trace к 1.1.1.1 через локальный прокси sing-box.
-      Возвращает время ответа в мс или -1. "warp=on" подтверждает туннель.
-      Сначала https (1.1.1.1 на 80-м порту может ответить перенаправлением),
-      затем http; прокси используется для обоих.
+      Запрос https://1.1.1.1/cdn-cgi/trace через локальный прокси sing-box.
+      Возвращает время ответа в мс или -1. Ответ содержит страну (loc) и
+      адрес (ip), под которыми туннель виден сайтам.
     #>
-    param([int]$Port,[int]$TimeoutMs=5000)
+    param([int]$Port,[int]$TimeoutMs=6000)
     $proto=[Net.SecurityProtocolType]::Tls12
     try { $proto=$proto -bor [Net.SecurityProtocolType]'Tls13' } catch {}
     [Net.ServicePointManager]::SecurityProtocol=$proto
-    foreach($url in @('https://1.1.1.1/cdn-cgi/trace','http://1.1.1.1/cdn-cgi/trace')){
+    foreach($url in @('https://1.1.1.1/cdn-cgi/trace','https://www.cloudflare.com/cdn-cgi/trace')){
         try {
             $req=[Net.HttpWebRequest]::Create($url)
             $req.Proxy=New-Object Net.WebProxy("http://127.0.0.1:$Port")
@@ -1592,29 +1996,22 @@ function Invoke-WarpTrace {
             $resp=$req.GetResponse()
             $text=(New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
             $resp.Close(); $sw.Stop()
-            if($text -match 'warp=(on|plus)'){
-                $script:WarpTraceLast="${url}: warp=$($Matches[1])"
+            if($text -match '(?m)^loc=(\S+)'){
+                $script:TunnelExit=@{ loc=$Matches[1] }
+                if($text -match '(?m)^ip=(\S+)'){ $script:TunnelExit['ip']=$Matches[1] }
+                $script:TunnelTraceLast="${url}: ответ получен, страна $($script:TunnelExit['loc'])"
                 return [int]$sw.ElapsedMilliseconds
             }
-            $w=if($text -match 'warp=(\w+)'){ "warp=$($Matches[1])" } else { 'без поля warp' }
-            $script:WarpTraceLast="${url}: ответ получен, но $w - трафик идёт не через WARP"
-        } catch {
-            $script:WarpTraceLast="${url}: " + $_.Exception.Message
-            # Туннель не отвечает - второй адрес не поможет.
-            if($_.Exception.Message -match 'timed out|время ожидания|тайм-аут'){ break }
-        }
+            $script:TunnelTraceLast="${url}: неожиданный ответ"
+        } catch { $script:TunnelTraceLast="${url}: " + $_.Exception.Message }
     }
     return -1
 }
 
-function Measure-WarpPing {
-    <#
-      Задержка через туннель: время установки TCP-соединения с 1.1.1.1:443
-      через прокси sing-box (CONNECT), лучший из трёх замеров, мс. Это
-      примерно один круговой пробег пакета; время полного HTTPS-запроса
-      в 3-4 раза больше и для сравнения узлов не годится.
-    #>
-    param([int]$Port,[int]$TimeoutMs=3000)
+function Measure-TunnelPing {
+    # Задержка через туннель: время установки TCP-соединения с 1.1.1.1:443
+    # через прокси sing-box (CONNECT), лучший из трёх замеров, мс.
+    param([int]$Port,[int]$TimeoutMs=4000)
     $best=-1
     foreach($i in 1..3){
         $c=$null
@@ -1637,158 +2034,146 @@ function Measure-WarpPing {
     return $best
 }
 
-function Test-WarpEndpoint {
-    # Пробный туннель к узлу: 3 запроса, задержка = лучший из 2-го и 3-го
-    # (первый включает рукопожатие WireGuard).
-    param([string]$Endpoint)
-    $p=Get-WarpPaths
-    Write-WarpProbeConfig -Endpoint $Endpoint -Port $script:WarpProbePort
-    $masque=Test-Masque $Endpoint
-    $uproc=$null
-    if($masque){
-        $uproc=Start-Process -FilePath $p.Usque -ArgumentList (Get-UsqueArgs $Endpoint $script:UsqueProbePort) -WindowStyle Hidden -PassThru `
-                   -RedirectStandardError $p.UsqueProbeLog -RedirectStandardOutput "$($p.UsqueProbeLog).out"
+function Test-TunnelProfile {
+    # Пробный запуск профиля. Возвращает объект: Ms (-1 при неудаче) и Loc.
+    param($Prof)
+    $p=Get-TunnelPaths
+    $fail=[pscustomobject]@{ Ms=-1; Loc=$null }
+    $srv=Get-ProfileServer $Prof
+    # Быстрый отсев: если TCP-порт сервера не отвечает, туннель не поднимется.
+    if($srv.Host -and $srv.Port -and -not $srv.Udp){
+        $ok=$false
+        try {
+            $c=[Net.Sockets.TcpClient]::new()
+            $ar=$c.BeginConnect($srv.Host,[int]$srv.Port,$null,$null)
+            if($ar.AsyncWaitHandle.WaitOne(3000)){ $c.EndConnect($ar); $ok=$true }
+            $c.Dispose()
+        } catch {}
+        if(-not $ok){
+            $script:TunnelTraceLast="сервер $($srv.Host):$($srv.Port) не принимает соединение"
+            Remove-Item $p.ProbeLog -Force -ErrorAction SilentlyContinue
+            return $fail
+        }
     }
+    $parts=Get-ProfileParts $Prof
+    $cfg=[ordered]@{
+        log=[ordered]@{ level='info' }
+        dns=[ordered]@{ servers=@([ordered]@{ type='local'; tag='local' }) }
+        inbounds=@([ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:TunnelProbePort })
+        outbounds=@($parts.Outbounds)+@([ordered]@{ type='direct'; tag='direct' })
+        route=[ordered]@{ final='tunnel'; auto_detect_interface=$true; default_domain_resolver='local' }
+    }
+    if($parts.Endpoints.Count){ $cfg.endpoints=@($parts.Endpoints) }
+    Write-JsonFile $p.Probe $cfg
     $proc=Start-Process -FilePath $p.Exe -ArgumentList @('run','-c',"`"$($p.Probe)`"") -WindowStyle Hidden -PassThru `
               -RedirectStandardError $p.ProbeLog -RedirectStandardOutput "$($p.ProbeLog).out"
     try {
-        if($uproc -and -not (Wait-LocalPort $script:UsqueProbePort 8000 $uproc)){ return -1 }
-        if(-not (Wait-LocalPort $script:WarpProbePort 8000 $proc)){ return -1 }
-        # MASQUE-туннель устанавливается дольше WireGuard: до трёх попыток.
-        $okFirst=$false
-        foreach($i in 1..$(if($masque){3}else{1})){
-            if((Invoke-WarpTrace $script:WarpProbePort 4000) -ge 0){ $okFirst=$true; break }
-        }
-        if(-not $okFirst){ return -1 }
-        # Туннель подтверждён (warp=on). Для сравнения узлов меряем задержку.
-        $ping=Measure-WarpPing $script:WarpProbePort
-        if($ping -ge 2){ return $ping }   # 0-1 мс значило бы, что замер не дошёл до туннеля
-        $t=@(); foreach($i in 1..2){ $x=Invoke-WarpTrace $script:WarpProbePort 3000; if($x -ge 0){ $t+=$x } }
-        if(-not $t.Count){ return -1 }
-        return ($t | Measure-Object -Minimum).Minimum
+        if(-not (Wait-LocalPort $script:TunnelProbePort 8000 $proc)){ return $fail }
+        if((Invoke-TunnelTrace $script:TunnelProbePort 6000) -lt 0){ return $fail }
+        $loc=$script:TunnelExit['loc']
+        $ping=Measure-TunnelPing $script:TunnelProbePort
+        if($ping -ge 2){ return [pscustomobject]@{ Ms=$ping; Loc=$loc } }
+        $t=Invoke-TunnelTrace $script:TunnelProbePort 6000
+        return [pscustomobject]@{ Ms=$t; Loc=$loc }
     } finally {
         if(-not $proc.HasExited){ Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
         $proc.WaitForExit(3000) | Out-Null
-        if($uproc){
-            if(-not $uproc.HasExited){ Stop-Process -Id $uproc.Id -Force -ErrorAction SilentlyContinue }
-            $uproc.WaitForExit(3000) | Out-Null
-        }
     }
 }
 
-function Find-WarpEndpoint {
-    # Автоподбор узла Cloudflare. Этап 1: по случайному адресу из каждой
-    # подсети WARP на порту 2408. Этап 2 (если рабочих мало): другие
-    # официальные порты WARP - провайдер может резать отдельные порты.
-    param([string[]]$Skip=@())
-    $p=Get-WarpPaths
-    $wasRunning=(Get-WarpStatus).Running
-    Stop-Warp -Quiet
-    $rnd=New-Object Random
-    $cands=New-Object System.Collections.Generic.List[string]
-    $haveWg=Test-Path $p.Account
-    if($haveWg){
-        $cands.Add('162.159.192.1:2408')
-        foreach($pre in $script:WarpPrefixes){ $cands.Add(("{0}.{1}:2408" -f $pre,$rnd.Next(1,255))) }
-    }
-    $results=New-Object System.Collections.Generic.List[object]
-    Write-Host '  Подбор узла Cloudflare WARP...' -ForegroundColor Yellow
-    $test={
-        param($ep)
-        if($Skip -contains $ep){ return }
-        Write-Host ("    {0,-22} " -f $ep) -NoNewline
-        $ms=Test-WarpEndpoint $ep
-        if($ms -ge 0){ $results.Add([pscustomobject]@{ endpoint=$ep; ms=[int]$ms }); Write-Host "$ms мс" -ForegroundColor Green }
-        else { Write-Host 'нет ответа' -ForegroundColor DarkGray }
-    }
-    foreach($c in $cands){ & $test $c }
-    if($haveWg -and $results.Count -lt 2){
-        foreach($port in ($script:WarpPorts | Where-Object { $_ -ne 2408 })){
-            foreach($pre in $script:WarpPrefixes){
-                & $test ("{0}.{1}:{2}" -f $pre,$rnd.Next(1,255),$port)
-                if($results.Count -ge 3){ break }
-            }
-            if($results.Count -ge 3){ break }
-        }
-    }
-    if(-not $results.Count){
-        # WireGuard не проходит - пробуем WARP через MASQUE (HTTP/3, затем HTTP/2).
-        Write-Host '  WireGuard к Cloudflare не проходит - пробую WARP через MASQUE...' -ForegroundColor Yellow
-        $wgLog=@(Get-FileTail $p.ProbeLog 3)
-        foreach($f in @($p.UsqueProbeLog,$p.ProbeLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
-        if(-not (Initialize-Masque)){
-            # usque не скачался или не зарегистрировался: это и есть причина.
-            # Оставляем её в "Последней ошибке", не затирая общим сообщением.
-            Write-Host '  MASQUE недоступен: причина выше.' -ForegroundColor Yellow
-            return $null
-        }
-        # Проверяем все варианты и берём самый быстрый, а не первый рабочий.
-        foreach($v in $script:MasqueVariants){ & $test $v }
-        if(-not $results.Count){
-            $u=@(Get-FileTail $p.UsqueProbeLog 8); if(-not $u.Count){ $u=@('<usque ничего не вывел>') }
-            Set-WarpError 'Ни один узел WARP не ответил (ни WireGuard, ни MASQUE).' (@('usque (MASQUE), последняя проба:') + $u + @('sing-box, последняя проба MASQUE:') + @(Get-FileTail $p.ProbeLog 4) + @('WireGuard, последняя проба:') + $wgLog)
-            Write-Host '  Похоже, провайдер блокирует WARP целиком.' -ForegroundColor Yellow
-            Write-Host '  Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).' -ForegroundColor DarkGray
-            return $null
-        }
-    }
-    $ranked=@($results | Sort-Object ms)
-    if(-not $ranked.Count){
-        Set-WarpError 'Ни один узел WARP не ответил.' (@('Журнал последней пробы sing-box:') + @(Get-FileTail $p.ProbeLog 6))
-        Write-Host '  Похоже, провайдер блокирует WARP целиком.' -ForegroundColor Yellow
-        Write-Host '  Попробуйте при запущенном zapret; иначе нужен другой выход (свой VPS).' -ForegroundColor DarkGray
+function Select-TunnelProfile {
+    # Проверяет все профили и выбирает рабочий с наименьшей задержкой.
+    param([string[]]$Skip=@(),[switch]$NoAutostart)
+    $p=Get-TunnelPaths
+    $profiles=@(Get-TunnelProfiles)
+    if(-not $profiles.Count){
+        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.'
         return $null
     }
-    Write-JsonFile $p.State ([ordered]@{ best=$ranked[0].endpoint; ranked=$ranked; tested=(Get-Date).ToString('s') })
-    Write-Host ("  Лучший узел: {0} (задержка {1} мс)" -f $ranked[0].endpoint,$ranked[0].ms) -ForegroundColor Green
-    if($ranked.Count -gt 1){
-        Write-Host ('  Остальные: ' + ((@($ranked | Select-Object -Skip 1 -First 3) | ForEach-Object { "$($_.endpoint) $($_.ms) мс" }) -join ', ')) -ForegroundColor DarkGray
+    $wasRunning=(Get-TunnelStatus).Running
+    Stop-Tunnel -Quiet
+    $results=New-Object System.Collections.Generic.List[object]
+    $lastFail=@()
+    Write-Host '  Проверка профилей туннеля...' -ForegroundColor Yellow
+    foreach($pr in $profiles){
+        if($Skip -contains $pr.name){ continue }
+        $shown=$pr.name; if($shown.Length -gt 40){ $shown=$shown.Substring(0,40) }
+        Write-Host ("    {0,-40} " -f $shown) -NoNewline
+        $r=Test-TunnelProfile $pr
+        if($r.Ms -ge 0){
+            $results.Add([pscustomobject]@{ name=$pr.name; ms=[int]$r.Ms; loc="$($r.Loc)"; ru=[int]("$($r.Loc)" -eq 'RU') })
+            Write-Host ("{0} мс, выход: {1}{2}" -f $r.Ms,$r.Loc,$(if("$($r.Loc)" -eq 'RU'){' (Россия!)'}else{''})) -ForegroundColor Green
+        } else {
+            Write-Host 'нет ответа' -ForegroundColor DarkGray
+            $lastFail=@("Профиль '$($pr.name)': $($script:TunnelTraceLast)")+@(Get-FileTail $p.ProbeLog 6)
+        }
     }
-    if($wasRunning){ Start-Warp }
-    return $ranked[0].endpoint
+    # Зарубежный выход важнее скорости: с российским адресом сервисы,
+    # закрытые для России, не откроются.
+    $ranked=@($results | Sort-Object ru,ms)
+    if(-not $ranked.Count){
+        Set-TunnelError 'Ни один профиль туннеля не ответил.' $lastFail
+        Write-Host '  Сервер недоступен или его протокол блокируется провайдером.' -ForegroundColor Yellow
+        Write-Host '  Попробуйте при запущенном zapret, другой сервер или другой протокол.' -ForegroundColor DarkGray
+        return $null
+    }
+    $best=$ranked[0]
+    Write-JsonFile $p.State ([ordered]@{ active=$best.name; ranked=@($ranked); tested=(Get-Date).ToString('s') })
+    Clear-TunnelError
+    Write-Host ("  Лучший профиль: {0} (задержка {1} мс, выход: {2})" -f $best.name,$best.ms,$best.loc) -ForegroundColor Green
+    if(-not $NoAutostart){
+        if($wasRunning -or ((Get-TunnelStatus).Enabled -and (Get-Status).Running)){ Start-Tunnel }
+        elseif((Get-TunnelStatus).Enabled){ Write-Host '  Туннель запустится вместе с обходом (пункт [2] главного меню).' -ForegroundColor DarkGray }
+        else { Write-Host '  Туннель выключен: включите его в меню туннеля, пункт [1].' -ForegroundColor DarkGray }
+    }
+    return $best.name
 }
 
-function Get-WarpStatus {
-    $p=Get-WarpPaths
+# --- запуск и остановка --------------------------------------------------------
+
+function Get-TunnelStarterProcess {
+    # Фоновый запуск туннеля, если он ещё идёт.
+    $p=Get-TunnelPaths
+    if(-not (Test-Path $p.StarterPid)){ return $null }
+    try { return (Get-Process -Id ([int](Get-Content $p.StarterPid -Raw)) -ErrorAction Stop) } catch { return $null }
+}
+
+function Get-TunnelStatus {
+    $p=Get-TunnelPaths
     $proc=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -eq $p.Exe })
     $st=Read-JsonFile $p.State
+    $ex=Read-JsonFile $p.ExitInfo
     [pscustomobject]@{
         Enabled=(Test-Path $p.Enabled)
-        Installed=(Test-Path $p.Exe) -and (Test-Path $p.Account)
+        Installed=(Test-Path $p.Exe) -or (Test-Path $p.Profiles)
         Running=[bool]$proc.Count
-        Starting=[bool](Get-WarpStarterProcess)
-        Endpoint=if($st){$st.best}else{$null}
+        Starting=[bool](Get-TunnelStarterProcess)
+        Active=$(if($st){$st.active}else{$null})
+        Loc=$(if($ex){$ex.loc}else{$null})
+        Profiles=@(Get-TunnelProfiles).Count
         Domains=@(Get-ListEntries $p.List).Count
     }
 }
 
-function Start-WarpProcess {
+function Find-TunnelProfile {
+    param([string]$Name)
+    foreach($pr in (Get-TunnelProfiles)){ if($pr.name -eq $Name){ return $pr } }
+    return $null
+}
+
+function Start-TunnelProcess {
     <#
       Возвращает 'ok', 'crash' (sing-box завершился: ошибка конфига, TUN,
-      прав - перебор узлов тут не поможет) или 'notunnel' (sing-box работает,
-      но трафик через WARP не идёт - стоит попробовать другой узел).
+      прав) или 'notunnel' (sing-box работает, но трафик через сервер не идёт).
     #>
-    param([string]$Endpoint)
-    # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
+    param($Prof)
     $ErrorActionPreference='Continue'
-    $p=Get-WarpPaths
-    $masque=Test-Masque $Endpoint
-    if($masque){
-        if(-not (Initialize-Masque)){ return 'crash' }
-        Stop-Usque
-        Remove-Item $p.UsqueLog -Force -ErrorAction SilentlyContinue
-        $uproc=Start-Process -FilePath $p.Usque -ArgumentList (Get-UsqueArgs $Endpoint $script:UsquePort) -WorkingDirectory $p.Dir -WindowStyle Hidden -PassThru `
-                   -RedirectStandardError $p.UsqueLog -RedirectStandardOutput "$($p.UsqueLog).out"
-        if(-not (Wait-LocalPort $script:UsquePort 15000 $uproc)){
-            Set-WarpError 'usque (MASQUE) не запустился.' @(Get-FileTail $p.UsqueLog 10)
-            return 'crash'
-        }
-    }
-    Write-WarpConfig -Endpoint $Endpoint
+    $p=Get-TunnelPaths
+    Write-TunnelConfig $Prof
     $chk=& $p.Exe check -c $p.Config 2>&1
     if($LASTEXITCODE -ne 0){
-        Set-WarpError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" })
+        Set-TunnelError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" })
         return 'crash'
     }
     foreach($f in @($p.Log,$p.ErrLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
@@ -1798,103 +2183,105 @@ function Start-WarpProcess {
     [IO.File]::WriteAllText($p.Pid,[string]$proc.Id,[Text.Encoding]::ASCII)
     # При первом запуске Windows создаёт адаптер Wintun - это бывает дольше
     # 10 секунд. Ждём, пока процесс жив, до 30 секунд.
-    if(-not (Wait-LocalPort $script:WarpMixedPort 30000 $proc)){
+    if(-not (Wait-LocalPort $script:TunnelMixedPort 30000 $proc)){
         $why=@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10)
-        if($proc.HasExited){
-            Set-WarpError ("sing-box завершился с кодом $($proc.ExitCode).") $why
-        } else {
-            Set-WarpError 'sing-box не открыл локальный порт за 30 секунд.' $why
+        if($proc.HasExited){ Set-TunnelError ("sing-box завершился с кодом $($proc.ExitCode).") $why }
+        else {
+            Set-TunnelError 'sing-box не открыл локальный порт за 30 секунд.' $why
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
         }
         return 'crash'
     }
-    # Рукопожатие WireGuard и маршруты TUN - даём три попытки.
-    foreach($i in 1..$(if($masque){5}else{3})){
+    foreach($i in 1..3){
         if($proc.HasExited){ break }
-        if((Invoke-WarpTrace $script:WarpMixedPort 6000) -ge 0){ Clear-WarpError; return 'ok' }
+        if((Invoke-TunnelTrace $script:TunnelMixedPort 6000) -ge 0){ Clear-TunnelError; return 'ok' }
         Start-Sleep -Seconds 1
     }
     if($proc.HasExited){
-        Set-WarpError ("sing-box завершился с кодом $($proc.ExitCode).") (@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10))
+        Set-TunnelError ("sing-box завершился с кодом $($proc.ExitCode).") (@(Get-FileTail $p.ErrLog 10) + @(Get-FileTail $p.Log 10))
         return 'crash'
     }
-    Set-WarpError "Через узел $Endpoint не идёт трафик." (@(if($masque){ Get-FileTail $p.UsqueLog 6 }) + @(Get-FileTail $p.Log 8))
+    Set-TunnelError "Через профиль '$($Prof.name)' не идёт трафик." (@("Проверка туннеля: $($script:TunnelTraceLast)") + @(Get-FileTail $p.Log 8))
     return 'notunnel'
 }
 
-function Start-Warp {
+function Start-Tunnel {
     Ensure-Admin
-    $p=Get-WarpPaths
-    try {
-        if(-not (Test-Path $p.Exe)){ Install-SingBox }
-    } catch {
-        Set-WarpError ($_.Exception.Message -split "`n")[0] @(($_.Exception.Message -split "`n") | Select-Object -Skip 1)
+    Remove-LegacyWarp
+    $p=Get-TunnelPaths
+    if(-not @(Get-TunnelProfiles).Count){
+        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.'
         return
     }
-    if(-not (Test-Path $p.Account) -and -not (Test-Path $p.UsqueConfig)){
-        # Не фатально: остаётся транспорт MASQUE со своей регистрацией.
-        try { New-WarpAccount } catch { Write-Host ('  ' + ($_.Exception.Message -split "`n")[0]) -ForegroundColor Yellow }
+    try { if(-not (Test-Path $p.Exe)){ Install-SingBox } }
+    catch {
+        Set-TunnelError ($_.Exception.Message -split "`n")[0] @(($_.Exception.Message -split "`n") | Select-Object -Skip 1)
+        return
     }
-    Stop-Warp -Quiet
+    Stop-Tunnel -Quiet
     $st=Read-JsonFile $p.State
-    $ep=if($st){ $st.best } else { $null }
-    if(-not $ep){ $ep=Find-WarpEndpoint }
-    if(-not $ep){ return }
-    Write-Host "  Запуск sing-box (узел $ep)..." -ForegroundColor Yellow
-    $r=Start-WarpProcess $ep
-    if($r -eq 'notunnel'){
-        # Узел перестал отвечать (заблокирован или ушёл) - подбираем новый.
-        Write-Host "  Узел $ep не отвечает, подбираю другой..." -ForegroundColor Yellow
-        Stop-Warp -Quiet
-        $ep=Find-WarpEndpoint -Skip @($ep)
-        $r=if($ep){ Start-WarpProcess $ep } else { 'crash' }
+    $prof=$null
+    if($st -and $st.active){ $prof=Find-TunnelProfile $st.active }
+    if(-not $prof){
+        $name=Select-TunnelProfile -NoAutostart
+        if($name){ $prof=Find-TunnelProfile $name }
+    }
+    if(-not $prof){ return }
+    Write-Host "  Запуск туннеля (профиль '$($prof.name)')..." -ForegroundColor Yellow
+    $r=Start-TunnelProcess $prof
+    if($r -eq 'notunnel' -and @(Get-TunnelProfiles).Count -gt 1){
+        Write-Host '  Профиль не отвечает, проверяю остальные...' -ForegroundColor Yellow
+        Stop-Tunnel -Quiet
+        $name=Select-TunnelProfile -Skip @($prof.name) -NoAutostart
+        $prof=$(if($name){ Find-TunnelProfile $name } else { $null })
+        $r=$(if($prof){ Start-TunnelProcess $prof } else { 'crash' })
     }
     if($r -ne 'ok'){
-        Stop-Warp -Quiet
-        Write-Host '  WARP не запущен. Причина выше; она же в меню WARP и в журналах:' -ForegroundColor Red
+        Stop-Tunnel -Quiet
+        Write-Host '  Туннель не запущен. Причина выше; она же в меню туннеля и в журналах:' -ForegroundColor Red
         Write-Host "    $($p.Log)" -ForegroundColor DarkGray
         Write-Host "    $($p.ErrLog)" -ForegroundColor DarkGray
         return
     }
-    & ipconfig.exe /flushdns | Out-Null
-    Write-Host "  WARP работает через узел $ep. Сайтов в списке WARP: $((Get-WarpStatus).Domains)" -ForegroundColor Green
+    Set-TunnelDns
+    Write-Host "  Туннель работает: '$($prof.name)'. Сайтов в списке туннеля: $((Get-TunnelStatus).Domains)" -ForegroundColor Green
+    if($script:TunnelExit['loc']){
+        Write-JsonFile $p.ExitInfo ([ordered]@{ loc=$script:TunnelExit['loc']; ip=$script:TunnelExit['ip'] })
+        Write-Host "  Выход в интернет: страна $($script:TunnelExit['loc']), адрес $($script:TunnelExit['ip'])" -ForegroundColor DarkGray
+        if($script:TunnelExit['loc'] -eq 'RU'){
+            Write-Host '  ! Выход - в России: сервисы, которые сами не пускают из России, через туннель не откроются.' -ForegroundColor Yellow
+        }
+    }
+    Test-TunnelDns
 }
 
-function Get-WarpStarterProcess {
-    # Фоновый запуск WARP, если он ещё идёт.
-    $p=Get-WarpPaths
-    if(-not (Test-Path $p.StarterPid)){ return $null }
-    try { return (Get-Process -Id ([int](Get-Content $p.StarterPid -Raw)) -ErrorAction Stop) } catch { return $null }
-}
-
-function Start-WarpBackground {
+function Start-TunnelBackground {
     <#
-      WARP запускается следом за zapret, не задерживая сам обход: проверка
-      узла (а при необходимости и подбор нового) идёт в отдельном скрытом
-      процессе PowerShell. Ход запуска - в logs\warp-start.log.
+      Туннель запускается следом за zapret, не задерживая сам обход: проверка
+      идёт в отдельном скрытом процессе PowerShell. Ход запуска - в
+      logs\tunnel-start.log.
     #>
-    $p=Get-WarpPaths
-    if(Get-WarpStarterProcess){ Write-Host '  WARP уже запускается в фоне.' -ForegroundColor DarkGray; return }
+    $p=Get-TunnelPaths
+    if(Get-TunnelStarterProcess){ Write-Host '  Туннель уже запускается в фоне.' -ForegroundColor DarkGray; return }
     $ps=Join-Path $PSHOME 'powershell.exe'
-    $argsList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Action','WarpStart')
+    $argsList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Action','TunnelStart')
     $proc=Start-Process -FilePath $ps -ArgumentList $argsList -WindowStyle Hidden -PassThru `
               -RedirectStandardOutput $p.StartLog -RedirectStandardError "$($p.StartLog).err"
     [IO.File]::WriteAllText($p.StarterPid,[string]$proc.Id,[Text.Encoding]::ASCII)
-    Write-Host '  WARP запускается в фоне - статус в меню [11].' -ForegroundColor DarkGray
+    Write-Host '  Туннель запускается в фоне - статус в меню [11].' -ForegroundColor DarkGray
 }
 
-function Invoke-WarpStartAction {
-    # Действие WarpStart: запуск WARP, если он включён (так его запускает обход).
-    try { if((Get-WarpStatus).Enabled){ Start-Warp } else { Write-Host 'WARP выключен.' } }
-    finally { Remove-Item (Get-WarpPaths).StarterPid -Force -ErrorAction SilentlyContinue }
+function Invoke-TunnelStartAction {
+    # Действие TunnelStart: запуск туннеля, если он включён (так его запускает обход).
+    try { if((Get-TunnelStatus).Enabled){ Start-Tunnel } else { Write-Host 'Туннель выключен.' } }
+    finally { Remove-Item (Get-TunnelPaths).StarterPid -Force -ErrorAction SilentlyContinue }
 }
 
-function Stop-Warp {
+function Stop-Tunnel {
     param([switch]$Quiet)
-    $p=Get-WarpPaths
-    # Остановка обхода во время фонового запуска WARP: прерываем и запуск,
-    # иначе он поднимет sing-box уже после остановки. Себя не трогаем.
-    $starter=Get-WarpStarterProcess
+    $p=Get-TunnelPaths
+    # Остановка во время фонового запуска: прерываем и запуск. Себя не трогаем.
+    $starter=Get-TunnelStarterProcess
     if($starter -and $starter.Id -ne $PID){
         Stop-Process -Id $starter.Id -Force -ErrorAction SilentlyContinue
         Remove-Item $p.StarterPid -Force -ErrorAction SilentlyContinue
@@ -1907,41 +2294,43 @@ function Stop-Warp {
         Start-Sleep -Milliseconds 300
     }
     Remove-Item $p.Pid -Force -ErrorAction SilentlyContinue
-    Stop-Usque
-    if(-not $Quiet){ Write-Host '  WARP остановлен.' -ForegroundColor Yellow }
+    Remove-TunnelDns
+    if(-not $Quiet){ Write-Host '  Туннель остановлен.' -ForegroundColor Yellow }
 }
 
-function Enable-Warp {
+function Enable-Tunnel {
     Ensure-Admin
-    $p=Get-WarpPaths
+    Remove-LegacyWarp
+    $p=Get-TunnelPaths
     New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
-    if(-not (Test-Path $p.List)){ $null=Merge-ListFile $p.List $script:SeedWarp }
+    if(-not (Test-Path $p.List)){ $null=Merge-ListFile $p.List $script:SeedTunnel }
+    if(-not @(Get-TunnelProfiles).Count){
+        Write-Host '  Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).' -ForegroundColor Red
+        return
+    }
     [IO.File]::WriteAllText($p.Enabled,'1',[Text.Encoding]::ASCII)
-    Start-Warp
-    if((Get-WarpStatus).Running){
+    Start-Tunnel
+    if((Get-TunnelStatus).Running){
         $a='y'
-        if($Action -eq 'Menu'){ $a=Read-Host '  Проверить сайты из списков и перенести в WARP те, что не открываются через zapret? (Y/n)' }
-        if($a -notmatch '^\s*[nNнН]'){ Update-WarpRoutes }
+        if($Action -eq 'Menu'){ $a=Read-Host '  Проверить сайты из списков и перенести в туннель те, что не открываются через zapret? (Y/n)' }
+        if($a -notmatch '^\s*[nNнН]'){ Update-TunnelRoutes }
     }
 }
 
-function Disable-Warp {
-    $p=Get-WarpPaths
+function Disable-Tunnel {
+    $p=Get-TunnelPaths
     Remove-Item $p.Enabled -Force -ErrorAction SilentlyContinue
-    Stop-Warp
+    Stop-Tunnel
     & ipconfig.exe /flushdns | Out-Null
 }
 
-function Toggle-Warp {
-    if((Get-WarpStatus).Enabled){ Disable-Warp } else { Enable-Warp }
-}
+# --- распределение сайтов ------------------------------------------------------
 
 function Test-HttpsBatch {
     <#
       Параллельная проверка https://<домен>/ . Успех - получен HTTP-ответ и
       прочитано 64 КБ тела (или оно кончилось раньше): так ловится и обрыв
-      "16 КБ", а не только недоступность. Код ответа не важен - сам факт
-      ответа значит, что сеть до сайта работает.
+      "16 КБ", а не только недоступность. Код ответа не важен.
     #>
     param([string[]]$Domains,[string]$Proxy)
     Add-Type -AssemblyName System.Net.Http
@@ -1985,7 +2374,7 @@ function Test-HttpsBatch {
 
 function Remove-HostsDomains {
     # Убирает из нашего блока hosts строки этих доменов: иначе hosts
-    # перекроет DNS sing-box и домен не попадёт в WARP.
+    # перекроет DNS sing-box и домен не попадёт в туннель.
     param([string[]]$Domains)
     $hf=Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     if(-not $Domains.Count -or -not (Test-Path $hf)){ return }
@@ -2002,86 +2391,179 @@ function Remove-HostsDomains {
     if($changed){ [IO.File]::WriteAllLines($hf,$out,[Text.Encoding]::ASCII) }
 }
 
-function Update-WarpRoutes {
+function Add-TunnelDomains {
+    param([string[]]$Domains)
+    $p=Get-TunnelPaths
+    $null=Merge-ListFile $p.List $Domains
+    Write-TunnelRules
+    Remove-HostsDomains $Domains
+    & ipconfig.exe /flushdns | Out-Null
+}
+
+function Update-TunnelRoutes {
     <#
-      "WARP там, где не справляется zapret": проверяем домены из списков
-      zapret напрямую (через zapret); не открывшиеся проверяем через WARP и,
-      если там они работают, переносим в lists\warp.txt.
+      "Туннель там, где не справляется zapret": проверяем домены из списков
+      zapret напрямую; не открывшиеся проверяем через туннель и, если там они
+      работают, переносим в lists\tunnel.txt.
     #>
     Ensure-Admin
-    $p=Get-WarpPaths
-    if(-not (Get-WarpStatus).Running){ Write-Host '  WARP не запущен.' -ForegroundColor Red; return }
+    $p=Get-TunnelPaths
+    if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
     if(-not (Get-Status).Running){
-        Write-Host '  Внимание: zapret не запущен - в WARP попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
+        Write-Host '  Внимание: zapret не запущен - в туннель попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
     }
     $lists=Join-Path $script:TrustedRuntime 'lists'
-    $inWarp=@(Get-ListEntries $p.List)
+    $inTunnel=@(Get-ListEntries $p.List)
     $excl=@(Get-ListEntries (Join-Path $lists 'exclude.txt'))
     $cands=@(@(Get-ListEntries (Join-Path $lists 'blocked.txt')) + @(Get-ListEntries (Join-Path $lists 'autohostlist.txt')) |
-             Select-Object -Unique | Where-Object { $inWarp -notcontains $_ -and $excl -notcontains $_ })
+             Select-Object -Unique | Where-Object { $inTunnel -notcontains $_ -and $excl -notcontains $_ })
     if(-not $cands.Count){ Write-Host '  Нечего проверять.' -ForegroundColor DarkGray; return }
     Write-Host ("  Проверка {0} сайтов через zapret..." -f $cands.Count) -ForegroundColor Yellow
     $direct=Test-HttpsBatch -Domains $cands
     $failed=@($cands | Where-Object { -not $direct[$_] })
+    if($failed.Count){
+        # Вторая попытка: случайный сбой не должен навсегда увести сайт в туннель
+        # (домены из списка туннеля zapret больше не обрабатывает).
+        $again=Test-HttpsBatch -Domains $failed
+        $failed=@($failed | Where-Object { -not $again[$_] })
+    }
     Write-Host ("  Открываются через zapret: {0}, не открываются: {1}" -f ($cands.Count-$failed.Count),$failed.Count) -ForegroundColor DarkGray
-    if(-not $failed.Count){ Write-Host '  WARP не нужен ни одному сайту из списков.' -ForegroundColor Green; return }
-    Write-Host '  Проверка неоткрывшихся через WARP...' -ForegroundColor Yellow
-    $viaWarp=Test-HttpsBatch -Domains $failed -Proxy "http://127.0.0.1:$($script:WarpMixedPort)"
-    $move=@($failed | Where-Object { $viaWarp[$_] })
-    $dead=@($failed | Where-Object { -not $viaWarp[$_] })
+    if(-not $failed.Count){ Write-Host '  Туннель не нужен ни одному сайту из списков.' -ForegroundColor Green; return }
+    Write-Host '  Проверка неоткрывшихся через туннель...' -ForegroundColor Yellow
+    $via=Test-HttpsBatch -Domains $failed -Proxy "http://127.0.0.1:$($script:TunnelMixedPort)"
+    $move=@($failed | Where-Object { $via[$_] })
+    $dead=@($failed | Where-Object { -not $via[$_] })
     if($move.Count){
-        $null=Merge-ListFile $p.List $move
-        Write-WarpRules
-        Remove-HostsDomains $move
-        & ipconfig.exe /flushdns | Out-Null
-        Write-Host ("  Перенесено в WARP: {0}" -f ($move -join ', ')) -ForegroundColor Green
+        Add-TunnelDomains $move
+        Write-Host ("  Перенесено в туннель: {0}" -f ($move -join ', ')) -ForegroundColor Green
+        Start-Sleep -Seconds 1
+        Test-TunnelDns
+        Write-Host '  Перезапустите браузер: он помнит старые адреса сайтов. Если в браузере включён' -ForegroundColor DarkGray
+        Write-Host '  "Безопасный DNS" (DNS через HTTPS), отключите его - иначе он обходит туннель.' -ForegroundColor DarkGray
     }
     if($dead.Count){
-        Write-Host ("  Не открываются и через WARP (нет сайта на корне домена, геоблок или сбой): {0}" -f ($dead -join ', ')) -ForegroundColor DarkGray
+        Write-Host ("  Не открываются и через туннель (нет сайта на корне домена или сбой): {0}" -f ($dead -join ', ')) -ForegroundColor DarkGray
     }
-    Write-Host "  Список WARP: $($p.List) (можно править вручную)." -ForegroundColor DarkGray
+    Write-Host "  Список туннеля: $($p.List) (можно править вручную)." -ForegroundColor DarkGray
 }
 
-function Show-WarpMenu {
+function Test-TunnelSites {
+    # Проверка сайтов из списка туннеля так, как их видит браузер (через DNS и TUN).
+    param([string[]]$Domains=@())
+    $p=Get-TunnelPaths
+    if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
+    if(-not $Domains.Count){ $Domains=@(Get-ListEntries $p.List) }
+    if(-not $Domains.Count){ Write-Host '  Список туннеля пуст.' -ForegroundColor DarkGray; return }
+    Write-Host '  Проверка сайтов из списка туннеля (как в браузере)...' -ForegroundColor Yellow
+    $res=Test-HttpsBatch -Domains $Domains
+    foreach($d in $Domains){
+        $ips=@()
+        try { $ips=@(Resolve-DnsName -Name $d -Type A -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) } catch {}
+        $via=$(if(@($ips | Where-Object { $_.StartsWith($script:TunnelFake4Prefix) }).Count){'в туннель'}else{'МИМО туннеля'})
+        if($res[$d]){ Write-Host ("    {0,-28} DNS {1,-13} открывается" -f $d,$via) -ForegroundColor Green }
+        else { Write-Host ("    {0,-28} DNS {1,-13} НЕ открывается" -f $d,$via) -ForegroundColor Red }
+    }
+    $ex=Read-JsonFile $p.ExitInfo
+    if($ex){ Write-Host "  Выход туннеля: страна $($ex.loc), адрес $($ex.ip)" -ForegroundColor DarkGray }
+}
+
+# --- меню -----------------------------------------------------------------------
+
+function Show-TunnelProfiles {
+    $profiles=@(Get-TunnelProfiles)
+    if(-not $profiles.Count){ Write-Host '  Профилей нет.' -ForegroundColor DarkGray; return $profiles }
+    $active=(Get-TunnelStatus).Active
+    $i=0
+    foreach($pr in $profiles){
+        $i++
+        $s=Get-ProfileServer $pr
+        $src=$(if($pr.source -eq 'proton'){'Proton'}else{'свой'})
+        $mark=$(if($pr.name -eq $active){' <- активный'}else{''})
+        Write-Host ("    [{0}] {1}  [{2}, {3}]  {4}:{5}{6}" -f $i,$pr.name,$pr.type,$src,$s.Host,$s.Port,$mark)
+    }
+    return $profiles
+}
+
+function Show-TunnelMenu {
     while($true){
-        $w=Get-WarpStatus
+        $w=Get-TunnelStatus
         Write-Host ''
-        Write-Host ('  WARP: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
-                    $(if($w.Running){"работает, узел $($w.Endpoint)"}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
-                    ' | сайтов в списке: ' + $w.Domains) -ForegroundColor Cyan
+        Write-Host ('  Туннель: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
+                    $(if($w.Running){"работает, профиль '$($w.Active)'"}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
+                    ' | профилей: ' + $w.Profiles + ' | сайтов в списке: ' + $w.Domains +
+                    $(if($w.Running -and $w.Loc){" | выход: $($w.Loc)"}else{''})) -ForegroundColor Cyan
         if($w.Enabled -and -not $w.Running -and -not $w.Starting){
-            $le=Get-FileTail (Get-WarpPaths).LastError 40
+            $le=Get-FileTail (Get-TunnelPaths).LastError 40
             if($le.Count){
                 Write-Host '  Последняя ошибка:' -ForegroundColor Red
                 $le | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
             }
         }
-        Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить WARP'}else{'Включить WARP'}))
-        Write-Host '  [2] Подобрать лучший узел Cloudflare заново'
-        Write-Host '  [3] Проверить сайты и перенести в WARP те, что не открываются через zapret'
-        Write-Host '  [4] Добавить домен в WARP вручную'
-        Write-Host '  [5] Импортировать WireGuard-конфиг WARP (если регистрация не проходит)'
+        Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить туннель'}else{'Включить туннель'}))
+        Write-Host '  [2] Proton VPN Free: импортировать конфиг WireGuard'
+        Write-Host '  [3] Свой сервер: импортировать конфиг, ссылку или подписку'
+        Write-Host '  [4] Проверить профили и выбрать лучший'
+        Write-Host '  [5] Проверить сайты и перенести в туннель те, что не открываются через zapret'
+        Write-Host '  [6] Добавить домен в туннель вручную'
+        Write-Host '  [7] Проверить сайты из списка туннеля (как в браузере)'
+        Write-Host '  [8] Профили: показать / удалить'
         Write-Host '  [0] Назад'
         $choice=Read-Host '  Выбор'
         if($choice -eq '0'){ return }
         try {
         switch($choice){
-            '1' { Toggle-Warp }
-            '2' { [void](Find-WarpEndpoint) }
-            '3' { Update-WarpRoutes }
-            '4' {
+            '1' { if($w.Enabled){ Disable-Tunnel } else { Enable-Tunnel } }
+            '2' {
+                Write-Host ''
+                Write-Host '  Proton VPN Free - бесплатный тариф без ограничения трафика.' -ForegroundColor DarkGray
+                Write-Host '    1. Зарегистрируйтесь на https://account.protonvpn.com (нужна почта).' -ForegroundColor DarkGray
+                Write-Host '    2. Раздел "Downloads" -> "WireGuard configuration".' -ForegroundColor DarkGray
+                Write-Host '    3. Платформа: Windows (или Router). Protocol: WireGuard.' -ForegroundColor DarkGray
+                Write-Host '    4. Выберите бесплатный сервер (Free). Для Дальнего Востока ближе Япония (JP).' -ForegroundColor DarkGray
+                Write-Host '    5. Нажмите "Create" и скачайте файл .conf.' -ForegroundColor DarkGray
+                Write-Host '  Можно импортировать несколько файлов (разные страны) - скрипт выберет лучший.' -ForegroundColor DarkGray
+                $v=Read-Host '  Путь к файлу .conf'
+                if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'proton'; [void](Select-TunnelProfile) }
+            }
+            '3' {
+                Write-Host ''
+                Write-Host '  Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.' -ForegroundColor DarkGray
+                Write-Host "  Поддерживается: $($script:SupportedFormats)." -ForegroundColor DarkGray
+                $v=Read-Host '  Ссылка, путь к файлу или адрес подписки'
+                if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'custom'; [void](Select-TunnelProfile) }
+            }
+            '4' { [void](Select-TunnelProfile) }
+            '5' { Update-TunnelRoutes }
+            '6' {
                 $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
                 if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
-                    $p=Get-WarpPaths
-                    $null=Merge-ListFile $p.List @($d); Write-WarpRules; Remove-HostsDomains @($d)
-                    & ipconfig.exe /flushdns | Out-Null
-                    Write-Host "  $d добавлен в WARP." -ForegroundColor Green
+                    Add-TunnelDomains @($d)
+                    Write-Host "  $d добавлен в туннель." -ForegroundColor Green
+                    if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
                 } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
             }
-            '5' { Import-WarpConfig -Path (Read-Host '  Путь к .conf'); if((Get-WarpStatus).Enabled){ Start-Warp } }
+            '7' { Test-TunnelSites }
+            '8' {
+                $profiles=@(Show-TunnelProfiles)
+                if($profiles.Count){
+                    $n=Read-Host '  Номер профиля для удаления (Enter - ничего не удалять)'
+                    $idx=0
+                    if([int]::TryParse($n,[ref]$idx) -and $idx -ge 1 -and $idx -le $profiles.Count){
+                        $gone=$profiles[$idx-1]
+                        $rest=@($profiles | Where-Object { $_.name -ne $gone.name })
+                        Save-TunnelProfiles $rest
+                        if((Get-TunnelStatus).Active -eq $gone.name){
+                            Stop-Tunnel -Quiet
+                            Remove-Item (Get-TunnelPaths).State -Force -ErrorAction SilentlyContinue
+                        }
+                        Write-LaunchConfig
+                        Write-Host "  Профиль '$($gone.name)' удалён." -ForegroundColor Green
+                    }
+                }
+            }
         }
         } catch {
-            Set-WarpError ('Ошибка: ' + $_.Exception.Message)
+            Write-Host ('  Ошибка: ' + $_.Exception.Message) -ForegroundColor Red
         }
     }
 }
@@ -2118,9 +2600,9 @@ function Show-Menu {
         Write-Host ('  winws2: ' + $(if($st.Running){"работает (PID $($st.Pid))"}else{'остановлен'}) +
                     ' | автозапуск: ' + $(if($st.AutoStart){'включён'}else{'выключен'}) +
                     ' | доменов: ' + $st.LearnedDomains)
-        $w=Get-WarpStatus
+        $w=Get-TunnelStatus
         if($w.Enabled -or $w.Installed){
-            Write-Host ('  WARP: ' + $(if($w.Running){"работает (узел $($w.Endpoint))"}elseif($w.Starting){'запускается...'}else{'не запущен'}) + ' | сайтов в WARP: ' + $w.Domains)
+            Write-Host ('  Туннель: ' + $(if($w.Running){"работает (профиль '$($w.Active)')"}elseif($w.Starting){'запускается...'}else{'не запущен'}) + ' | профилей: ' + $w.Profiles + ' | сайтов в туннеле: ' + $w.Domains)
         }
         Write-Host ''
         Write-Host ('  [1] ' + $(if($st.Runtime){'Обновить среду zapret2'}else{'Установить среду zapret2'}))
@@ -2133,7 +2615,7 @@ function Show-Menu {
         Write-Host '  [8] Выученные домены и журналы'
         Write-Host ('  [9] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
         Write-Host '  [10] Удалить из системы' -ForegroundColor Yellow
-        Write-Host '  [11] WARP для сайтов, которые не открывает zapret'
+        Write-Host '  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)'
         Write-Host '  [0] Выход'
         $choice=Read-Host '  Выбор'
         try {
@@ -2166,7 +2648,7 @@ function Show-Menu {
                 }
                 '9' {Update-Self; if($script:ScriptVersion){Read-Host '  Нажмите Enter'}}
                 '10' {Remove-All}
-                '11' {Show-WarpMenu}
+                '11' {Show-TunnelMenu}
                 '0' {return}
             }
         } catch {Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red; Read-Host '  Нажмите Enter'}
@@ -2347,8 +2829,8 @@ function Update-DohHosts {
     $domains=@(Get-Content $listFile -ErrorAction SilentlyContinue |
                Where-Object { $_ -and $_ -notmatch '^\s*#' } |
                ForEach-Object { $_.Trim() } | Select-Object -Unique)
-    # Домены WARP разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
-    $inWarp=@(Get-ListEntries (Join-Path $script:TrustedRuntime 'lists\warp.txt'))
+    # Домены туннеля разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
+    $inWarp=@(Get-ListEntries (Join-Path $script:TrustedRuntime 'lists\tunnel.txt'))
     $domains=@($domains | Where-Object { $inWarp -notcontains $_.ToLowerInvariant() })
     if(-not $domains.Count){Write-Host '  Список доменов пуст.' -ForegroundColor Yellow; return}
     # hosts сопоставляет ТОЧНОЕ имя, поэтому www-вариант разрешаем отдельно:
@@ -2462,7 +2944,7 @@ function Remove-All {
     Write-Host ''
     Write-Host '  Полное удаление Zapret2 Windows из системы' -ForegroundColor Cyan
     Write-Host '  Будет удалено:' -ForegroundColor DarkGray
-    Write-Host '    - процессы winws2 и sing-box (WARP), если запущены' -ForegroundColor DarkGray
+    Write-Host '    - процессы winws2 и sing-box (туннель), если запущены' -ForegroundColor DarkGray
     Write-Host "    - задача планировщика '$script:TaskName' (если есть)" -ForegroundColor DarkGray
     Write-Host '    - служба ядра WinDivert' -ForegroundColor DarkGray
     Write-Host "    - каталог $script:TrustedRuntime" -ForegroundColor DarkGray
@@ -2479,7 +2961,7 @@ function Remove-All {
     }
 
     # 1) процесс
-    Write-Host '  [1/5] Остановка winws2 и WARP...' -ForegroundColor Yellow
+    Write-Host '  [1/5] Остановка winws2 и туннеля...' -ForegroundColor Yellow
     Stop-Zapret -Quiet
 
     # 2) задача автозапуска
@@ -2567,12 +3049,20 @@ switch($Action){
     'Update' {Update-Self -Force:$Force}
     'Uninstall' {Remove-All -KeepLogs:$KeepLogs -Force:$Force}
     'Purge' {Remove-All -KeepLogs:$KeepLogs -IncludeProject:$IncludeProject -Force:$Force}
-    'WarpOn' {Enable-Warp}
-    'WarpOff' {Disable-Warp}
-    'WarpScan' {Ensure-Admin; [void](Find-WarpEndpoint)}
-    'WarpRoutes' {Update-WarpRoutes}
-    'WarpStart' {Ensure-Admin; Invoke-WarpStartAction}
-    'WarpImport' {Ensure-Admin; Import-WarpConfig -Path $WarpConfig; if((Get-WarpStatus).Enabled){Start-Warp}}
+    'TunnelOn' {Enable-Tunnel}
+    'TunnelOff' {Disable-Tunnel}
+    'TunnelImport' {
+        Ensure-Admin
+        $src=$TunnelConfig; if(-not $src){ $src=$TunnelLink }
+        if(-not $src){ throw 'Укажите -TunnelConfig <файл> или -TunnelLink <ссылка>.' }
+        Import-TunnelProfiles -Text (Read-UserInput $src) -Source $(if($Proton){'proton'}else{'custom'})
+        [void](Select-TunnelProfile)
+    }
+    'TunnelSelect' {Ensure-Admin; [void](Select-TunnelProfile)}
+    'TunnelRoutes' {Update-TunnelRoutes}
+    'TunnelTest' {Test-TunnelSites}
+    'TunnelList' {[void](Show-TunnelProfiles)}
+    'TunnelStart' {Ensure-Admin; Invoke-TunnelStartAction}
     'Menu' {Show-Menu}
 }
 } catch {
