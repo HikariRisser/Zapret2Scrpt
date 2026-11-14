@@ -10,6 +10,6 @@ zapret2-*/
 *.log
 *.zapret-backup
 Zapret2Windows.ps1.*.bak
-zapret2-linux.py.*.bak
+zapret2-linux.sh.*.bak
 __pycache__/
 *.pyc

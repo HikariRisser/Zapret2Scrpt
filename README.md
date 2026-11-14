@@ -1,559 +1,271 @@
 # Zapret2 Windows / Linux system controller
 
-[Russian version](README.ru.md) · [Security audit](SECURITY.md) · [License](LICENSE)
+[Русская версия](README.ru.md) · [Security audit](SECURITY.md) · [License](LICENSE)
 
-Controller for `bol-van/zapret2` (release v1.0.6): system-wide DPI desync for
-all applications, DoH-based DNS bypass, domain auto-learning and complete
-removal from the system.
+Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
+(release v1.0.6). It does two things:
 
-Two implementations with the same feature set:
+1. **DPI bypass** for every application on the system: sites the ISP throttles
+   or resets open directly, with no speed loss.
+2. **A tunnel** for sites DPI bypass cannot help (the address is blocked
+   outright, or the service refuses visitors from Russia): through Proton VPN
+   Free or your own server. Only the sites you choose go into the tunnel.
 
-| Platform | File | Interception engine |
+| Platform | What to download | Bypass engine |
 |---|---|---|
-| Windows | [`Zapret2Windows.ps1`](Zapret2Windows.ps1) | `winws2` + WinDivert |
-| Linux | [`zapret2-linux.py`](zapret2-linux.py) | `nfqws2` + nftables/iptables |
+| Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
+| Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) and [`Zapret2Windows.ps1`](Zapret2Windows.ps1) | `winws2` + WinDivert |
 
-**Both console UIs are in Russian.**
-
-## Tunnel for sites zapret can't open (1.6.0)
-
-Menu item **[11]**. For sites that are IP-blocked or that refuse Russian
-visitors, the script runs a [sing-box](https://github.com/SagerNet/sing-box)
-tunnel to an external server. (Cloudflare WARP from 1.3–1.4 was removed: free
-WARP exits through Russian Cloudflare nodes.)
-
-- **Proton VPN Free**: import the WireGuard `.conf` from account.protonvpn.com.
-- **Your own server**: WireGuard `.conf` / `wireguard://`, `vless://` (TCP,
-  Reality, Vision, WS, gRPC, HTTP, HTTPUpgrade), `vmess://`, `trojan://`,
-  `ss://` (SIP002, legacy, 2022, obfs / v2ray-plugin), `hysteria2://`,
-  `hy2://`, `hysteria://`, `tuic://`, `anytls://`, `socks5://`, link lists,
-  subscriptions (URL or base64), sing-box JSON. Every profile is validated
-  with `sing-box check`.
-- Only the FakeIP range is routed into the TUN; DNS for listed domains goes to
-  sing-box (systemd-resolved routing domains on Linux, NRPT on Windows).
-- 1.6.0: XHTTP links and Xray JSON configs run through xray-core, used as a
-  local proxy behind sing-box (downloaded only for such profiles).
-- 1.6.0: all profiles are probed against a list of region-restricted sites
-  (`tunnel-geo` list: claude.ai, chatgpt.com, gemini.google.com by default);
-  the profile that opens the most sites wins, then a foreign exit, then latency.
-- 1.6.0: manual profile choice (`tunnel-use --profile N|name|auto`,
-  `-Action TunnelUse -TunnelProfile ...`); a manually chosen profile is pinned.
-- 1.6.0: bypass autostart also starts the tunnel.
-- 1.6.1: browsers with their own DNS-over-HTTPS bypassed the tunnel and hung.
-  The tunnel now answers NXDOMAIN for Firefox's canary domain (disables
-  default-on DoH) and zapret keeps handling tunnel-list domains that still go
-  direct; tunnel-bound traffic is excluded by the FakeIP range instead.
-
-Actions: Windows `-Action TunnelOn|TunnelOff|TunnelImport|TunnelSelect|TunnelRoutes|TunnelTest|TunnelList`,
-Linux `--action tunnel-on|tunnel-off|tunnel-import|tunnel-select|tunnel-routes|tunnel-test|tunnel-list`.
-
-Tested on Linux: all formats parse and pass `sing-box check` (1.14.4). Not
-tested: a real server connection and the Windows part.
-
-## What's new in 1.2.0: speed and coverage
-
-**Speed**
-
-- Windows: no more interception of **all incoming** 80/443 TCP and UDP 443
-  traffic (`--wf-tcp-in`, `--wf-udp-in`) or of every empty ACK
-  (`--wf-tcp-empty`). Previously every downloaded packet, including YouTube
-  video over QUIC, went through user-mode `winws2`. The strategies don't need
-  incoming data; winws2's filter constructor already captures SYN+ACK/FIN/RST
-  and HTTP redirects.
-- DoH pinning no longer writes domains to `hosts` when the **system DNS
-  already returns a working address** (verified by TLS certificate), so CDNs
-  keep picking the nearest node and pins don't go stale.
-- Linux: the generated `config` lacked `NFQWS2_TCP_PKT_OUT/IN` and
-  `NFQWS2_UDP_PKT_OUT/IN`, so the zapret2 init script created **no
-  interception rules at all**. The official values (20/10, 5/3) are now set.
-
-**Fewer sites needing a VPN**
-
-- **TLS strategy rotation** via `circular`: after 2 failures (ClientHello
-  retransmissions or DPI RST) the second-level domain moves to the next
-  strategy. Strategy 1 is the previous one.
-- **"16 KB" block**: a new profile matches connections to big hosting
-  networks (`lists\ipset-hosting.txt`) for domains that are *not* in the
-  lists and sends a fake ClientHello with a whitelisted SNI
-  (`$script:WhiteSni`, default `www.google.com`).
-- **Seed list grown** from 37 to 86 domains; updates now **merge** new
-  entries into existing lists instead of skipping existing files.
-- **IPv6 on Linux** is intercepted too (`DISABLE_IPV6=0`).
-
-Not fixable by DPI desync: geo-blocking by the services themselves (ChatGPT,
-Spotify, Notion, ...) and full IP blocks.
-
-To apply on an existing install: update the script ([9]), run install ([1])
-to rewrite the launch config and merge the lists, then start the bypass.
-Run the DoH update ([7]) while the bypass is running.
-
-## Linux version
-
-```bash
-./zapret2-linux.sh                       # menu (the launcher asks for root itself)
-./zapret2-linux.sh install               # any action: install, start, tunnel-on...
-./zapret2-linux.sh check                 # requirements check, no root
-```
-
-The `zapret2-linux.sh` launcher finds Python 3.8+ (offers to install it),
-elevates via sudo/doas/pkexec/su, opens a terminal when double-clicked and
-keeps it open on errors. After a ZIP download: `chmod +x zapret2-linux.sh`.
-
-Directly via Python:
-
-```bash
-sudo python3 zapret2-linux.py            # interactive menu
-sudo python3 zapret2-linux.py -a install # install runtime
-python3 zapret2-linux.py -a check        # check requirements
-python3 zapret2-linux.py --help
-```
-
-The menu is the same as on Windows (10 items, with start/autostart toggles).
-
-### Linux requirements
-
-| Requirement | Value | Why |
-|---|---|---|
-| **OS** | Linux, kernel with NFQUEUE | interception goes through `nfqws2` |
-| **Architecture** | x86_64, aarch64, armv7, mips, riscv64 | prebuilt zapret2 binary is used |
-| **Python** | 3.8+ | script is Python, no third-party packages |
-| **Privileges** | root (via `sudo`) | firewall rules, `/opt`, `/etc/hosts`, systemd |
-| **Firewall** | `nftables` (preferred) or `iptables` | redirect to NFQUEUE |
-| **Kernel module** | `nfnetlink_queue` | loaded automatically |
-| **systemd** | for autostart (optional) | `zapret2win` service |
-| **Internet** | first install only | zapret2 release (~9.5 MB) from GitHub |
-
-Check everything at once: `python3 zapret2-linux.py -a check` or item **[5]**.
-
-### Differences from the Windows version
-
-| | Windows | Linux |
-|---|---|---|
-| Interception | WinDivert (kernel driver) | NFQUEUE (`nfqws2` + nftables) |
-| Engine | `winws2` directly | zapret2 init script (`/opt/zapret2/init.d/sysv/zapret2`) |
-| Location | `System32\Zapret2Windows` | `/opt/zapret2` (root-owned) |
-| Autostart | scheduled task (SYSTEM) | systemd service |
-| Domain lists | `lists\*.txt` | `/opt/zapret2/ipset/zapret-hosts-*.txt` |
-| DNS flush | `ipconfig /flushdns` | `resolvectl flush-caches` / `nscd -i hosts` |
-
-Strategy logic, profiles (HTTP, TLS, QUIC, Discord voice), DoH with working-IP
-verification, script self-update and uninstall are identical to Windows.
-
-### Archive permissions caveat
-
-Python's `zipfile` does **not** restore Unix permissions from the archive, so
-the installer explicitly marks all `*.sh`, `nfqws2`, `mdig`, `ip2net` and
-`init.d/sysv/zapret2` as executable. Without that the init script will not run.
-
-### Testing status of the Linux version
-
-Development happened on Windows, so, honestly:
-
-**Verified locally (Python 3.12):**
-- syntax (`py_compile`) — clean;
-- version comparison and `VERSION` marker extraction;
-- DoH resolution across all providers plus working-IP verification
-  (`www.instagram.com` → `57.145.12.34`, dead `31.13.72.174` rejected);
-- removal of the marked `hosts` block (ours and the older project's);
-- `config` and systemd unit generation;
-- correct refusal to run on non-Linux.
-
-**Not verified (requires a Linux run):**
-- actual `nfqws2` start through the init script;
-- nftables/iptables rule creation and absence of routing loops;
-- systemd service registration and operation;
-- package installation via `apt`/`dnf`/`pacman`;
-- real DPI bypass against a specific ISP.
-
-On the target machine start with item **[5]** (requirements), then **[1]**
-(install), then **[2]** (start) and **[4]** (diagnose). If `nfqws2` does not
-start, check `systemctl status zapret2win` and `dmesg`.
-
-## Requirements
-
-On the **first run** the script checks dependencies itself and offers to
-install the missing ones. Manually: menu **[11]** (check) and **[12]** (install),
-or `-Action Check` / `-Action Deps`.
-
-### Installed automatically
-
-| Dependency | Method |
-|---|---|
-| **.NET Framework 4.x** | winget → chocolatey → direct download of the official 4.8 installer (`/q /norestart`) |
-| **TLS 1.2 for .NET** | registry keys `SchUseStrongCrypto` + `SCHANNEL\Protocols\TLS 1.2` |
-| **zapret2 release** | downloaded from GitHub (~9.5 MB) |
-| **Node.js** *(optional)* | winget / chocolatey; needed only for `tools/` |
-
-Before downloading the release the script **enables TLS 1.2** when it is off —
-otherwise the GitHub download fails on a clean system.
-
-### Cannot be installed automatically
-
-| Dependency | Why |
-|---|---|
-| **Windows PowerShell 5.1** | the script runs on it (chicken-and-egg); WMF 5.1 is retired from Microsoft's site — manual step |
-| **Administrator rights** | granted by the user via UAC |
-| **64-bit Windows** | OS reinstall |
-
-### Required
-
-| Requirement | Value | Why |
-|---|---|---|
-| **OS** | Windows 10/11, **x64** | WinDivert is a signed kernel driver; modern signatures are x64-only |
-| **PowerShell** | **Windows PowerShell 5.1** (built into Win10/11) | `.cmd` invokes `powershell.exe`; PowerShell 7 alone is not enough |
-| **.NET Framework** | 4.x | required by PowerShell and the WinDivert glue |
-| **Privileges** | **administrator** | kernel driver, `System32`, `hosts`, scheduled task |
-| **Internet** | for the first install | zapret2 release (~9.5 MB) is downloaded from GitHub; needs TLS 1.2 |
-| **Disk space** | ~100 MB | release, runtime, logs |
-| **Encoding of `Zapret2Windows.ps1`** | **UTF-8 with BOM** | without BOM PowerShell 5.1 reads it as ANSI and the script dies before starting |
-
-### Also important
-
-- **Antivirus / EDR.** WinDivert is often flagged as a hacktool. Add the project
-  folder and `winws2.exe` to exclusions, otherwise the driver fails with
-  `windivert: error opening filter: Access is denied`.
-- **Conflicting software.** Documented conflicts between WinDivert and Hyper-V,
-  WSL2, VirtualBox, third-party VPN clients and firewalls — up to BSOD.
-- **Avoid Cyrillic in the path** — recommended; some external tools break on it.
-- **Do not run two instances.** WinDivert refuses a second filter with the same
-  expression.
-
-### Optional
-
-- **Node.js** — only for the diagnostics in `tools/`.
-- **git** — only to clone; a ZIP download works too.
-
-## If the script closes instantly
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Window flashes and closes | `.ps1` has no **BOM** | save as "UTF-8 with BOM" or re-download |
-| Window flashes and closes | PowerShell older than 5.1 | install Windows Management Framework 5.1 |
-| Window flashes and closes | `.ps1` is not next to `.cmd` | keep both files in one folder |
-| `[ERROR] Script exited with code 1` | read the message above it | the window now **stays** open |
-| `windivert: error opening filter: Access is denied` | no admin rights or AV block | run as administrator, add an exclusion |
-| `Не найден исходный релиз zapret2` | no release and no internet | download the release into `zapret2-v1.0.6/` |
-
-The launcher validates the file encoding before starting and **keeps the window
-open** on any error — silent closes are gone.
+Script version: 1.7.0. **The console UI is in Russian.** The
+[Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
 
-1. Clone the repository (or unpack the ZIP).
-2. Run `Zapret2Windows.cmd` **as Administrator**.
-3. Choose **[5]** to verify requirements.
-4. Choose **[1]** to install. The zapret2 release is downloaded from GitHub
-   automatically if it is not present next to the script.
-5. Choose **[2]** to start the system-wide bypass.
+### Linux
 
-Menu items:
+One file is needed, `zapret2-linux.sh`:
+
+```bash
+sh zapret2-linux.sh
+```
+
+The script finds Python 3.8+ (and offers to install it if missing), asks for
+root and opens the menu. Then: **[5]** check requirements → **[1]** install →
+**[2]** start the bypass.
+
+The file is both a shell script and a Python program: `sh` runs the head, Python
+runs the rest. Running it through `sh` needs no executable bit.
+
+### Windows
+
+1. Put `Zapret2Windows.cmd` and `Zapret2Windows.ps1` in one folder.
+2. Run `Zapret2Windows.cmd` as administrator.
+3. **[5]** check requirements → **[1]** install → **[2]** start the bypass.
+
+The zapret2 build is downloaded from GitHub during installation.
+
+## Main menu
+
+The same on both systems.
 
 | Item | Action |
 |---|---|
-| [1] | Install or update zapret2 runtime |
-| [2] | Start / stop bypass *(toggle)* |
-| [3] | Autostart at logon: enable / disable *(toggle)* |
-| [4] | Diagnose resources |
+| [1] | Install or update the zapret2 runtime |
+| [2] | Start / stop the bypass |
+| [3] | Autostart at logon: on / off |
+| [4] | Resource diagnostics |
 | [5] | Check requirements |
 | [6] | Install missing dependencies |
-| [7] | Refresh DNS via DoH |
+| [7] | Refresh DNS over DoH |
 | [8] | Learned domains and logs |
 | [9] | Update the script |
-| [10] | Uninstall from system |
+| [10] | Remove from the system |
+| [11] | Tunnel for sites zapret cannot open |
 | [0] | Exit |
 
-Labels of **[2]** and **[3]** follow the actual state: when the bypass is
-running the item offers "Stop", otherwise "Start". Same for autostart. There is
-no separate "disable" item — one action covers both states.
+## How the bypass works
 
-## Script update (item [9])
+Interception is system-wide. There is no TLS MITM, no root certificate and no
+browser setup.
 
-Update source:
+Only the first packets of a connection go to `nfqws2`/`winws2` (Linux: 20
+outgoing and 10 incoming TCP packets, 5 and 3 for UDP; Windows: outgoing TCP
+80/443 and UDP 443 only). The rest of the traffic, video included, bypasses the
+engine, so speed is unaffected.
 
-```
-https://github.com/HikariRisser/Zapret2Scrpt
-```
-
-The script downloads `Zapret2Windows.ps1` from the `main` branch (falling back
-to `master`), compares versions and offers an update.
-
-The version lives inside the script:
-
-```powershell
-$script:ScriptVersion='1.6.1'
-```
-
-Flow:
-
-1. the remote copy is downloaded and its version is extracted;
-2. content is compared with the local file (line endings and BOM normalised);
-3. if identical — "already up to date";
-4. if the remote version is newer — the update is offered;
-5. if it is **older** or carries **no version marker** — a rollback warning is
-   printed and explicit confirmation is required;
-6. a backup `Zapret2Windows.ps1.<timestamp>.bak` is created before writing;
-7. the new file is parsed by PowerShell; on a syntax error the backup is
-   restored automatically;
-8. after a successful replacement a restart is offered.
-
-Command line:
-
-```powershell
-.\Zapret2Windows.ps1 -Action Update          # with confirmations
-.\Zapret2Windows.ps1 -Action Update -Force   # no prompts
-```
-
-**Note:** only the script itself is updated. The zapret2 runtime, domain lists
-and the autostart task are untouched — use item **[1]** for those.
-
-If the repository holds a copy without the `ScriptVersion` marker, the script
-treats it as potentially outdated and requires explicit confirmation. This
-prevents rolling back a working version to an old copy.
-
-Installation copies the architecture-matched official `winws2`, WinDivert
-driver/DLL, Cygwin runtime, Lua libraries, hostlists, and official WinDivert
-filter fragments into `runtime\winws2` and the protected directory
-`C:\Windows\System32\Zapret2Windows`.
-
-Start enables system-wide WinDivert interception. This is not a browser proxy:
-TCP/UDP traffic from all applications is eligible for interception.
-
-Command-line equivalents:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Install
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Start
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Status
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Diagnose
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action DohHosts
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Stop
-powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action Uninstall
-```
-
-## What is implemented
-
-- official x64/x86 release selection based on Windows architecture;
-- WinDivert interception of **outgoing** TCP 80/443 and UDP 443 only
-  (incoming SYN+ACK/FIN/RST and HTTP redirects are added by winws2 itself);
-- official `zapret-lib.lua`, `zapret-antidpi.lua` and `zapret-auto.lua` from the same release;
-- HTTP strategy: fake + multisplit;
-- TLS strategy: **automatic rotation of 4 strategies** (`circular`) per domain;
-- **hosting profile** (Cloudflare, Hetzner, OVH, AWS CloudFront,
-  DigitalOcean) against the "16 KB" block — fake ClientHello with a whitelisted SNI;
-- QUIC strategy: fake on `quic_initial`;
-- **Discord voice/media profile**: fake on `discord_ip_discovery`, `stun`,
-  `wireguard_initiation`, `wireguard_cookie` (official zapret2 scheme from
-  `init.d/custom.d.examples.*/50-discord-media`, `50-stun4all`, `50-wg4all`);
-- official Discord media, STUN, and WireGuard raw filter fragments;
-- static hostlist plus zapret2 autohostlist feedback;
-- **DNS over DoH** for DNS-level blocks (marked block in `hosts`, removed by
-  `Uninstall`);
-- **full uninstall** (process, task, kernel service, runtime directory, hosts);
-- logs, PID tracking, safe stop, status, diagnostics, and autostart;
-- no TLS MITM, no root certificate, no browser-specific configuration.
-
-The runtime starts with a conservative seed list. zapret2's autohostlist
-learns domains when its failure detector sees retransmissions/RST/insufficient
-responses. The learned list is stored in:
-
-```text
-runtime\winws2\lists\autohostlist.txt
-```
-
-## Discord voice
-
-Voice uses a different transport than the web client: a UDP media path plus a
-WebSocket gateway for signaling. The controller therefore has a dedicated 4th
-profile that desyncs `discord_ip_discovery`, `stun`, and WireGuard payloads, and
-the WinDivert capture includes the official media/UDP fragments.
-
-Verified on this host:
-
-| check | result |
+| Traffic | What is applied |
 |---|---|
-| HTTPS API (`/api/v9/gateway`) | 200 |
-| HTTPS API (`/api/v9/voice/regions`) | 401 (reachable; login required) |
-| WSS voice gateway `gateway.discord.gg` | Hello `op=10`, heartbeat present |
-| UDP STUN binding (Google / Cloudflare) | `0x0101` success, mapped address returned |
-| Profile on `discord_ip_discovery` (debug) | `profile 4 matches` → `fake_4_1 desync` |
-| Profile on `stun` (debug) | `fake_4_1 : payload_type 'stun' satisfy filter` |
+| HTTP | `fake` + `multisplit` |
+| TLS, listed domains | four strategies rotated per domain by the `circular` orchestrator: after two failures the domain moves to the next one |
+| TLS, large hosting subnets | fake ClientHello with a whitelisted SNI against the cut-off after ~16 KB |
+| QUIC | `fake` on `quic_initial` |
+| Discord voice, STUN, WireGuard | `fake` on `discord_ip_discovery`, `stun`, WireGuard handshake |
 
-Debug trace for a synthetic 74-byte IP-discovery packet on port 50000:
-
-```text
-UDP: len=74 : 00 01 00 46 ...
-packet contains discord_ip_discovery payload
-discovered l7 protocol
-desync profile 4 (noname) matches
-* lua 'fake_4_1' : payload_type 'discord_ip_discovery' satisfy filter
-* lua 'fake_4_1' : desync
-```
-
-**Limitation:** a full voice session (joining a channel with two-way audio)
-cannot be verified without a logged-in Discord client, because the real voice
-endpoint is only issued after authentication. All measurable transports were
-checked: signaling (WSS), the API, and the UDP media path, plus proof that the
-voice profile actually fires.
-
-## Security
-
-Live resources (Lua, lists, filters and the kernel driver) are placed in
-`C:\Windows\System32\Zapret2Windows`, where ordinary users have read-only
-access. This is deliberate: the project working folder may be writable by other
-users, while `winws2` executes Lua inside a process running with
-administrator/SYSTEM rights and kernel-driver access. See
-[SECURITY.md](SECURITY.md) for the full threat review, what was fixed, and what
-remains.
-
-Before enabling autostart, move `Zapret2Windows.ps1` itself into a directory
-that ordinary users cannot write to; otherwise the SYSTEM task stays a
-privilege-escalation vector.
-
-## Uninstall
-
-Menu item **[9]** (or `-Action Uninstall`) removes the project from the system
-in five steps:
-
-| Step | Removed |
-|---|---|
-| 1/5 | `winws2` process |
-| 2/5 | `Zapret2Windows` scheduled task (autostart) |
-| 3/5 | `WinDivert` kernel service |
-| 4/5 | `C:\Windows\System32\Zapret2Windows` protected directory |
-| 5/5 | marked block in `hosts` (ours and the one from the older project) |
-
-It then prints a leftover check for every component. The command is
-idempotent. A `hosts.zapret-backup` copy is created before editing `hosts`.
-
-Variants:
-
-```powershell
-.\Zapret2Windows.ps1 -Action Purge -IncludeProject   # also remove project runtime
-.\Zapret2Windows.ps1 -Action Uninstall -KeepLogs     # keep a copy of logs
-.\Zapret2Windows.ps1 -Action Uninstall -Force        # no confirmation prompt
-```
-
-**Not touched:** certificate store, other files in `System32`, unrelated `hosts`
-entries, the project folder (unless `-IncludeProject`).
+The seed list has 86 domains; zapret2's autohostlist adds domains on which it
+sees retransmissions or resets. Updating the runtime (item [1]) appends new seed
+domains and keeps manual edits and learned domains.
 
 ## DNS over DoH
 
-DPI desync cannot help when the ISP returns no IP at all (DNS block):
-`youtube.com` and `rutracker.org` simply do not resolve. The controller
-therefore resolves names over DoH (Cloudflare, Google, Quad9) and writes the
-result into `hosts` as a marked block:
+Item **[7]** resolves domains through DoH (Cloudflare, Google, Quad9) and writes
+them to `hosts` in a marked block, removed on uninstall. Only domains for which
+the system DNS returns a non-working address are pinned, and every candidate
+address is verified with a connection to port 443 before it is written. Tunnel
+domains are never pinned.
+
+## Tunnel
+
+Item **[11]**. A [sing-box](https://github.com/SagerNet/sing-box) tunnel
+(v1.14.4, downloaded on first use) to an external server.
+
+### Servers
+
+- **Proton VPN Free**: import the WireGuard `.conf` created at
+  account.protonvpn.com (Downloads → WireGuard configuration).
+- **Your own server**: a link, a file path or a subscription URL.
+
+| Format | Accepted |
+|---|---|
+| WireGuard | `.conf` file, `wireguard://` |
+| VLESS | `vless://` — TCP, Reality, XTLS Vision, WebSocket, gRPC, HTTP, HTTPUpgrade, XHTTP |
+| VMess | `vmess://` (base64 JSON and parameter form) |
+| Trojan | `trojan://` |
+| Shadowsocks | `ss://` (SIP002, legacy, 2022, obfs and v2ray-plugin) |
+| Hysteria | `hysteria2://`, `hy2://`, `hysteria://` |
+| TUIC, AnyTLS, SOCKS | `tuic://`, `anytls://`, `socks5://`, `socks4://` |
+| Several servers | link list, subscription by `https://…` URL or base64 (first 40 are taken) |
+| JSON | sing-box outbound/endpoint or config; Xray outbound or config |
+
+AmneziaWG is not supported.
+
+sing-box handles the TUN, DNS and almost every protocol. XHTTP links and Xray
+configs run through [xray-core](https://github.com/XTLS/Xray-core), used as a
+local proxy behind sing-box and downloaded only for such profiles. Every profile
+is validated by its engine before it is saved.
+
+### Design
+
+- Only the FakeIP range (`10.249.0.0/16`) is routed into the TUN. Everything
+  else bypasses sing-box and goes through zapret.
+- DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
+  routing domains on Linux, an NRPT rule on Windows) and get FakeIP addresses.
+- zapret leaves tunnel-bound traffic and the connection to the server alone.
+- TUN addresses, the FakeIP range and the routing table are non-default, so the
+  tunnel coexists with other sing-box clients.
+
+### Choosing a profile
+
+- **Automatic** (tunnel menu [5]): every profile is probed for exit country,
+  latency and a list of region-restricted sites (claude.ai, chatgpt.com,
+  gemini.google.com by default, editable). Order: more sites open → foreign exit
+  → lower latency.
+- **Manual** (tunnel menu [4]): the chosen profile is pinned and automatic
+  selection will not replace it.
+
+### Browsers and DNS
+
+The tunnel relies on the system DNS. While it runs, Firefox is told to disable
+its default-on DNS over HTTPS (canary domain `use-application-dns.net`); DoH
+enabled by hand must be turned off in the browser. Tunnel-list domains stay
+under zapret, which acts as a fallback when a request still goes direct.
+
+### Autostart
+
+An enabled tunnel starts in the background right after the bypass and stops
+with it. Bypass autostart also starts the tunnel.
+
+## Commands
+
+Linux: `sh zapret2-linux.sh <action>`. Windows:
+`powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1 -Action <action>`.
+
+| Action | Linux | Windows |
+|---|---|---|
+| Install / update runtime | `install` | `Install` |
+| Start / stop | `start` / `stop` | `Start` / `Stop` |
+| Status | `status` | `Status` |
+| Check requirements | `check` | `Check` |
+| Install dependencies | `deps` | `Deps` |
+| Refresh DoH | `doh` | `DohHosts` |
+| Diagnostics | `diagnose` | `Diagnose` |
+| Troubleshooting report | `report` | — |
+| Update the script | `update` | `Update` |
+| Remove | `uninstall` | `Uninstall`, `Purge` |
+| Tunnel on / off | `tunnel-on` / `tunnel-off` | `TunnelOn` / `TunnelOff` |
+| Add a server | `tunnel-import --config FILE` or `--link LINK` (`--proton`) | `TunnelImport -TunnelConfig FILE` or `-TunnelLink LINK` (`-Proton`) |
+| Pick the best profile | `tunnel-select` | `TunnelSelect` |
+| Pick a profile by hand | `tunnel-use --profile N\|name\|auto` | `TunnelUse -TunnelProfile N\|name\|auto` |
+| Region check | `tunnel-geo` | `TunnelGeo` |
+| Move failing sites to the tunnel | `tunnel-routes` | `TunnelRoutes` |
+| Test tunnel sites | `tunnel-test` | `TunnelTest` |
+| List profiles | `tunnel-list` | `TunnelList` |
+
+## Requirements
+
+**Linux:** a kernel with NFQUEUE; x86_64, aarch64, armv7, mips or riscv64;
+Python 3.8+ (standard library only); root; nftables or iptables; systemd for
+autostart and the tunnel; systemd-resolved for the tunnel.
+
+**Windows:** Windows 10 or 11 x64; Windows PowerShell 5.1; .NET Framework 4.x
+(installed automatically); administrator rights; the `.ps1` must stay UTF-8
+with BOM. WinDivert is often flagged by antivirus software and conflicts with
+Hyper-V, WSL2, VirtualBox and third-party VPN clients.
+
+## Troubleshooting
+
+- **Linux:** `sh zapret2-linux.sh report` writes a report to `/tmp` (no keys or
+  passwords). Tunnel log: `journalctl -u zapret2win-tunnel`.
+- **Windows:** the launcher keeps the window open on errors. `windivert: error
+  opening filter: Access is denied` means missing rights or an antivirus block.
+  Tunnel logs: `logs\sing-box*.log`.
+- A tunnel site that does not open in the browser: restart the browser and turn
+  off its DNS over HTTPS.
+
+## Update and removal
+
+Item **[9]** downloads the script from the `main` branch, compares versions,
+makes a backup and checks the new file's syntax before replacing the old one.
+
+Item **[10]** removes processes, autostart, the WinDivert driver service
+(Windows), the runtime directory (`/opt/zapret2`,
+`C:\Windows\System32\Zapret2Windows`) and the `hosts` block.
+
+**Linux, upgrading from versions before 1.7.0:** the Linux version used to be
+two files. Download the new `zapret2-linux.sh`; the old `zapret2-linux.py` can
+be deleted. The `zapret2-linux.py` in this repository is a transitional stub
+for the updater of old versions and need not be downloaded.
+
+## Files
+
+| | Linux (`/opt/zapret2/`) | Windows (`C:\Windows\System32\Zapret2Windows\`) |
+|---|---|---|
+| Bypass domains | `ipset/zapret-hosts-user.txt` | `lists\blocked.txt` |
+| Learned domains | `ipset/zapret-hosts-auto.txt` | `lists\autohostlist.txt` |
+| Exclusions | `ipset/zapret-hosts-user-exclude.txt` | `lists\exclude.txt` |
+| Hosting subnets | `ipset/zapret2win-ip-hosting.txt` | `lists\ipset-hosting.txt` |
+| Tunnel sites | `ipset/zapret2win-hosts-tunnel.txt` | `lists\tunnel.txt` |
+| Region-check sites | `ipset/zapret2win-geo-sites.txt` | `lists\tunnel-geo.txt` |
+| Tunnel profiles and binaries | `tunnel/` | `tunnel\` |
+
+## Security and limits
+
+Runtime files live in a directory writable only by the administrator, because
+the engines run Lua with elevated rights; see [SECURITY.md](SECURITY.md). On
+Windows, move `Zapret2Windows.ps1` to a protected directory before enabling
+autostart: the scheduled task runs it as SYSTEM.
+
+- DPI bypass is not a VPN; blocked addresses and regional refusals need the
+  tunnel.
+- Proton VPN is blocked in Russia and may fail to connect; a DPI-resistant
+  protocol on your own server (VLESS + Reality) is the fallback.
+- Profile keys are stored in `tunnel/profiles.json` (mode 600 on Linux).
+
+## Testing status
+
+- **Linux, on a real machine (Ubuntu 26.10):** the bypass works; the tunnel
+  starts with VLESS + Reality profiles; automatic profile selection runs.
+- **Linux, in a test environment:** all server formats pass validation by real
+  sing-box 1.14.4 and xray-core; the sing-box → xray-core → VLESS + XHTTP chain
+  works on localhost; bypass parameters pass `nfqws2 --dry-run`; single-file
+  launch through `sh`, `dash` and `bash`.
+- **Not tested:** the Windows tunnel code has never been run, and after the
+  latest changes `Zapret2Windows.ps1` has not even been parsed by PowerShell;
+  tunnel autostart at boot on Linux; region detection against real site
+  responses; Firefox reacting to the DoH canary.
+
+## Project layout
 
 ```
-# --- Zapret2Windows DoH begin ---
-172.67.182.196	rutracker.org
-...
-# --- Zapret2Windows DoH end ---
+zapret2-linux.sh      Linux controller, single file (sh + Python)
+zapret2-linux.py      transitional stub for updating from versions before 1.7.0
+Zapret2Windows.ps1    Windows controller
+Zapret2Windows.cmd    Windows launcher (asks for administrator rights)
+README.md / README.ru.md / SECURITY.md / LICENSE
+tools/                optional Node.js diagnostics (probe-h2.js, probe-voice.js)
 ```
 
-Runs automatically on `Install`; manually via menu **[10]** or
-`-Action DohHosts`. Note that `hosts` matches exact names, so `www` variants
-are resolved separately. Removed completely by `Uninstall`.
-
-### Working-IP verification (important)
-
-DoH often returns a **dead edge address** — typical for Meta/Instagram:
-`31.13.72.174` does not answer while `57.145.12.34` works. Pinning the first
-returned address in `hosts` **breaks** the site even if it worked before.
-The address is therefore verified before writing:
-
-1. A records are collected from **all DoH providers** (Cloudflare, Google,
-   Quad9) — different CDN nodes return different addresses, some of them alive;
-2. CNAME targets are added (`www.instagram.com` →
-   `z-p42-instagram.c10r.instagram.com`);
-3. for `www.X` the parent `X` addresses are added;
-4. every candidate is checked with a **real TCP connection to port 443**;
-5. only a confirmed working address is written to `hosts`.
-
-If no address works, the domain is **not pinned** and stays with system DNS.
-That is better than hardcoding a dead IP.
-
-Such domains are reported as "no working IP" (e.g. `ytimg.com`, `twimg.com`,
-`githubassets.com` — they are usually served via CNAME and work without a
-separate entry).
-
-## Important limits
-
-This is a system-wide DPI desync controller, not a VPN. It can handle traffic
-that is reachable at the IP/TCP level but interfered with by DPI. It cannot
-restore a route when every destination IP is filtered, and it cannot turn a
-local SOCKS proxy into a transparent system tunnel. Full IP/routing blocks and
-arbitrary UDP services require an external system route such as WireGuard,
-Wintun/TUN, or another VPN endpoint.
-
-HTTP/2 is deliberately not rewritten. The release supports TLS ClientHello
-reassembly for desync, but stock `tls_mod` has no ALPN modification. Unsafe
-Lua packet replacement can invalidate TCP sequence/reassembly and break TLS.
-
-The script therefore does not promise that every site or protocol will work:
-its diagnostic output separates TCP reachability, HTTP result, and WinDivert
-startup errors. A `200` from one HTTP request is not proof that every native
-application, WebSocket, QUIC, or UDP media flow works.
-
-## Project structure
-
-```
-zapret2-windows/
-├── Zapret2Windows.ps1   — controller (install, start, diagnose, uninstall)
-├── Zapret2Windows.cmd   — launcher that requests administrator rights
-├── README.md            — documentation (English)
-├── README.ru.md         — documentation (Russian)
-├── SECURITY.md          — security audit: threats and what was fixed
-├── LICENSE              — MIT
-├── .gitignore
-├── tools/               — optional diagnostics
-│   ├── probe-h2.js      — HTTP/2 versus HTTP/1.1
-│   └── probe-voice.js   — Discord voice transport
-├── runtime/             — created on install (not in git)
-└── zapret2-v1.0.6/      — upstream release, downloaded on install (not in git)
-```
-
-## Diagnostics (tools/)
-
-Optional Node.js scripts that help locate the failing layer:
-
-```bash
-node tools/probe-h2.js discord.com rutracker.org www.youtube.com
-node tools/probe-voice.js
-```
-
-`probe-h2.js` compares HTTP/2 and HTTP/1.1 — it shows whether HTTP/2
-specifically breaks. `probe-voice.js` checks Discord voice signaling (HTTPS
-API, WSS gateway) and the UDP media path (STUN).
-
-## Source and release
-
-Upstream repository: <https://github.com/bol-van/zapret2>
-
-The zapret2 build is **not stored in the repository** — it is downloaded from
-the official release during installation (or placed manually into
-`zapret2-v1.0.6/`). Keep `winws2.exe`, WinDivert files, and Lua libraries from
-the same release together; mismatched versions break compatibility
-(`NFQWS2_COMPAT_VER`).
-
-## Publishing to GitHub
-
-The repository is ready: `.gitignore`, `LICENSE`, documentation, and a clean
-split between code and generated files. The zapret2 build and `runtime/` are
-**not** committed — they are downloaded/created during installation.
-
-```bash
-git init
-git add .
-git commit -m "Zapret2 Windows: system-wide DPI desync controller"
-git branch -M main
-git remote add origin https://github.com/<user>/<repo>.git
-git push -u origin main
-```
-
-Tracked: `.gitignore`, `LICENSE`, `README.md`, `README.ru.md`, `SECURITY.md`,
-`Zapret2Windows.cmd`, `Zapret2Windows.ps1`, `tools/probe-h2.js`,
-`tools/probe-voice.js`.
-Ignored: `runtime/`, `zapret2-v1.0.6/`, `*.log`, `*.zapret-backup`.
+The zapret2 build, sing-box and xray-core are not stored in the repository;
+they are downloaded from official releases.
 
 ## License
 
