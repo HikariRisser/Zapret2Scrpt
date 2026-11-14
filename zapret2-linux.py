@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.py"
 UPDATE_BRANCH = "main"
@@ -2227,18 +2227,39 @@ def build_warp_config(endpoint):
     }
 
 
+WARP_TRACE_LAST = ""   # чем закончилась последняя проверка туннеля
+
+
 def warp_trace(port, timeout=5.0):
-    """http://1.1.1.1/cdn-cgi/trace через прокси sing-box: мс или -1."""
+    """
+    Запрос cdn-cgi/trace к 1.1.1.1 через прокси sing-box: мс или -1.
+    Ответ «warp=on» подтверждает, что трафик идёт через WARP.
+
+    Прокси задан и для http, и для https: 1.1.1.1 на 80-м порту может
+    ответить перенаправлением на https, и без https-прокси urllib пошёл бы
+    по нему НАПРЯМУЮ, мимо туннеля (ответ «warp=off» при рабочем туннеле).
+    """
+    global WARP_TRACE_LAST
+    proxy = f"http://127.0.0.1:{port}"
     opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}"}))
-    t0 = time.monotonic()
-    try:
-        with opener.open("http://1.1.1.1/cdn-cgi/trace", timeout=timeout) as r:
-            text = r.read(4096).decode("utf-8", "replace")
-        if re.search(r"warp=(on|plus)", text):
-            return int((time.monotonic() - t0) * 1000)
-    except Exception:
-        pass
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    for url in ("https://1.1.1.1/cdn-cgi/trace", "http://1.1.1.1/cdn-cgi/trace"):
+        t0 = time.monotonic()
+        try:
+            with opener.open(url, timeout=timeout) as r:
+                text = r.read(4096).decode("utf-8", "replace")
+            m = re.search(r"warp=(\w+)", text)
+            if m and m.group(1) in ("on", "plus"):
+                WARP_TRACE_LAST = f"{url}: warp={m.group(1)}"
+                return int((time.monotonic() - t0) * 1000)
+            WARP_TRACE_LAST = (f"{url}: ответ получен, но " +
+                               (f"warp={m.group(1)}" if m else "без поля warp")
+                               + " — трафик идёт не через WARP")
+        except Exception as e:
+            WARP_TRACE_LAST = f"{url}: {e.__class__.__name__}: {e}"
+            if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e):
+                break   # туннель не отвечает — второй адрес не поможет
     return -1
 
 
@@ -2451,6 +2472,9 @@ def file_tail(path, lines=12):
 
 def set_warp_error(message, details=()):
     """Запоминает причину сбоя: её видно в меню WARP, а не только при запуске."""
+    details = list(details)
+    if WARP_TRACE_LAST and ("узел" in message.lower() or "трафик" in message):
+        details.insert(0, f"Проверка туннеля: {WARP_TRACE_LAST}")
     err(message)
     for ln in details:
         print(_c(C.GRAY, f"    {ln}"))
