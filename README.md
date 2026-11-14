@@ -15,35 +15,29 @@ Two implementations with the same feature set:
 
 **Both console UIs are in Russian.**
 
-## WARP for sites zapret can't open (1.3.0)
+## Tunnel for sites zapret can't open (1.5.0)
 
-Menu item **[11]**. For sites that are IP-blocked or otherwise beyond DPI
-desync, the script brings up **Cloudflare WARP** via
-[sing-box](https://github.com/SagerNet/sing-box) v1.14.4 (downloaded on first use).
+Menu item **[11]**. For sites that are IP-blocked or that refuse Russian
+visitors, the script runs a [sing-box](https://github.com/SagerNet/sing-box)
+tunnel to an external server. (Cloudflare WARP from 1.3–1.4 was removed: free
+WARP exits through Russian Cloudflare nodes.)
 
-- sing-box creates a TUN adapter but routes **only the FakeIP range**
-  (`198.18.0.0/15`) into it; all other traffic bypasses sing-box and keeps
-  going through zapret at full speed.
-- sing-box answers system DNS: domains from the WARP list get FakeIPs and go
-  into the WireGuard tunnel; their real addresses are resolved via `1.1.1.1`
-  inside the tunnel.
-- **Automatic Cloudflare node selection**: a probe tunnel to candidates in the
-  WARP subnets on official ports (2408, 500, 1701, 4500), latency measured via
-  `1.1.1.1/cdn-cgi/trace`; the node is re-verified on every start and
-  replaced if dead.
-- **Automatic zapret-vs-WARP split**: WARP → [3] checks every domain in the
-  zapret lists directly (reading 64 KB to catch the "16 KB" cut); those that
-  fail but work through WARP are moved to `lists\warp.txt`.
-- Free WARP device registration (protocol from wgcf); if it fails, import a
-  WireGuard config from wgcf/WarpGen (WARP → [5]).
+- **Proton VPN Free**: import the WireGuard `.conf` from account.protonvpn.com.
+- **Your own server**: WireGuard `.conf` / `wireguard://`, `vless://` (TCP,
+  Reality, Vision, WS, gRPC, HTTP, HTTPUpgrade), `vmess://`, `trojan://`,
+  `ss://` (SIP002, legacy, 2022, obfs / v2ray-plugin), `hysteria2://`,
+  `hy2://`, `hysteria://`, `tuic://`, `anytls://`, `socks5://`, link lists,
+  subscriptions (URL or base64), sing-box JSON. Every profile is validated
+  with `sing-box check`.
+- Only the FakeIP range is routed into the TUN; DNS for listed domains goes to
+  sing-box (systemd-resolved routing domains on Linux, NRPT on Windows).
+- All profiles are probed; a foreign exit is preferred, then the lowest latency.
 
-Actions: Windows `-Action WarpOn|WarpOff|WarpScan|WarpRoutes|WarpImport`,
-Linux `--action warp-on|warp-off|warp-scan|warp-routes|warp-import`.
+Actions: Windows `-Action TunnelOn|TunnelOff|TunnelImport|TunnelSelect|TunnelRoutes|TunnelTest|TunnelList`,
+Linux `--action tunnel-on|tunnel-off|tunnel-import|tunnel-select|tunnel-routes|tunnel-test|tunnel-list`.
 
-Limits: WARP often exits via Russian Cloudflare PoPs, so service-side
-geo-blocks are not reliably bypassed. Configs pass `sing-box check` with the
-real 1.14.4 binary and FakeIP behaviour was verified; WARP registration, the
-WireGuard tunnel and the Windows part were not tested in the sandbox.
+Tested on Linux: all formats parse and pass `sing-box check` (1.14.4). Not
+tested: a real server connection and the Windows part.
 
 ## What's new in 1.2.0: speed and coverage
 
@@ -86,7 +80,7 @@ Run the DoH update ([7]) while the bypass is running.
 
 ```bash
 ./zapret2-linux.sh                       # menu (the launcher asks for root itself)
-./zapret2-linux.sh install               # any action: install, start, warp-on...
+./zapret2-linux.sh install               # any action: install, start, tunnel-on...
 ./zapret2-linux.sh check                 # requirements check, no root
 ```
 
@@ -275,7 +269,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.4.7'
+$script:ScriptVersion='1.5.0'
 ```
 
 Flow:
