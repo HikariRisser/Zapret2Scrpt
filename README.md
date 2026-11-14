@@ -275,7 +275,7 @@ to `master`), compares versions and offers an update.
 The version lives inside the script:
 
 ```powershell
-$script:ScriptVersion='1.4.6'
+$script:ScriptVersion='1.4.7'
 ```
 
 Flow:
