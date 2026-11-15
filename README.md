@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Script version: 1.8.1. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
+Script version: 1.8.2. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
@@ -137,6 +137,12 @@ is validated by its engine before it is saved.
 - The Telegram app connects to its servers by IP, without DNS, so with the
   tunnel on it always goes through the tunnel. Without the tunnel the Telegram
   app does not work: zapret does not handle its traffic.
+- Discord media servers on Cloudflare (`104.29.0.0/16`, used by Go Live
+  streams and increasingly by voice) are reached by IP, without DNS. Some ISPs
+  cut UDP to them about a second into the connection, which zapret cannot fix.
+  Tunnel menu item [6] tests this (an IP discovery packet, ~3 s of traffic,
+  another IP discovery packet) and, if the server stops answering, routes UDP to
+  these addresses through the tunnel (TCP still goes direct through zapret).
 - DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
   routing domains on Linux, an NRPT rule on Windows) and get FakeIP addresses.
 - zapret leaves tunnel-bound traffic and the connection to the server alone.

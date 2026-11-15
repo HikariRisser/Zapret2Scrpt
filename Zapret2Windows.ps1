@@ -83,7 +83,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.1'
+$script:ScriptVersion='1.8.2'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1342,6 +1342,14 @@ $script:TelegramCidr6=@(
     '2001:b28:f23d::/48','2001:b28:f23f::/48','2001:67c:4e8::/48',
     '2001:b28:f23c::/48','2a0a:f280::/32'
 )
+# Медиасерверы Discord в сети Cloudflare (трансляции, всё больше и голос).
+# Discord шлёт на них UDP по адресу из сигнального соединения, без DNS, поэтому
+# список доменов туннеля их не касается. У части провайдеров UDP к ним обрезается
+# через ~1 с после начала соединения, и zapret это не исправляет: тогда (по
+# итогам проверки) в туннель направляется UDP к этим адресам, TCP идёт напрямую.
+$script:DiscordMediaCidr4=@('104.29.0.0/16')
+# Серверы для проверки: отвечают на пакет определения IP без входа в аккаунт.
+$script:DiscordProbeServers=@(@('104.29.149.69',19298),@('104.29.155.188',19298))
 $script:TunnelIpsetHeader=@(
     '# Адреса, которые zapret не трогает: трафик в туннель (FakeIP, Telegram) и серверы туннеля.',
     '# Файл создаётся автоматически.',
@@ -1410,6 +1418,7 @@ function Get-TunnelPaths {
         Servers=Join-Path $script:TrustedRuntime 'lists\ipset-tunnel-servers.txt'
         GeoList=Join-Path $script:TrustedRuntime 'lists\tunnel-geoblock.txt'
         GeoListOff=Join-Path $d 'geolist.off'
+        DiscordMedia=Join-Path $d 'discord-media.on'
     }
 }
 
@@ -2434,7 +2443,9 @@ function Write-TunnelConfig {
     Write-TunnelRulesFileOnly
     $parts=Get-ProfileParts $Prof
     $fake=[ordered]@{ type='fakeip'; tag='fakeip'; inet4_range=$script:TunnelFake4 }
-    $tunAddr=@($script:TunnelAddr4); $tunRoute=@($script:TunnelFake4)+$script:TelegramCidr4
+    # Медиасерверы Discord - в туннель, только если так решила проверка трансляций.
+    $discord=@(); if(Test-Path -LiteralPath $p.DiscordMedia){ $discord=@($script:DiscordMediaCidr4) }
+    $tunAddr=@($script:TunnelAddr4); $tunRoute=@($script:TunnelFake4)+$script:TelegramCidr4+$discord
     if(Test-Ipv6Available){
         $fake.inet6_range=$script:TunnelFake6
         $tunAddr+=$script:TunnelAddr6; $tunRoute+=@($script:TunnelFake6)+$script:TelegramCidr6
@@ -2459,7 +2470,8 @@ function Write-TunnelConfig {
                 type='tun'; tag='tun-in'; interface_name=$script:TunnelIf
                 address=@($tunAddr); mtu=1400
                 auto_route=$true; strict_route=$false; stack='gvisor'
-                # В TUN идут только FakeIP и подсети Telegram: остальной трафик мимо sing-box.
+                # В TUN идут только FakeIP, подсети Telegram и (если проверка так
+                # решила) медиасерверы Discord: остальной трафик мимо sing-box.
                 route_address=@($tunRoute)
             },
             [ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:TunnelMixedPort }
@@ -2468,10 +2480,16 @@ function Write-TunnelConfig {
         route=[ordered]@{
             rule_set=@([ordered]@{ type='local'; tag='tunnel-domains'; format='source'; path=$p.Rules })
             rules=@(
-                [ordered]@{ action='sniff' },
-                [ordered]@{ protocol='dns'; action='hijack-dns' },
-                [ordered]@{ inbound=@('tun-in','mixed-in'); action='resolve'; server='tunnel-dns' },
-                [ordered]@{ inbound=@('tun-in','mixed-in'); outbound='tunnel' }
+                @(
+                    [ordered]@{ action='sniff' },
+                    [ordered]@{ protocol='dns'; action='hijack-dns' }
+                )+@(
+                    # Из адресов Discord в туннель идёт только UDP (медиа); TCP к ним - напрямую.
+                    if($discord.Count){ [ordered]@{ inbound=@('tun-in'); network='tcp'; ip_cidr=@($discord); outbound='direct' } }
+                )+@(
+                    [ordered]@{ inbound=@('tun-in','mixed-in'); action='resolve'; server='tunnel-dns' },
+                    [ordered]@{ inbound=@('tun-in','mixed-in'); outbound='tunnel' }
+                )
             )
             final='direct'
             auto_detect_interface=$true
@@ -2996,7 +3014,7 @@ function Enable-Tunnel {
     Start-Tunnel
     if((Get-TunnelStatus).Running){
         $a='y'
-        if($Action -eq 'Menu'){ $a=Read-Host '  Проверить сайты из списков и перенести в туннель те, что не открываются через zapret? (Y/n)' }
+        if($Action -eq 'Menu'){ $a=Read-Host '  Проверить сайты из списков и трансляции Discord и перенести в туннель то, что не работает через zapret? (Y/n)' }
         if($a -notmatch '^\s*[nNнН]'){ Update-TunnelRoutes }
     }
 }
@@ -3086,15 +3104,131 @@ function Add-TunnelDomains {
     & ipconfig.exe /flushdns | Out-Null
 }
 
-function Update-TunnelRoutes {
+function Test-DiscordProbeOne {
     <#
-      "Туннель там, где не справляется zapret": проверяем домены из списков
-      zapret напрямую; не открывшиеся проверяем через туннель и, если там они
-      работают, переносим в lists\tunnel.txt.
+      Проверка медиасервера Discord так, как его видит трансляция: пакет
+      определения IP (на него сервер отвечает без входа в аккаунт), затем ~3 с
+      потока по 1000 байт, затем снова пакет определения IP.
+      'ok' - ответ есть и в начале, и после потока; 'blocked' - ответ только в
+      начале (соединение обрезается, как у трансляций); $null - сервер не ответил.
     #>
-    Ensure-Admin
+    param([string]$Ip,[int]$Port)
+    $rng=[Security.Cryptography.RandomNumberGenerator]::Create()
+    $disc=New-Object byte[] 74
+    $disc[1]=1; $disc[3]=70
+    $ssrc=New-Object byte[] 4; $rng.GetBytes($ssrc); [Array]::Copy($ssrc,0,$disc,4,4)
+    $u=New-Object Net.Sockets.UdpClient
+    try {
+        $u.Client.ReceiveTimeout=1500
+        $u.Connect($Ip,$Port)
+        $ask={
+            param($tries)
+            for($i=0;$i -lt $tries;$i++){
+                try {
+                    [void]$u.Send($disc,$disc.Length)
+                    $ep=New-Object Net.IPEndPoint([Net.IPAddress]::Any,0)
+                    [void]$u.Receive([ref]$ep)
+                    return $true
+                } catch {}
+            }
+            return $false
+        }
+        if(-not (& $ask 2)){ return $null }
+        $buf=New-Object byte[] 1000
+        for($i=0;$i -lt 300;$i++){
+            $rng.GetBytes($buf)
+            try { [void]$u.Send($buf,$buf.Length) } catch {}
+            Start-Sleep -Milliseconds 10
+        }
+        if(& $ask 3){ return 'ok' }
+        return 'blocked'
+    } catch { return $null }
+    finally { $u.Close() }
+}
+
+function Test-DiscordStreamProbe {
+    <#
+      Может ли zapret обеспечить трансляции Discord: 'ok', 'blocked' или $null
+      (проверить не удалось). Проверка идёт напрямую, мимо туннеля: если адреса
+      Discord уже направлены в туннель, на время проверки для сервера проверки
+      ставится маршрут /32 через основной шлюз (он точнее маршрута туннеля).
+    #>
     $p=Get-TunnelPaths
+    $gw=$null
+    if((Test-Path -LiteralPath $p.DiscordMedia) -and (Get-TunnelStatus).Running){
+        $gw=Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -ne $script:TunnelIf } |
+            Sort-Object { [int]$_.RouteMetric + [int]$_.InterfaceMetric } | Select-Object -First 1
+    }
+    $results=@()
+    foreach($srv in $script:DiscordProbeServers){
+        $ip=$srv[0]; $added=$false
+        if($gw){
+            try {
+                New-NetRoute -DestinationPrefix "$ip/32" -InterfaceIndex $gw.ifIndex -NextHop $gw.NextHop -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+                $added=$true
+            } catch {}
+        }
+        try { $results+=,(Test-DiscordProbeOne -Ip $ip -Port $srv[1]) }
+        finally {
+            if($added){ Remove-NetRoute -DestinationPrefix "$ip/32" -InterfaceIndex $gw.ifIndex -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue }
+        }
+    }
+    if($results -contains 'blocked'){ return 'blocked' }
+    if($results -contains 'ok'){ return 'ok' }
+    return $null
+}
+
+function Test-DiscordStreams {
+    # Итог проверки трансляций Discord; при необходимости - UDP Discord в туннель.
+    $p=Get-TunnelPaths
+    Write-Host '  Проверка трансляций Discord через zapret...' -ForegroundColor Yellow
+    if(-not (Get-Status).Running){
+        Write-Host '  Трансляции Discord: не проверено - zapret не запущен.' -ForegroundColor Yellow
+        return
+    }
+    $r=Test-DiscordStreamProbe
+    if(-not $r){
+        Write-Host '  Трансляции Discord: проверить не удалось - серверы проверки не ответили.' -ForegroundColor Yellow
+        return
+    }
+    $on=Test-Path -LiteralPath $p.DiscordMedia
+    if($r -eq 'ok'){
+        if($on){
+            Write-Host '  Трансляции Discord: zapret справляется. UDP к медиасерверам Discord по-прежнему идёт через туннель' -ForegroundColor Green
+            Write-Host "  (вернуть напрямую: удалить $($p.DiscordMedia) и перезапустить туннель)." -ForegroundColor DarkGray
+        } else {
+            Write-Host '  Трансляции Discord: работают через zapret.' -ForegroundColor Green
+        }
+        return
+    }
+    if($on){
+        Write-Host '  Трансляции Discord: zapret не справляется (сервер перестаёт отвечать через ~1 с);' -ForegroundColor DarkGray
+        Write-Host '  UDP к медиасерверам Discord уже идёт через туннель.' -ForegroundColor DarkGray
+        return
+    }
+    [IO.File]::WriteAllText($p.DiscordMedia,'auto',[Text.Encoding]::ASCII)
+    Write-Host '  Трансляции Discord: zapret не справляется (сервер перестаёт отвечать через ~1 с).' -ForegroundColor Yellow
+    Write-Host ("  Направляю UDP к медиасерверам Discord ({0}) в туннель; голос и сайты на этих адресах идут как раньше. Перезапуск туннеля..." -f ($script:DiscordMediaCidr4 -join ', ')) -ForegroundColor DarkGray
+    Start-Tunnel
+    Write-Host '  Начните трансляцию заново: уже идущая останется на прежнем пути.' -ForegroundColor DarkGray
+}
+
+function Update-TunnelRoutes {
+    # "Туннель там, где не справляется zapret": сайты и трансляции Discord.
+    Ensure-Admin
     if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
+    Update-TunnelSites
+    Write-Host ''
+    Test-DiscordStreams
+}
+
+function Update-TunnelSites {
+    <#
+      Проверяем домены из списков zapret напрямую; не открывшиеся проверяем
+      через туннель и, если там они работают, переносим в lists\tunnel.txt.
+    #>
+    $p=Get-TunnelPaths
     if(-not (Get-Status).Running){
         Write-Host '  Внимание: zapret не запущен - в туннель попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
     }
@@ -3199,7 +3333,7 @@ function Show-TunnelMenu {
         Write-Host '  [3] Свой сервер: импортировать конфиг, ссылку или подписку'
         Write-Host '  [4] Выбрать профиль вручную'
         Write-Host '  [5] Проверить профили и выбрать лучший автоматически'
-        Write-Host '  [6] Проверить сайты и перенести в туннель те, что не открываются через zapret'
+        Write-Host '  [6] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель'
         Write-Host '  [7] Добавить домен в туннель вручную'
         Write-Host '  [8] Проверить сайты из списка туннеля (как в браузере)'
         Write-Host '  [9] Профили: показать / удалить'
