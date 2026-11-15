@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Script version: 1.8.3. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
+Script version: 1.8.4. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
@@ -274,15 +274,20 @@ points:
 - Runtime files live in directories writable only by the administrator
   (`C:\Windows\System32\Zapret2Windows`, `/opt/zapret2`). No TLS
   interception, no root certificates.
-- **Windows: the scheduled tasks run the script as SYSTEM from wherever it
-  lies.** The autostart task is created by menu item [3], the daily list-update
-  task when the tunnel is enabled. A script in Downloads can be replaced by any
-  program running as you, and the replacement runs as SYSTEM. Until this is
-  fixed, keep the script in a directory ordinary users cannot write to (F-05).
+- **Windows: since 1.8.4 the scheduled tasks run a protected copy of the
+  script from `C:\Windows\System32\Zapret2Windows\`**, not the file in the
+  working folder (F-05 fixed). The copy is refreshed on install, when
+  autostart is toggled and on script update. Until you re-run install or
+  autostart once after updating, an old task may still point at the old
+  location: keep the script in a directory ordinary users cannot write to
+  until then.
   On Linux, services and the timer run only files from `/opt/zapret2`.
-- Windows: tunnel profile keys are readable by all local users (F-17).
-- Downloads are not checked against checksums, only HTTPS (F-06); the
-  self-update takes the script from `main` without a signature (F-18).
+- Windows: since 1.8.4 profile keys are readable only by SYSTEM and
+  Administrators; the tunnel directory is protected with explicit ACLs
+  (F-17 fixed).
+- Since 1.8.4 downloads are checked against SHA-256 (release zip, sing-box,
+  xray-core; xray version pinned). The self-update still takes the script
+  from `main` without a signature (F-18).
 - The tunnel server operator sees which sites go through the tunnel; a
   subscription means trusting its author (F-20).
 
@@ -301,9 +306,12 @@ points:
   sing-box 1.14.4 and xray-core; the sing-box → xray-core → VLESS + XHTTP chain
   works on localhost; bypass parameters pass `nfqws2 --dry-run`; single-file
   launch through `sh`, `dash` and `bash`.
-- **Release workflow:** release 1.8.0 was published by it automatically.
-- **Not tested:** the reworked Windows version (tunnel, single-file launch,
-  speed-ups) has never been run or even parsed by PowerShell;
+- **Release workflow:** releases are published by it automatically.
+- **Windows, in CI (since 1.8.4):** the script is parsed by PowerShell 5.1,
+  checked by PSScriptAnalyzer, all definitions are loaded without errors,
+  read-only smoke actions run on a real Windows runner.
+- **Not tested:** the reworked Windows version has never been run on a real
+  Windows machine (tunnel, single-file launch, speed-ups);
   tunnel autostart at boot on Linux; region detection against real site
   responses; Firefox reacting to the DoH canary.
 

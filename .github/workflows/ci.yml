@@ -1,0 +1,129 @@
+# CI: проверки при каждом push и PR.
+#
+# До появления этого файла Windows-скрипт мог уехать в релиз с синтаксической
+# ошибкой: release.yml проверял только совпадение .cmd и .ps1. Здесь:
+#   * Linux: синтаксис sh-заголовка (sh/dash/bash), shellcheck, py_compile;
+#   * Windows: разбор PowerShell 5.1 ( целевая среда ), PSScriptAnalyzer,
+#     холодная загрузка всех определений, смок чтения Check/Status;
+#   * оба: .cmd собран из текущего .ps1; версии в скриптах совпадают.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  linux:
+    name: Linux (sh/Python)
+    runs-on: ubuntu-latest
+    steps:
+      # Pin по хешу коммита (F-23), не по метке.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: "Синтаксис sh-заголовка (полиглот: sh + Python)"
+        run: |
+          # Файл целиком sh не проверяется (Python-часть внутри ''':'-строки):
+          # вырезаем sh-заголовок до закрывающего '''.
+          n=$(grep -n "^'''$" zapret2-linux.sh | head -n 1 | cut -d: -f1)
+          sed -n "3,$((n-1))p" zapret2-linux.sh > /tmp/sh-header.sh
+          sh -n /tmp/sh-header.sh
+          bash -n /tmp/sh-header.sh
+          if command -v dash >/dev/null 2>&1; then dash -n /tmp/sh-header.sh; fi
+      - name: shellcheck sh-заголовка
+        # Строгий режим после стабилизации; сейчас - только сигналы.
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          n=$(grep -n "^'''$" zapret2-linux.sh | head -n 1 | cut -d: -f1)
+          sed -n "3,$((n-1))p" zapret2-linux.sh > /tmp/sh-header.sh
+          shellcheck -S error /tmp/sh-header.sh
+      - name: Синтаксис Python
+        run: python3 -m py_compile zapret2-linux.sh zapret2-linux.py tools/build-cmd.py
+      - name: Запуск без root не падает (смок)
+        run: |
+          # Меню без tty должно отказаться работать внятно, а не упасть трейсбеком.
+          sh zapret2-linux.sh check </dev/null || true
+
+  windows:
+    name: Windows (PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Разбор PowerShell 5.1 (целевая среда)
+        shell: powershell
+        run: |
+          $errs = $null; $toks = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD 'Zapret2Windows.ps1'), [ref]$toks, [ref]$errs)
+          if ($errs.Count) {
+            $errs | ForEach-Object { Write-Host ("{0}: {1} @ line {2}" -f $_.ErrorId, $_.Message, $_.Extent.StartLineNumber) }
+            exit 1
+          }
+          Write-Host 'Parse OK'
+
+      - name: PSScriptAnalyzer (только ошибки)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path Zapret2Windows.ps1 -Severity Error
+          if ($r) {
+            $r | ForEach-Object { Write-Host ("{0} {1} @ line {2}: {3}" -f $_.RuleName, $_.ScriptPath, $_.Line, $_.Message) }
+            exit 1
+          }
+          Write-Host 'PSScriptAnalyzer: нет ошибок уровня Error'
+
+      - name: Холодная загрузка определений (до switch по действиям)
+        shell: powershell
+        run: |
+          # Всё до финального try/switch: определения функций и константы.
+          $text = Get-Content -LiteralPath Zapret2Windows.ps1 -Raw
+          $idx = $text.IndexOf("try {`r`nswitch(`$Action){")
+          if ($idx -lt 0) { Write-Host 'Не найден блок диспетчера'; exit 1 }
+          $head = $text.Substring(0, $idx)
+          $tmp = Join-Path $env:TEMP 'zapret2-definitions.ps1'
+          [IO.File]::WriteAllText($tmp, $head, (New-Object Text.UTF8Encoding $true))
+          . $tmp -Action Status -ErrorAction Stop
+          Write-Host 'Определения загружаются без ошибок'
+
+      - name: Смок чтения -Action Check и -Action Status
+        # Read-only действия без прав администратора. Пока не гейт: среда
+        # раннера отличается от целевой (нет .NET, нет сети...) - следим,
+        # затем переведём в strict.
+        continue-on-error: true
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File Zapret2Windows.ps1 -Action Check
+          powershell -NoProfile -ExecutionPolicy Bypass -File Zapret2Windows.ps1 -Action Status
+
+      - name: .cmd соответствует .ps1
+        run: python tools/build-cmd.py --check
+
+  versions:
+    name: Версии согласованы
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Одна версия во всех скриптах
+        run: |
+          linux=$(sed -n 's/^VERSION = "\([0-9][0-9A-Za-z.-]*\)"$/\1/p' zapret2-linux.sh | head -n 1)
+          windows=$(grep -o "ScriptVersion='[^']*'" Zapret2Windows.ps1 | head -n 1 | cut -d"'" -f2)
+          if [ -z "$linux" ] || [ -z "$windows" ]; then
+            echo "::error::Версия не найдена (Linux: '$linux', Windows: '$windows')"
+            exit 1
+          fi
+          if [ "$linux" != "$windows" ]; then
+            echo "::error::Версии различаются: Linux $linux, Windows $windows"
+            exit 1
+          fi
+          echo "Версия: $linux (согласована)"

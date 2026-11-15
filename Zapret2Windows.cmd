@@ -71,10 +71,18 @@ param(
     [switch]$Elevated            # служебный: скрипт перезапущен с правами администратора
 )
 $ErrorActionPreference='Stop'
+# Прогресс-бар Invoke-WebRequest в PS 5.1 замедляет загрузку в разы и
+# мусорит вывод фоновых задач - глобально отключаем.
+$ProgressPreference='SilentlyContinue'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch {}
-if($PSVersionTable.PSVersion.Major -lt 5){
+# Windows PowerShell 5.0 не годится (нет части API), pwsh 6/7 - не тестировался.
+$v=$PSVersionTable.PSVersion
+if($v.Major -lt 5 -or ($v.Major -eq 5 -and $v.Minor -lt 1)){
     Write-Host 'Нужен Windows PowerShell 5.1 (есть в Windows 10/11).' -ForegroundColor Red
     exit 1
+}
+if($PSVersionTable.PSEdition -eq 'Core'){
+    Write-Host 'Проверено только в Windows PowerShell 5.1; в pwsh поведение может отличаться.' -ForegroundColor Yellow
 }
 # Путь к самому файлу скрипта. При запуске из Zapret2Windows.cmd код
 # исполняется как блок, $PSCommandPath пуст - путь и аргументы командной
@@ -118,9 +126,24 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.3'
+$script:ScriptVersion='1.8.4'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
+
+# Версии и SHA-256 скачиваемых артефактов (F-06). Хэш берётся из
+# официального релиза (API GitHub отдаёт digest каждого asset). При
+# обновлении версии меняйте и хэш. Сверка выполняется ПОСЛЕ скачивания:
+# несовпадение - отказ от установки (файл мог быть подменён).
+$script:XrayVersion='v26.11.9'   # xray-core закреплён, вместо releases/latest
+$script:Sha256=@{
+    'zapret2-v1.0.6.zip'              ='e141b51b60c895fe9548f4d644365461dcad8155e068d284a9aae1724504237d'
+    'sing-box-1.14.4-windows-amd64.zip'='99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df'
+    'sing-box-1.14.4-windows-arm64.zip'='8cd0a4d0cd8cd480be5731ac31f17038969a42d12add9feb6e031fd43d85bbae'
+    'sing-box-1.14.4-windows-386.zip'  ='7994c40c5c1316777bdd29216a5dd7f134f894fad0afaa1efe7b872e60ed1dd9'
+    'Xray-windows-64.zip'             ='1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d'
+    'Xray-windows-32.zip'             ='a5b6d456688612b678d2d528626d192972c96e645ae4e1e7fbb2566421f60bce'
+    'Xray-windows-arm64-v8a.zip'      ='9fdd48ff890e54ffdc37f92df9037c940fe4d4f914755b70cc644b97e9678a83'
+}
 
 # "Белый" SNI для фейковых ClientHello. ТСПУ пропускает соединения к
 # хостингам (Cloudflare, Hetzner, OVH, AWS...) только для доменов из своего
@@ -395,21 +418,130 @@ function Fix-DriverService {
       Если служба уже указывает на незащищённый каталог (например, на рабочую
       папку проекта), пересоздаём её: тогда драйвер ядра будет загружаться
       из System32\Zapret2Windows, куда обычные пользователи писать не могут.
+      Служба другого приложения (тот же путь за пределами наших каталогов)
+      не трогается.
     #>
     $svc=Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue
     if(-not $svc){return}
     $cur=($svc.PathName -replace '^\\\?\?\\','')
     $want=Join-Path $script:TrustedRuntime 'WinDivert64.sys'
     if($cur -ieq $want){return}
+    # Трогаем службу только если ImagePath относится к нашим каталогам:
+    # иначе это легитимная служба стороннего приложения.
+    $ours=@($script:TrustedRuntime,$script:Runtime) |
+        ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+    if(-not ($ours | Where-Object { $cur -like "$_*" })){
+        Write-Host "  Служба WinDivert указывает на чужой каталог, не трогаю:" -ForegroundColor DarkGray
+        Write-Host "    $cur" -ForegroundColor DarkGray
+        return
+    }
     Write-Host "  Перерегистрация драйвера WinDivert:" -ForegroundColor Yellow
     Write-Host "    было:  $cur" -ForegroundColor DarkGray
     Write-Host "    станет: $want" -ForegroundColor DarkGray
     Stop-Zapret -Quiet
     & sc.exe stop WinDivert | Out-Null
+    if($LASTEXITCODE -ne 0){
+        Write-Host "  Служба WinDivert не остановилась (код $LASTEXITCODE); файл драйвера может не замениться." -ForegroundColor Yellow
+    }
     Start-Sleep -Seconds 2
     & sc.exe delete WinDivert | Out-Null
+    if($LASTEXITCODE -ne 0){
+        Write-Host "  Служба WinDivert не удалена (код $LASTEXITCODE)." -ForegroundColor Yellow
+    }
     Start-Sleep -Seconds 2
     Write-Host '    служба удалена; будет создана заново из защищённого каталога при старте.' -ForegroundColor DarkGray
+}
+function Get-FileSha256 {
+    # SHA-256 файла строчными hex-символами.
+    param([string]$Path)
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try {
+        $fs=[IO.File]::OpenRead($Path)
+        try { return ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-','').ToLowerInvariant() }
+        finally { $fs.Dispose() }
+    } finally { $sha.Dispose() }
+}
+function Test-FileHash {
+    <#
+      Сверяет файл с контрольной суммой из $script:Sha256 (ключ - имя файла).
+      Если хэш в таблице не задан - открыто предупреждает и пропускает:
+      отказ от загрузки целиком хуже честного предупреждения.
+    #>
+    param([string]$Path)
+    $name=Split-Path -Leaf $Path
+    if(-not $script:Sha256.ContainsKey($name)){
+        Write-Host "    ВНИМАНИЕ: контрольная сумма для $name не задана, сверка пропущена." -ForegroundColor Yellow
+        return
+    }
+    $want=$script:Sha256[$name].ToLowerInvariant()
+    $got=Get-FileSha256 $Path
+    if($got -ne $want){
+        throw ("Контрольная сумма {0} НЕ СОВПАЛА. Скачанный файл может быть подменён.`n  ожидалось: {1}`n  получено:  {2}" -f $name,$want,$got)
+    }
+}
+function Protect-Directory {
+    <#
+      Явные ACL (F-17): наследование от родителя заменяется на прямые grants.
+      По умолчанию Пользователи сохраняют только чтение (нужно, например,
+      для меню без прав администратора). -HideFromUsers убирает и чтение -
+      для каталога с ключами туннеля (profiles.json и др.).
+    #>
+    param([string]$Path,[switch]$HideFromUsers)
+    if(-not (Test-Path -LiteralPath $Path)){ return }
+    # /T: права применяются и к уже существующим дочерним файлам - они могли
+    # быть созданы раньше с наследованием от System32.
+    $icaclsArgs=@($Path,'/T','/inheritance:r','/grant:r','SYSTEM:(OI)(CI)F','Administrators:(OI)(CI)F')
+    # Без /deny: deny для группы Users заблокировал бы и администраторов -
+    # они тоже члены Users. Отсутствие grant даёт тот же эффект безопасно.
+    if(-not $HideFromUsers){ $icaclsArgs+=@('/grant:r','Users:(OI)(CI)RX') }
+    & icacls.exe @icaclsArgs 2>$null | Out-Null
+    if($LASTEXITCODE -ne 0){
+        Write-Host "    Не удалось задать права на $Path (код $LASTEXITCODE)." -ForegroundColor Yellow
+    }
+}
+function Sync-TrustedScriptCopy {
+    <#
+      Поддерживает копию скрипта в защищённом каталоге (F-05). Задачи
+      планировщика запускают ТОЛЬКО эту копию: файл в рабочей папке может
+      подменить любая программа от имени пользователя, а копию в System32 -
+      только администратор.
+    #>
+    if(-not (Test-Path -LiteralPath $script:TrustedRuntime)){ return $null }
+    $dst=Join-Path $script:TrustedRuntime $script:SelfName
+    $self=if($script:SelfPath){ [IO.Path]::GetFullPath($script:SelfPath) } else { $null }
+    if($self -and ($self.TrimEnd('\') -ine ([IO.Path]::GetFullPath($dst).TrimEnd('\')))){
+        # Повторы: копию может удерживать запущенная из неё задача.
+        for($try=1; $try -le 6; $try++){
+            try { Copy-Item -LiteralPath $script:SelfPath -Destination $dst -Force -ErrorAction Stop; break }
+            catch {
+                if($try -eq 6){
+                    Write-Host "    Не удалось обновить копию скрипта в $($script:TrustedRuntime): $($_.Exception.Message)" -ForegroundColor Yellow
+                    return $null
+                }
+                Start-Sleep -Milliseconds 700
+            }
+        }
+    }
+    return $dst
+}
+function Get-TrustedLaunch {
+    <#
+      Как Get-SelfLaunch, но команда указывает на защищённую копию скрипта
+      в System32\Zapret2Windows. Для задач планировщика (F-05).
+    #>
+    param([string[]]$Arguments=@(),[switch]$Hidden)
+    $dst=Sync-TrustedScriptCopy
+    if(-not $dst -or -not (Test-Path -LiteralPath $dst)){
+        Write-Host '    Защищённая копия скрипта недоступна - задача создана на путь запуска (менее безопасно).' -ForegroundColor Yellow
+        return (Get-SelfLaunch $Arguments -Hidden:$Hidden)
+    }
+    $tail=($Arguments -join ' ')
+    if($script:SelfIsCmd){
+        return [pscustomobject]@{ File=$env:ComSpec; Args=('/c ""{0}" {1}"' -f $dst,$tail) }
+    }
+    $hide=$(if($Hidden){'-WindowStyle Hidden '}else{''})
+    return [pscustomobject]@{ File=(Join-Path $PSHOME 'powershell.exe')
+                              Args=('-NoProfile -ExecutionPolicy Bypass {0}-File "{1}" {2}' -f $hide,$dst,$tail) }
 }
 function Get-Upstream {
     <#
@@ -432,16 +564,27 @@ function Get-Upstream {
     Write-Host "    $url" -ForegroundColor DarkGray
     try {
         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
     } catch {
         throw ("Не удалось скачать релиз. Скачайте вручную и распакуйте в: $ZapretRoot`n" + $_.Exception.Message)
     }
+    Test-FileHash $zip
     Write-Host '  Распаковка...' -ForegroundColor Yellow
     Expand-Archive -LiteralPath $zip -DestinationPath $dl -Force
     $dir=Get-ChildItem $dl -Directory -ErrorAction SilentlyContinue |
          Where-Object { Test-Path (Join-Path $_.FullName 'binaries') } | Select-Object -First 1
     if(-not $dir){throw "В архиве не найден каталог с binaries: $zip"}
-    if(Test-Path $ZapretRoot){Remove-Item $ZapretRoot -Recurse -Force}
+    if(Test-Path $ZapretRoot){
+        # Каталог мог появиться, пока шла загрузка (второй экземпляр, ручная
+        # распаковка). Молча удалять его нельзя - там могут быть файлы
+        # пользователя.
+        if(Test-Path (Join-Path $ZapretRoot 'binaries')){
+            Write-Host '  Релиз уже распакован - использую его.' -ForegroundColor Green
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            return
+        }
+        throw "Каталог $ZapretRoot занят и не похож на релиз zapret2. Удалите его вручную и повторите."
+    }
     Move-Item $dir.FullName $ZapretRoot -Force
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Write-Host "  Релиз распакован в: $ZapretRoot" -ForegroundColor Green
@@ -540,8 +683,15 @@ function Install-Runtime {
     $auto=Join-Path $lists 'autohostlist.txt'
     if(-not (Test-Path $auto)){[IO.File]::WriteAllText($auto,'',[Text.UTF8Encoding]::new($false))}
 
+    # Явные права вместо наследования (F-17): боевое содержимое - чтение
+    # для Пользователей, запись только SYSTEM/Администраторы.
+    Protect-Directory $script:TrustedRuntime
+
     Write-LaunchConfig
     Fix-DriverService
+    # Задачи планировщика запускают защищённую копию скрипта (F-05):
+    # поддерживаем её в актуальном состоянии уже при установке.
+    [void](Sync-TrustedScriptCopy)
     # Проверка DNS (DoH) выполняется при первом запуске обхода, а не здесь:
     # без обхода нельзя отличить подмену DNS от блокировки DPI, и проверка
     # каждого домена упиралась в таймауты (установка шла минутами).
@@ -954,6 +1104,13 @@ function Install-DotNet {
         Write-Host ('    Не удалось скачать: ' + $_.Exception.Message) -ForegroundColor Red
         return $false
     }
+    # Установщик .NET подписан Microsoft: проверяем подпись, а не только HTTPS.
+    $sig=Get-AuthenticodeSignature $exe
+    if($sig.Status -ne 'Valid' -or -not ($sig.SignerCertificate.Subject -match 'Microsoft')){
+        Write-Host '    Подпись установщика не прошла проверку - загрузка отменена.' -ForegroundColor Red
+        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        return $false
+    }
     Write-Host '    Тихая установка (может занять несколько минут)...' -ForegroundColor DarkGray
     $proc=Start-Process -FilePath $exe -ArgumentList '/q','/norestart' -Wait -PassThru
     Remove-Item $exe -Force -ErrorAction SilentlyContinue
@@ -1121,7 +1278,9 @@ function Show-Status {
 }
 function Install-Autostart {
     Ensure-Admin
-    $l=Get-SelfLaunch @('-Action','Start','-NoAutostart') -Hidden
+    # Команда ссылается на защищённую копию скрипта в System32 (F-05):
+    # файл в рабочей папке может быть подменён любой программой пользователя.
+    $l=Get-TrustedLaunch @('-Action','Start','-NoAutostart') -Hidden
     $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
     $trg=New-ScheduledTaskTrigger -AtLogOn
     $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -1296,6 +1455,16 @@ function Update-Self {
         if($a -notmatch '^\s*[yYдД]'){ Write-Host '    Отменено.' -ForegroundColor Yellow; Write-Host ''; return }
     }
 
+    # Синтаксис нового текста проверяем ДО того, как тронем рабочий файл.
+    $parseErrors=$null
+    $parseTokens=$null
+    $newText=$remote.Text
+    if($script:SelfIsCmd){ $newText=(($newText -replace "`r`n","`n") -replace "`n","`r`n") }
+    [void][System.Management.Automation.Language.Parser]::ParseInput($newText,[ref]$parseTokens,[ref]$parseErrors)
+    if($parseErrors.Count){
+        throw ("Скачанный скрипт содержит синтаксические ошибки, обновление отменено:`n  " + $parseErrors[0].Message)
+    }
+
     # Резервная копия с отметкой времени
     $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
     $bak="$self.$stamp.bak"
@@ -1305,26 +1474,24 @@ function Update-Self {
     # .ps1 - с UTF-8 BOM (иначе PowerShell 5.1 сломает кириллицу); .cmd - без
     # BOM (иначе cmd.exe споткнётся на первой строке) и с переводами строк CRLF.
     try {
-        $newText=$remote.Text
-        if($script:SelfIsCmd){ $newText=(($newText -replace "`r`n","`n") -replace "`n","`r`n") }
-        [IO.File]::WriteAllText($self,$newText,(New-Object Text.UTF8Encoding (-not $script:SelfIsCmd)))
+        # Атомарная подмена: сначала пишем во временный файл рядом, затем
+        # Replace. Падение процесса не оставит полузаписанный скрипт.
+        $tmp="$self.new"
+        [IO.File]::WriteAllText($tmp,$newText,(New-Object Text.UTF8Encoding (-not $script:SelfIsCmd)))
+        try { [IO.File]::Replace($tmp,$self,$null) }
+        catch { Move-Item -LiteralPath $tmp -Destination $self -Force }  # FAT и пр.: без Replace
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     } catch {
         Copy-Item -LiteralPath $bak -Destination $self -Force
         throw ("Не удалось записать обновление, восстановлена резервная копия.`n  " + $_.Exception.Message)
-    }
-
-    # Проверка синтаксиса нового файла до перезапуска.
-    $parseErrors=$null
-    [void][System.Management.Automation.Language.Parser]::ParseInput($remote.Text,[ref]$null,[ref]$parseErrors)
-    if($parseErrors.Count){
-        Copy-Item -LiteralPath $bak -Destination $self -Force
-        throw ("Скачанный скрипт содержит синтаксические ошибки, восстановлена резервная копия:`n  " + $parseErrors[0].Message)
     }
 
     Write-Host ''
     Write-Host '    Скрипт обновлён.' -ForegroundColor Green
     Write-Host ("    Было: " + $script:ScriptVersion + " -> Стало: " + $(if($remoteVer){$remoteVer}else{'обновлённая версия'})) -ForegroundColor Green
     Write-Host ("    Резервная копия: " + $bak) -ForegroundColor DarkGray
+    # Защищённая копия для задач планировщика (F-05) - тоже обновляется.
+    if(Test-Path -LiteralPath $script:TrustedRuntime){ [void](Sync-TrustedScriptCopy) }
     Write-Host ''
     Write-Host '    Текущий процесс работает со старой версией в памяти.' -ForegroundColor Yellow
     if(-not $Force){
@@ -1497,6 +1664,9 @@ function Initialize-TunnelDirs {
     foreach($d in @($p.Dir,(Join-Path $script:TrustedRuntime 'lists'),(Join-Path $script:TrustedRuntime 'logs'))){
         if(-not (Test-Path -LiteralPath $d)){ New-Item -ItemType Directory -Path $d -Force | Out-Null }
     }
+    # В tunnel лежат profiles.json с закрытыми ключами и паролями - Пользователям
+    # читать нельзя (F-17). Вызывается только с правами администратора.
+    Protect-Directory $p.Dir -HideFromUsers
 }
 
 function Test-Ipv6Available {
@@ -1607,12 +1777,17 @@ function Install-SingBox {
         Write-Host "    $url" -ForegroundColor DarkGray
         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
         $zip=Join-Path $tmp 'sb.zip'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
+        Test-FileHash $zip
         Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
         $inner=Join-Path $tmp $name
         if(-not (Test-Path (Join-Path $inner 'sing-box.exe'))){ throw "В архиве нет sing-box.exe: $url" }
         Stop-Tunnel -Quiet
-        Copy-Item (Join-Path $inner '*') $p.Dir -Recurse -Force
+        # Копируем только ожидаемые имена: в каталоге не должно оказаться
+        # лишних исполняемых файлов из архива.
+        Copy-Item (Join-Path $inner 'sing-box.exe') $p.Dir -Force
+        Get-ChildItem $inner -Filter '*.dll' -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName $p.Dir -Force }
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host "  sing-box установлен: $($p.Exe)" -ForegroundColor Green
 }
@@ -1625,15 +1800,17 @@ function Install-Xray {
     New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
     $arch=$env:PROCESSOR_ARCHITEW6432; if(-not $arch){ $arch=$env:PROCESSOR_ARCHITECTURE }
     $xa=switch($arch){ 'AMD64' {'64'} 'ARM64' {'arm64-v8a'} 'x86' {'32'} default {'64'} }
-    $url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-$xa.zip"
+    $zipName="Xray-windows-$xa.zip"
+    $url="https://github.com/XTLS/Xray-core/releases/download/$($script:XrayVersion)/$zipName"
     $tmp=Join-Path $env:TEMP ("xray-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
     try {
-        Write-Host '  Скачивание xray-core (нужен для профилей с XHTTP и конфигов Xray)...' -ForegroundColor Yellow
+        Write-Host "  Скачивание xray-core $($script:XrayVersion) (нужен для профилей с XHTTP и конфигов Xray)..." -ForegroundColor Yellow
         Write-Host "    $url" -ForegroundColor DarkGray
         [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
         $zip=Join-Path $tmp 'xray.zip'
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
+        Test-FileHash $zip
         Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
         if(-not (Test-Path (Join-Path $tmp 'xray.exe'))){ throw "В архиве нет xray.exe: $url" }
         Copy-Item (Join-Path $tmp 'xray.exe') $p.Xray -Force
@@ -2210,6 +2387,7 @@ function Test-ProfileConfig {
         try { Install-Xray } catch { return ('xray-core не скачался: ' + $_.Exception.Message) }
         $vf=Join-Path $p.Dir 'validate-xray.json'
         Write-JsonFile $vf (New-XrayConfig $Prof $script:XrayProbePort)
+        $LASTEXITCODE=0
         $out=& $p.Xray run -test -c $vf 2>&1
         $rc=$LASTEXITCODE
         Remove-Item $vf -Force -ErrorAction SilentlyContinue
@@ -2227,6 +2405,7 @@ function Test-ProfileConfig {
     }
     if($parts.Endpoints.Count){ $cfg.endpoints=@($parts.Endpoints) }
     Write-JsonFile $p.Validate $cfg
+    $LASTEXITCODE=0
     $out=& $p.Exe check -c $p.Validate 2>&1
     $rc=$LASTEXITCODE
     Remove-Item $p.Validate -Force -ErrorAction SilentlyContinue
@@ -2403,7 +2582,8 @@ function Update-GeoList {
 
 function Install-GeoListTask {
     # Обновление списка раз в сутки - задача планировщика.
-    $l=Get-SelfLaunch @('-Action','TunnelGeoListAuto') -Hidden
+    # Запускает защищённую копию скрипта (F-05), см. Install-Autostart.
+    $l=Get-TrustedLaunch @('-Action','TunnelGeoListAuto') -Hidden
     $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
     $trg=New-ScheduledTaskTrigger -Daily -At (Get-Date)
     $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -2928,6 +3108,7 @@ function Start-TunnelProcess {
     $ErrorActionPreference='Continue'
     $p=Get-TunnelPaths
     Write-TunnelConfig $Prof
+    $LASTEXITCODE=0
     $chk=& $p.Exe check -c $p.Config 2>&1
     if($LASTEXITCODE -ne 0){
         Set-TunnelError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" })
@@ -3863,7 +4044,7 @@ function Update-DohHosts {
     foreach($l in $resolved){$lines.Add($l)}
     $lines.Add('# --- Zapret2Windows DoH end ---')
     Copy-Item -LiteralPath $hf -Destination "$hf.zapret-backup" -Force -ErrorAction SilentlyContinue
-    [IO.File]::WriteAllLines($hf,$lines,[Text.Encoding]::ASCII)
+    [IO.File]::WriteAllLines($hf,$lines,(Get-HostsEncoding $lines))
     & ipconfig.exe /flushdns | Out-Null
 
     Write-Host ''
@@ -3885,6 +4066,16 @@ function Update-DohHosts {
 #    "# --- Zapret2 TUI DoH begin/end ---"
 #  Прочие строки hosts не затрагиваются.
 # ============================================================================
+function Get-HostsEncoding {
+    <#
+      Кодировка записи hosts: UTF-8 без BOM, если в строках есть что-то вне
+      ASCII (пользовательские комментарии кириллицей), иначе ASCII. hosts
+      целиком перезаписывается - неверная кодировка молча портит файл.
+    #>
+    param([System.Collections.Generic.List[string]]$Lines)
+    foreach($l in $Lines){ if($l -match '[^\x00-\x7F]'){ return [Text.UTF8Encoding]::new($false) } }
+    return [Text.Encoding]::ASCII
+}
 function Remove-HostsEntries {
     param([switch]$CountOnly)
     $hf=Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
@@ -3900,10 +4091,7 @@ function Remove-HostsEntries {
     }
     if($removed -eq 0 -or $CountOnly){return $removed}
     Copy-Item -LiteralPath $hf -Destination "$hf.zapret-backup" -Force -ErrorAction SilentlyContinue
-    $hasNonAscii=$false
-    foreach($l in $out){ if($l -match '[^\x00-\x7F]'){$hasNonAscii=$true; break} }
-    $enc=if($hasNonAscii){[Text.UTF8Encoding]::new($false)}else{[Text.Encoding]::ASCII}
-    [IO.File]::WriteAllLines($hf,$out,$enc)
+    [IO.File]::WriteAllLines($hf,$out,(Get-HostsEncoding $out))
     & ipconfig.exe /flushdns | Out-Null
     return $removed
 }
