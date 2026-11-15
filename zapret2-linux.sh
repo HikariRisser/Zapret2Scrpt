@@ -191,6 +191,7 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -201,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -2127,6 +2128,14 @@ TELEGRAM_CIDR4 = ["91.108.56.0/22", "91.108.4.0/22", "91.108.8.0/22", "91.108.16
                   "185.76.151.0/24"]
 TELEGRAM_CIDR6 = ["2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48",
                   "2001:b28:f23c::/48", "2a0a:f280::/32"]
+# Медиасерверы Discord в сети Cloudflare (трансляции, всё больше и голос).
+# Discord шлёт на них UDP по адресу из сигнального соединения, без DNS, поэтому
+# список доменов туннеля их не касается. У части провайдеров UDP к ним обрезается
+# через ~1 с после начала соединения, и zapret это не исправляет: тогда (по
+# итогам проверки) в туннель направляется UDP к этим адресам, TCP идёт напрямую.
+DISCORD_MEDIA_CIDR4 = ["104.29.0.0/16"]
+# Серверы для проверки: отвечают на пакет определения IP без входа в аккаунт.
+DISCORD_PROBE_SERVERS = [("104.29.149.69", 19298), ("104.29.155.188", 19298)]
 TUNNEL_RT_TABLE = 2649
 TUNNEL_RT_RULE = 8640
 
@@ -3432,6 +3441,10 @@ def build_tunnel_config(profile):
     fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": TUNNEL_FAKE4}
     if v6:
         fake["inet6_range"] = TUNNEL_FAKE6
+    discord_media = DISCORD_MEDIA_CIDR4 if discord_media_tunneled() else []
+    # Из адресов Discord в туннель идёт только UDP (медиа); TCP к ним - напрямую.
+    discord_tcp = ([{"inbound": ["tun-in"], "network": "tcp", "ip_cidr": discord_media,
+                     "outbound": "direct"}] if discord_media else [])
     cfg = {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -3452,8 +3465,9 @@ def build_tunnel_config(profile):
                 "address": [TUNNEL_TUN_ADDR4] + ([TUNNEL_TUN_ADDR6] if v6 else []),
                 "mtu": 1400,
                 "auto_route": True,
-                # В TUN идут только FakeIP и подсети Telegram: остальной трафик мимо sing-box.
-                "route_address": ([TUNNEL_FAKE4] + TELEGRAM_CIDR4
+                # В TUN идут только FakeIP, подсети Telegram и (если проверка так
+                # решила) медиасерверы Discord: остальной трафик мимо sing-box.
+                "route_address": ([TUNNEL_FAKE4] + TELEGRAM_CIDR4 + discord_media
                                   + ([TUNNEL_FAKE6] + TELEGRAM_CIDR6 if v6 else [])),
                 "iproute2_table_index": TUNNEL_RT_TABLE,
                 "iproute2_rule_index": TUNNEL_RT_RULE,
@@ -3468,6 +3482,7 @@ def build_tunnel_config(profile):
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
+            ] + discord_tcp + [
                 {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "tunnel-dns"},
                 {"inbound": ["tun-in", "mixed-in"], "outbound": "tunnel"},
             ],
@@ -4118,8 +4133,8 @@ def enable_tunnel(assume_yes=False):
         ans = "y"
         if not assume_yes:
             try:
-                ans = input("  Проверить сайты из списков и перенести в туннель те, "
-                            "что не открываются через zapret? (Y/n) ").strip().lower()
+                ans = input("  Проверить сайты из списков и трансляции Discord и перенести в туннель "
+                            "то, что не работает через zapret? (Y/n) ").strip().lower()
             except EOFError:
                 ans = "y"
         if ans not in ("n", "no", "н", "нет"):
@@ -4206,12 +4221,115 @@ def add_tunnel_domains(domains):
     flush_dns()
 
 
+def discord_media_tunneled():
+    return os.path.isfile(tunnel_path("discord-media.on"))
+
+
+def _discord_probe_one(ip, port):
+    """
+    Проверка медиасервера Discord так, как его видит трансляция: пакет
+    определения IP (на него сервер отвечает без входа в аккаунт), затем ~3 с
+    потока по 1000 байт, затем снова пакет определения IP.
+    'ok' - ответ есть и в начале, и после потока; 'blocked' - ответ только в
+    начале (соединение обрезается, как у трансляций); None - сервер не ответил.
+    """
+    disc = struct.pack(">HHI", 1, 70, int.from_bytes(os.urandom(4), "big")) + b"\0" * 66
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.5)
+
+    def ask(tries):
+        for _ in range(tries):
+            try:
+                s.sendto(disc, (ip, port))
+                s.recvfrom(2048)
+                return True
+            except OSError:
+                pass
+        return False
+
+    try:
+        if not ask(2):
+            return None
+        for _ in range(300):
+            s.sendto(os.urandom(1000), (ip, port))
+            time.sleep(0.01)
+        return "ok" if ask(3) else "blocked"
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def discord_stream_probe():
+    """
+    Может ли zapret обеспечить трансляции Discord: 'ok', 'blocked' или None
+    (проверить не удалось). Проверка идёт напрямую, мимо туннеля: если адреса
+    Discord уже направлены в туннель, на время проверки для сервера проверки
+    ставится правило «через основную таблицу» раньше правил sing-box.
+    """
+    results = []
+    for ip, port in DISCORD_PROBE_SERVERS:
+        rule = ["ip", "rule", "add", "to", f"{ip}/32", "lookup", "main",
+                "priority", str(TUNNEL_RT_RULE - 1)]
+        bypass = discord_media_tunneled() and tunnel_tun_exists()
+        if bypass:
+            run(rule)
+        try:
+            results.append(_discord_probe_one(ip, port))
+        finally:
+            if bypass:
+                run(["ip", "rule", "del"] + rule[3:])
+    if "blocked" in results:
+        return "blocked"
+    if "ok" in results:
+        return "ok"
+    return None
+
+
+def check_discord_streams():
+    """Итог проверки трансляций Discord; при необходимости - UDP Discord в туннель."""
+    head("Проверка трансляций Discord через zapret...")
+    if not nfqws2_running():
+        warn("Трансляции Discord: не проверено — zapret не запущен")
+        return
+    r = discord_stream_probe()
+    if r is None:
+        warn("Трансляции Discord: проверить не удалось — серверы проверки не ответили")
+        return
+    if r == "ok":
+        if discord_media_tunneled():
+            ok("Трансляции Discord: zapret справляется. UDP к медиасерверам Discord "
+               "по-прежнему идёт через туннель (вернуть напрямую: удалить "
+               f"{tunnel_path('discord-media.on')} и перезапустить туннель)")
+        else:
+            ok("Трансляции Discord: работают через zapret")
+        return
+    if discord_media_tunneled():
+        info("Трансляции Discord: zapret не справляется (сервер перестаёт отвечать через ~1 с); "
+             "UDP к медиасерверам Discord уже идёт через туннель")
+        return
+    with open(tunnel_path("discord-media.on"), "w", encoding="utf-8") as f:
+        f.write("auto\n")
+    warn("Трансляции Discord: zapret не справляется (сервер перестаёт отвечать через ~1 с)")
+    info("Направляю UDP к медиасерверам Discord (" + ", ".join(DISCORD_MEDIA_CIDR4)
+         + ") в туннель; голос и сайты на этих адресах идут как раньше. Перезапуск туннеля...")
+    start_tunnel()
+    info("Начните трансляцию заново: уже идущая останется на прежнем пути.")
+
+
 def update_tunnel_routes():
-    """Туннель там, где не справляется zapret: перенос неоткрывающихся сайтов."""
+    """Туннель там, где не справляется zapret: сайты и трансляции Discord."""
     ensure_root(sys.argv)
     if not tunnel_running():
         err("Туннель не запущен")
         return
+    _update_tunnel_sites()
+    print()
+    check_discord_streams()
+
+
+def _update_tunnel_sites():
+    """Перенос в туннель сайтов, которые не открываются через zapret."""
     if not nfqws2_running():
         warn("zapret не запущен — в туннель попадут и сайты, которые zapret открыл бы сам")
     in_tunnel = set(tunnel_domains())
@@ -4363,7 +4481,7 @@ def tunnel_menu():
         print("  [3] Свой сервер: импортировать конфиг, ссылку или подписку")
         print("  [4] Выбрать профиль вручную")
         print("  [5] Проверить профили и выбрать лучший автоматически")
-        print("  [6] Проверить сайты и перенести в туннель те, что не открываются через zapret")
+        print("  [6] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель")
         print("  [7] Добавить домен в туннель вручную")
         print("  [8] Проверить сайты из списка туннеля (как в браузере)")
         print("  [9] Профили: показать / удалить")
