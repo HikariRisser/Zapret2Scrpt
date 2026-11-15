@@ -57,7 +57,7 @@ endlocal & exit /b %RC%
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelGeoList','TunnelGeoListAuto','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -1390,6 +1390,14 @@ $script:SeedGeo=@(
 # Признаки отказа по региону: в адресе перенаправления или в тексте страницы.
 $script:GeoRegex='(?i)app-unavailable-in-region|unavailable[-_ ]in[-_ ](your[-_ ])?(region|country)|unsupported[-_ ](country|region)|country[-_ ]not[-_ ]supported|not[-_ ](available|supported)[-_ ]in[-_ ]your[-_ ](country|region|location)|region[-_ ](restricted|blocked)|geo[-_ ]?(block|restrict)|недоступ\w+ в ваш\w+ (стране|регионе)'
 $script:GeoLabel=@{ ok='открывается'; challenge='отвечает (проверка браузера)'; geo='отказ по региону'; deny='отказ (403)'; fail='нет ответа' }
+# Внешний список сайтов, которые сами не пускают из России (claude.ai,
+# chatgpt.com...). "Обучением" их не найти: соединение проходит, отказ приходит
+# уже от сайта. Список ведёт сообщество (itdoginfo/allow-domains, раздел
+# GeoBlock). При включённом туннеле он скачивается, добавляется к списку
+# туннеля и обновляется раз в сутки. Свой список туннеля при этом не меняется.
+$script:GeoListUrl='https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst'
+$script:GeoListTask='Zapret2WindowsGeoList'
+$script:TunnelDomainsMax=1000
 $script:TunnelTraceLast=''       # чем закончилась последняя проверка туннеля
 $script:TunnelExit=@{}           # откуда туннель выходит в интернет: loc, ip
 
@@ -1422,6 +1430,8 @@ function Get-TunnelPaths {
         StartLog=Join-Path $script:TrustedRuntime 'logs\tunnel-start.log'
         List=Join-Path $script:TrustedRuntime 'lists\tunnel.txt'
         Servers=Join-Path $script:TrustedRuntime 'lists\ipset-tunnel-servers.txt'
+        GeoList=Join-Path $script:TrustedRuntime 'lists\tunnel-geoblock.txt'
+        GeoListOff=Join-Path $d 'geolist.off'
     }
 }
 
@@ -1455,9 +1465,17 @@ function Read-JsonFile {
 function Get-ListEntries {
     param([string]$Path)
     if(-not (Test-Path -LiteralPath $Path)){ return @() }
-    return @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue |
-             ForEach-Object { $_.Trim().ToLowerInvariant() } |
-             Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
+    # Обычный цикл вместо конвейера: списки читаются при каждой отрисовке
+    # меню, а внешний список - это сотни строк.
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]'
+    $out=New-Object System.Collections.Generic.List[string]
+    try {
+        foreach($l in [IO.File]::ReadAllLines($Path)){
+            $x=$l.Trim().ToLowerInvariant()
+            if($x -and -not $x.StartsWith('#') -and $seen.Add($x)){ $out.Add($x) }
+        }
+    } catch {}
+    return $out.ToArray()
 }
 
 function Get-FileTail {
@@ -2226,10 +2244,161 @@ function Read-UserInput {
 
 # --- конфигурация sing-box ----------------------------------------------------
 
-function Write-TunnelRules {
-    # rule-set для sing-box из lists\tunnel.txt; sing-box перечитывает его сам.
+# --- внешний список сайтов с региональными ограничениями ----------------------
+
+function Test-GeoListEnabled { return (-not (Test-Path -LiteralPath (Get-TunnelPaths).GeoListOff)) }
+
+function Get-GeoListEntries {
+    if(-not (Test-GeoListEnabled)){ return @() }
+    return @(Get-ListEntries (Get-TunnelPaths).GeoList)
+}
+
+function Get-TunnelDomains {
+    # Все домены, идущие в туннель: свой список и внешний, без повторов.
     $p=Get-TunnelPaths
-    $d=@(Get-ListEntries $p.List)
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $all=New-Object System.Collections.Generic.List[string]
+    foreach($d in (@(Get-ListEntries $p.List) + @(Get-GeoListEntries))){
+        if($all.Count -ge $script:TunnelDomainsMax){ break }
+        if($seen.Add($d)){ $all.Add($d) }
+    }
+    return $all.ToArray()
+}
+
+function Get-TunnelSitesSummary {
+    $own=@(Get-ListEntries (Get-TunnelPaths).List).Count
+    $ext=@(Get-TunnelDomains).Count - $own
+    if($ext -gt 0){ return "$own своих + $ext из внешнего списка" }
+    return "$own"
+}
+
+function Get-GeoListAgeHours {
+    # Сколько часов назад список обновлялся; -1, если его ещё нет.
+    $f=(Get-TunnelPaths).GeoList
+    if(-not (Test-Path -LiteralPath $f)){ return -1 }
+    return [Math]::Max(0,((Get-Date) - (Get-Item -LiteralPath $f).LastWriteTime).TotalHours)
+}
+
+function Get-GeoListStatus {
+    if(-not (Test-GeoListEnabled)){ return 'выключен' }
+    $n=@(Get-GeoListEntries).Count
+    $age=Get-GeoListAgeHours
+    if($age -lt 0 -or -not $n){ return 'ещё не скачан' }
+    if($age -lt 1){ return "$n доменов, обновлён меньше часа назад" }
+    return "$n доменов, обновлён $([int][Math]::Floor($age)) ч назад"
+}
+
+function Update-GeoList {
+    <#
+      Обновляет внешний список, если он старше суток (или -Force). Возвращает
+      $true, если список скачан заново. Сбой не мешает работе: остаётся прежний.
+    #>
+    param([switch]$Force)
+    if(-not (Test-GeoListEnabled)){ return $false }
+    $p=Get-TunnelPaths
+    $age=Get-GeoListAgeHours
+    if(-not $Force -and $age -ge 0 -and $age -lt 23){ return $false }
+    Initialize-TunnelDirs
+    $text=$null; $lastErr=''
+    # Напрямую, а если не вышло и туннель работает - через него.
+    $proxies=@('')
+    if((Get-TunnelStatus).Running){ $proxies+="http://127.0.0.1:$($script:TunnelMixedPort)" }
+    foreach($px in $proxies){
+        try {
+            [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+            $wr=@{ Uri=$script:GeoListUrl; UseBasicParsing=$true; TimeoutSec=30; ErrorAction='Stop' }
+            if($px){ $wr.Proxy=$px }
+            $body=(Invoke-WebRequest @wr).Content
+            if($body -is [byte[]]){ $body=[Text.Encoding]::UTF8.GetString($body) }
+            $text="$body"
+            break
+        } catch { $lastErr=$_.Exception.Message }
+    }
+    $doms=New-Object System.Collections.Generic.List[string]
+    if($text){
+        $seen=New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach($ln in $text -split "`r?`n"){
+            $d=($ln -split '#',2)[0].Trim().ToLowerInvariant().Trim('.')
+            if($d -and $d -match '^([a-z0-9_]([a-z0-9_-]*[a-z0-9_])?\.)+[a-z0-9-]{2,}$' -and $seen.Add($d)){ $doms.Add($d) }
+        }
+        if($doms.Count -lt 50){ $lastErr="в ответе только $($doms.Count) доменов - это не список" }
+    }
+    if($doms.Count -lt 50){
+        Write-Host "  ! Внешний список сайтов с региональными ограничениями не скачался: $lastErr" -ForegroundColor Yellow
+        if($age -ge 0){ Write-Host '    Используется прежний список.' -ForegroundColor DarkGray }
+        return $false
+    }
+    $old=@(Get-ListEntries $p.GeoList)
+    $lines=@('# Сайты, которые сами не пускают из России. Источник:',
+             "# $($script:GeoListUrl)",
+             '# Файл обновляется автоматически раз в сутки - правки здесь будут потеряны.',
+             '# Свои сайты добавляйте в tunnel.txt.') + $doms.ToArray()
+    [IO.File]::WriteAllLines($p.GeoList,$lines,[Text.UTF8Encoding]::new($false))
+    $msg="  Внешний список сайтов с региональными ограничениями: $($doms.Count) доменов"
+    if($old.Count){
+        $added=@($doms | Where-Object { $old -notcontains $_ }).Count
+        $gone=@($old | Where-Object { -not $doms.Contains($_) }).Count
+        $msg+=" (добавлено $added, убрано $gone)"
+    }
+    Write-Host $msg -ForegroundColor Green
+    Remove-HostsDomains $doms.ToArray()
+    Write-TunnelRules
+    return $true
+}
+
+function Install-GeoListTask {
+    # Обновление списка раз в сутки - задача планировщика.
+    $l=Get-SelfLaunch @('-Action','TunnelGeoListAuto') -Hidden
+    $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
+    $trg=New-ScheduledTaskTrigger -Daily -At (Get-Date)
+    $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $script:GeoListTask -Action $act -Trigger $trg -Principal $pr -Settings $set -Force | Out-Null
+}
+
+function Remove-GeoListTask {
+    Unregister-ScheduledTask -TaskName $script:GeoListTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Test-GeoListTask {
+    return (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\Tasks\$($script:GeoListTask)"))
+}
+
+function Sync-GeoList {
+    # Задача и свежий список есть, пока включены туннель и внешний список.
+    try {
+        if((Test-Path -LiteralPath (Get-TunnelPaths).Enabled) -and (Test-GeoListEnabled)){
+            if(-not (Test-GeoListTask)){ Install-GeoListTask }
+            [void](Update-GeoList)
+        } elseif(Test-GeoListTask){ Remove-GeoListTask }
+    } catch {
+        Write-Host ('  ! Внешний список: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+function Switch-GeoList {
+    Ensure-Admin
+    Initialize-TunnelDirs
+    $p=Get-TunnelPaths
+    if(Test-GeoListEnabled){
+        [IO.File]::WriteAllText($p.GeoListOff,'1',[Text.Encoding]::ASCII)
+        Remove-GeoListTask
+        Write-TunnelRules
+        Write-Host '  Внешний список выключен: в туннель идут только сайты из своего списка.' -ForegroundColor Green
+    } else {
+        Remove-Item -LiteralPath $p.GeoListOff -Force -ErrorAction SilentlyContinue
+        Sync-GeoList
+        Write-TunnelRules
+        if(Test-Path -LiteralPath $p.Enabled){ Write-Host "  Внешний список включён: $(@(Get-GeoListEntries).Count) доменов." -ForegroundColor Green }
+        else { Write-Host '  Внешний список включён: он скачается при включении туннеля.' -ForegroundColor Green }
+    }
+}
+
+function Write-TunnelRules {
+    # rule-set для sing-box из списка туннеля (свой + внешний); sing-box перечитывает его сам.
+    $p=Get-TunnelPaths
+    Initialize-TunnelDirs
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ $d=@('tunnel.invalid') }   # пустое правило sing-box не примет
     Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
     if((Get-TunnelStatus).Running){ Set-TunnelDns }
@@ -2251,7 +2420,7 @@ function Set-TunnelDns {
     #>
     $p=Get-TunnelPaths
     Remove-TunnelDns
-    $d=@(Get-ListEntries $p.List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ return }
     $ns=@(); foreach($x in $d){ $ns+=$x; $ns+=".$x" }
     $ns+=$script:DohCanary
@@ -2269,7 +2438,7 @@ function Set-TunnelDns {
 
 function Test-TunnelDns {
     # Проверяет, что домен из списка туннеля действительно получает FakeIP.
-    $d=@(Get-ListEntries (Get-TunnelPaths).List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ return }
     $ips=@()
     try { $ips=@(Resolve-DnsName -Name $d[0] -Type A -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) } catch {}
@@ -2338,7 +2507,7 @@ function Write-TunnelConfig {
 
 function Write-TunnelRulesFileOnly {
     $p=Get-TunnelPaths
-    $d=@(Get-ListEntries $p.List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ $d=@('tunnel.invalid') }
     Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
 }
@@ -2676,7 +2845,7 @@ function Get-TunnelStatus {
         Pinned=[bool]($st -and $st.pinned)
         Loc=$(if($ex){$ex.loc}else{$null})
         Profiles=@(Get-TunnelProfiles).Count
-        Domains=@(Get-ListEntries $p.List).Count
+        Domains=(Get-TunnelSitesSummary)
     }
 }
 
@@ -2753,6 +2922,7 @@ function Start-Tunnel {
         return
     }
     Stop-Tunnel -Quiet
+    Sync-GeoList      # список старше суток обновляется; задача на месте
     $st=Read-JsonFile $p.State
     $prof=$null
     if($st -and $st.active){ $prof=Find-TunnelProfile $st.active }
@@ -2780,7 +2950,7 @@ function Start-Tunnel {
         return
     }
     Set-TunnelDns
-    Write-Host "  Туннель работает: '$($prof.name)'. Сайтов в списке туннеля: $((Get-TunnelStatus).Domains)" -ForegroundColor Green
+    Write-Host "  Туннель работает: '$($prof.name)'. Сайтов в туннеле: $(Get-TunnelSitesSummary)" -ForegroundColor Green
     if($script:TunnelExit['loc']){
         Write-JsonFile $p.ExitInfo ([ordered]@{ loc=$script:TunnelExit['loc']; ip=$script:TunnelExit['ip'] })
         Write-Host "  Выход в интернет: страна $($script:TunnelExit['loc']), адрес $($script:TunnelExit['ip'])" -ForegroundColor DarkGray
@@ -2844,6 +3014,7 @@ function Enable-Tunnel {
         return
     }
     [IO.File]::WriteAllText($p.Enabled,'1',[Text.Encoding]::ASCII)
+    Sync-GeoList
     Start-Tunnel
     if((Get-TunnelStatus).Running){
         $a='y'
@@ -2856,6 +3027,7 @@ function Disable-Tunnel {
     $p=Get-TunnelPaths
     Remove-Item $p.Enabled -Force -ErrorAction SilentlyContinue
     Stop-Tunnel
+    Remove-GeoListTask
     & ipconfig.exe /flushdns | Out-Null
 }
 
@@ -2949,7 +3121,7 @@ function Update-TunnelRoutes {
         Write-Host '  Внимание: zapret не запущен - в туннель попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
     }
     $lists=Join-Path $script:TrustedRuntime 'lists'
-    $inTunnel=@(Get-ListEntries $p.List)
+    $inTunnel=@(Get-TunnelDomains)
     $excl=@(Get-ListEntries (Join-Path $lists 'exclude.txt'))
     $cands=@(@(Get-ListEntries (Join-Path $lists 'blocked.txt')) + @(Get-ListEntries (Join-Path $lists 'autohostlist.txt')) |
              Select-Object -Unique | Where-Object { $inTunnel -notcontains $_ -and $excl -notcontains $_ })
@@ -2988,7 +3160,8 @@ function Test-TunnelSites {
     param([string[]]$Domains=@())
     $p=Get-TunnelPaths
     if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
-    if(-not $Domains.Count){ $Domains=@(Get-ListEntries $p.List) }
+    # Внешний список большой - проверяем свой, а из внешнего берём несколько для примера.
+    if(-not $Domains.Count){ $Domains=@(Get-ListEntries $p.List) + @(Get-GeoListEntries | Select-Object -First 5) }
     if(-not $Domains.Count){ Write-Host '  Список туннеля пуст.' -ForegroundColor DarkGray; return }
     Write-Host '  Проверка сайтов из списка туннеля (как в браузере)...' -ForegroundColor Yellow
     $res=Test-HttpsBatch -Domains $Domains
@@ -3034,7 +3207,7 @@ function Show-TunnelMenu {
         Write-Host ''
         Write-Host ('  Туннель: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
                     $(if($w.Running){"работает, профиль '$($w.Active)'" + $(if($w.Pinned){' (выбран вручную)'}else{''})}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
-                    ' | профилей: ' + $w.Profiles + ' | сайтов в списке: ' + $w.Domains +
+                    ' | профилей: ' + $w.Profiles + ' | сайтов: ' + $w.Domains +
                     $(if($w.Running -and $w.Loc){" | выход: $($w.Loc)"}else{''})) -ForegroundColor Cyan
         if($w.Enabled -and -not $w.Running -and -not $w.Starting){
             $le=Get-FileTail (Get-TunnelPaths).LastError 40
@@ -3053,6 +3226,8 @@ function Show-TunnelMenu {
         Write-Host '  [8] Проверить сайты из списка туннеля (как в браузере)'
         Write-Host '  [9] Профили: показать / удалить'
         Write-Host '  [10] Региональные ограничения: проверить сайты через активный профиль'
+        Write-Host "  [11] Внешний список сайтов с региональными ограничениями: обновить сейчас ($(Get-GeoListStatus))"
+        Write-Host ('  [12] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
         Write-Host '  [0] Назад'
         $choice=Read-Host '  Выбор'
         if($choice -eq '0'){ return }
@@ -3087,6 +3262,12 @@ function Show-TunnelMenu {
             '5' { [void](Select-TunnelProfile) }
             '6' { Update-TunnelRoutes }
             '10' { Test-TunnelGeo }
+            '11' {
+                Ensure-Admin
+                if(Test-GeoListEnabled){ [void](Update-GeoList -Force) }
+                else { Write-Host '  Внешний список выключен (пункт [12]).' -ForegroundColor DarkGray }
+            }
+            '12' { Switch-GeoList }
             '7' {
                 $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
                 if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
@@ -3447,7 +3628,7 @@ function Update-DohHosts {
                Where-Object { $_ -and $_ -notmatch '^\s*#' } |
                ForEach-Object { $_.Trim() } | Select-Object -Unique)
     # Домены туннеля разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
-    $inWarp=@(Get-ListEntries (Join-Path $script:TrustedRuntime 'lists\tunnel.txt'))
+    $inWarp=@(Get-TunnelDomains)
     $domains=@($domains | Where-Object { $inWarp -notcontains $_.ToLowerInvariant() })
     if(-not $domains.Count){Write-Host '  Список доменов пуст.' -ForegroundColor Yellow; return}
     # hosts сопоставляет ТОЧНОЕ имя, поэтому www-вариант разрешаем отдельно:
@@ -3585,8 +3766,9 @@ function Remove-All {
     Stop-Zapret -Quiet
 
     # 2) задача автозапуска
-    Write-Host '  [2/5] Удаление задачи автозапуска...' -ForegroundColor Yellow
+    Write-Host '  [2/5] Удаление задач планировщика...' -ForegroundColor Yellow
     Remove-Autostart
+    Remove-GeoListTask
 
     # 3) служба ядра WinDivert
     Write-Host '  [3/5] Удаление службы драйвера WinDivert...' -ForegroundColor Yellow
@@ -3640,14 +3822,15 @@ function Remove-All {
                Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($tunDir,[StringComparison]::OrdinalIgnoreCase) }).Count
     $nrpt=0
     try { $nrpt=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq $script:TunnelNrptComment }).Count } catch {}
-    $task=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+    $task=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue) -or
+          [bool](Get-ScheduledTask -TaskName $script:GeoListTask -ErrorAction SilentlyContinue)
     $drv=[bool](Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue)
     $dir=Test-Path (Join-Path $env:SystemRoot 'System32\Zapret2Windows')
     $hostsLeft=Remove-HostsEntries -CountOnly
     Write-Host ("    процесс winws2:        {0}" -f $(if($proc -eq 0){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if($proc -eq 0){'Green'}else{'Red'})
     Write-Host ("    процессы туннеля:      {0}" -f $(if($tunProc -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($tunProc -eq 0){'Green'}else{'Red'})
     Write-Host ("    правила DNS туннеля:   {0}" -f $(if($nrpt -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($nrpt -eq 0){'Green'}else{'Red'})
-    Write-Host ("    задача автозапуска:    {0}" -f $(if(-not $task){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $task){'Green'}else{'Red'})
+    Write-Host ("    задачи планировщика:   {0}" -f $(if(-not $task){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if(-not $task){'Green'}else{'Red'})
     Write-Host ("    служба WinDivert:      {0}" -f $(if(-not $drv){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $drv){'Green'}else{'Red'})
     Write-Host ("    каталог в System32:    {0}" -f $(if(-not $dir){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if(-not $dir){'Green'}else{'Red'})
     Write-Host ("    записи hosts:          {0}" -f $(if($hostsLeft -eq 0){'очищены'}else{"осталось $hostsLeft"})) -ForegroundColor $(if($hostsLeft -eq 0){'Green'}else{'Yellow'})
@@ -3691,6 +3874,8 @@ switch($Action){
         else { [void](Show-TunnelProfiles); Write-Host '  Укажите -TunnelProfile <номер | имя | auto>.' -ForegroundColor DarkGray }
     }
     'TunnelGeo' {Test-TunnelGeo}
+    'TunnelGeoList' {Ensure-Admin; [void](Update-GeoList -Force)}
+    'TunnelGeoListAuto' {Ensure-Admin; [void](Update-GeoList)}
     'TunnelRoutes' {Update-TunnelRoutes}
     'TunnelTest' {Test-TunnelSites}
     'TunnelList' {[void](Show-TunnelProfiles)}
@@ -3699,7 +3884,7 @@ switch($Action){
 }
 # Действие выполнялось в отдельном окне с правами администратора: не даём
 # ему закрыться, пока результат не прочитан.
-if($Elevated -and $Action -ne 'Menu' -and $Action -ne 'TunnelStart' -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost'){
+if($Elevated -and $Action -ne 'Menu' -and $Action -ne 'TunnelStart' -and $Action -ne 'TunnelGeoListAuto' -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost'){
     Write-Host ''
     [void](Read-Host '  Нажмите Enter для выхода')
 }
@@ -3718,7 +3903,7 @@ if($Elevated -and $Action -ne 'Menu' -and $Action -ne 'TunnelStart' -and [Enviro
     Write-Host ''
     # Фоновый запуск туннеля и задача автозапуска идут в скрытом окне: там
     # ждать Enter некому, процесс повис бы навсегда.
-    if($Host.Name -eq 'ConsoleHost' -and [Environment]::UserInteractive -and $Action -ne 'TunnelStart' -and -not $NoAutostart){
+    if($Host.Name -eq 'ConsoleHost' -and [Environment]::UserInteractive -and $Action -ne 'TunnelStart' -and $Action -ne 'TunnelGeoListAuto' -and -not $NoAutostart){
         [void](Read-Host '  Нажмите Enter для выхода')
     }
     # Код 2 - ошибка уже показана и прочитана (лаунчер .cmd не ждёт Enter повторно).

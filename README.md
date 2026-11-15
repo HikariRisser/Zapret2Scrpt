@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Versions: Windows 1.8.0, Linux 1.7.1. **The console UI is in Russian.** The
+Script version: 1.8.0. **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
@@ -147,6 +147,17 @@ is validated by its engine before it is saved.
 - **Manual** (tunnel menu [4]): the chosen profile is pinned and automatic
   selection will not replace it.
 
+### External list of region-restricted sites
+
+Sites that refuse Russian visitors themselves (claude.ai, chatgpt.com, …) cannot
+be detected by probing. When the tunnel is enabled, the script downloads the
+GeoBlock list of [itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains)
+(about 500 domains) and routes them through the tunnel. The list is refreshed
+every 24 hours (systemd timer `zapret2win-geolist.timer` on Linux, scheduled
+task `Zapret2WindowsGeoList` on Windows) and whenever the tunnel starts with a
+copy older than a day. It is kept in a separate file; your own tunnel list is
+untouched. Tunnel menu [11] updates it now, [12] turns it off.
+
 ### Browsers and DNS
 
 The tunnel relies on the system DNS. While it runs, Firefox is told to disable
@@ -181,6 +192,7 @@ Linux: `sh zapret2-linux.sh <action>`. Windows:
 | Pick the best profile | `tunnel-select` | `TunnelSelect` |
 | Pick a profile by hand | `tunnel-use --profile N\|name\|auto` | `TunnelUse -TunnelProfile N\|name\|auto` |
 | Region check | `tunnel-geo` | `TunnelGeo` |
+| Update the external list | `tunnel-geolist` | `TunnelGeoList` |
 | Move failing sites to the tunnel | `tunnel-routes` | `TunnelRoutes` |
 | Test tunnel sites | `tunnel-test` | `TunnelTest` |
 | List profiles | `tunnel-list` | `TunnelList` |
@@ -229,6 +241,7 @@ for the updater of old versions and need not be downloaded.
 | Exclusions | `ipset/zapret-hosts-user-exclude.txt` | `lists\exclude.txt` |
 | Hosting subnets | `ipset/zapret2win-ip-hosting.txt` | `lists\ipset-hosting.txt` |
 | Tunnel sites | `ipset/zapret2win-hosts-tunnel.txt` | `lists\tunnel.txt` |
+| Tunnel sites, external list | `ipset/zapret2win-hosts-geoblock.txt` | `lists\tunnel-geoblock.txt` |
 | Region-check sites | `ipset/zapret2win-geo-sites.txt` | `lists\tunnel-geo.txt` |
 | Tunnel profiles and binaries | `tunnel/` | `tunnel\` |
 
