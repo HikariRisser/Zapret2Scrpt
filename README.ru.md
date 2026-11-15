@@ -16,7 +16,7 @@
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — один файл | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **или** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — любой один файл | `winws2` + WinDivert |
 
-Версия скриптов — 1.8.0. Интерфейс — на русском языке.
+Версия скриптов — 1.8.1. Интерфейс — на русском языке.
 Скачивать лучше со страницы [последнего релиза](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest).
 
 ## Содержание
@@ -200,7 +200,11 @@ xray-core не скачивается и не запускается. Кажды
 ### Как устроено
 
 - sing-box создаёт TUN-адаптер, но направляет в него **только диапазон FakeIP**
-  (`10.249.0.0/16`). Весь остальной трафик идёт мимо sing-box, через zapret.
+  (`10.249.0.0/16`) и **подсети Telegram** ([официальный список](https://core.telegram.org/resources/cidr.txt)).
+  Весь остальной трафик идёт мимо sing-box, через zapret.
+- Приложение Telegram подключается к серверам по IP, без DNS, поэтому при
+  включённом туннеле оно всегда идёт через него. Без туннеля приложение
+  Telegram не работает: zapret его трафик не обрабатывает.
 - DNS-запросы доменов из списка туннеля система отправляет в sing-box
   (Linux — маршрутные домены systemd-resolved, Windows — правило NRPT). Они
   получают FakeIP и уходят на сервер. Остальной DNS не меняется.

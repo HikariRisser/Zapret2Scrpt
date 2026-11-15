@@ -201,7 +201,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -2065,8 +2065,9 @@ def uninstall(assume_yes=False):
 #  Выход — Proton VPN Free (конфиг WireGuard) или свой сервер (WireGuard,
 #  VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, SOCKS, JSON sing-box,
 #  ссылки и подписки). В TUN sing-box маршрутизируется ТОЛЬКО диапазон
-#  FakeIP: домены из списка туннеля получают FakeIP от DNS sing-box и уходят
-#  на сервер, весь остальной трафик идёт мимо sing-box, через zapret.
+#  FakeIP и подсети Telegram: домены из списка туннеля получают FakeIP от DNS
+#  sing-box и уходят на сервер, приложение Telegram (ходит по IP, без DNS)
+#  уходит туда же; весь остальной трафик идёт мимо sing-box, через zapret.
 # ----------------------------------------------------------------------------
 
 SING_BOX_VERSION = "1.14.4"
@@ -2118,6 +2119,14 @@ TUNNEL_TUN_ADDR6 = "fd7a:7a70:7761::1/126"
 TUNNEL_FAKE4 = "10.249.0.0/16"
 TUNNEL_FAKE4_PREFIX = "10.249."
 TUNNEL_FAKE6 = "fd7a:7a70:fa4e::/64"
+# Подсети Telegram (https://core.telegram.org/resources/cidr.txt). Приложение
+# Telegram подключается к серверам по IP, без DNS и без TLS-имени, поэтому
+# ни FakeIP, ни профили zapret его не ловят. Эти подсети всегда идут в туннель.
+TELEGRAM_CIDR4 = ["91.108.56.0/22", "91.108.4.0/22", "91.108.8.0/22", "91.108.16.0/22",
+                  "91.108.12.0/22", "149.154.160.0/20", "91.105.192.0/23", "91.108.20.0/22",
+                  "185.76.151.0/24"]
+TELEGRAM_CIDR6 = ["2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48",
+                  "2001:b28:f23c::/48", "2a0a:f280::/32"]
 TUNNEL_RT_TABLE = 2649
 TUNNEL_RT_RULE = 8640
 
@@ -2907,8 +2916,9 @@ def save_profiles(profiles):
 
 
 def tunnel_ipset_header():
-    return ["# Адреса, которые zapret не трогает: трафик в туннель (FakeIP) и серверы туннеля.",
-            "# Файл создаётся автоматически.", TUNNEL_FAKE4, TUNNEL_FAKE6]
+    return (["# Адреса, которые zapret не трогает: трафик в туннель (FakeIP, Telegram) и серверы туннеля.",
+             "# Файл создаётся автоматически.", TUNNEL_FAKE4, TUNNEL_FAKE6]
+            + TELEGRAM_CIDR4 + TELEGRAM_CIDR6)
 
 
 def ensure_tunnel_ipset():
@@ -3442,8 +3452,9 @@ def build_tunnel_config(profile):
                 "address": [TUNNEL_TUN_ADDR4] + ([TUNNEL_TUN_ADDR6] if v6 else []),
                 "mtu": 1400,
                 "auto_route": True,
-                # В TUN идут только FakeIP: остальной трафик мимо sing-box.
-                "route_address": [TUNNEL_FAKE4] + ([TUNNEL_FAKE6] if v6 else []),
+                # В TUN идут только FakeIP и подсети Telegram: остальной трафик мимо sing-box.
+                "route_address": ([TUNNEL_FAKE4] + TELEGRAM_CIDR4
+                                  + ([TUNNEL_FAKE6] + TELEGRAM_CIDR6 if v6 else [])),
                 "iproute2_table_index": TUNNEL_RT_TABLE,
                 "iproute2_rule_index": TUNNEL_RT_RULE,
             },

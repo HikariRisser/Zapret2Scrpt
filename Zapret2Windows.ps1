@@ -83,7 +83,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.0'
+$script:ScriptVersion='1.8.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1306,7 +1306,8 @@ function Toggle-Autostart {
 #  ссылки и подписки).
 #
 #  Схема (скорость остального трафика не страдает):
-#    * sing-box поднимает TUN, но маршрутизирует в него ТОЛЬКО диапазон FakeIP.
+#    * sing-box поднимает TUN, но маршрутизирует в него ТОЛЬКО диапазон FakeIP
+#      и подсети Telegram (приложение ходит к серверам по IP, без DNS).
 #      Весь прочий трафик идёт мимо sing-box, напрямую, через zapret.
 #    * DNS-запросы доменов из lists\tunnel.txt Windows отправляет в sing-box
 #      (правило NRPT): они получают FakeIP и попадают в туннель. Остальной
@@ -1329,12 +1330,24 @@ $script:TunnelFake4='10.249.0.0/16'
 $script:TunnelFake4Prefix='10.249.'
 $script:TunnelFake6='fd7a:7a70:fa4e::/64'
 $script:TunnelNrptComment='Zapret2Tunnel'
+# Подсети Telegram (https://core.telegram.org/resources/cidr.txt). Приложение
+# Telegram подключается к серверам по IP, без DNS и без TLS-имени, поэтому
+# ни FakeIP, ни профили zapret его не ловят. Эти подсети всегда идут в туннель.
+$script:TelegramCidr4=@(
+    '91.108.56.0/22','91.108.4.0/22','91.108.8.0/22','91.108.16.0/22',
+    '91.108.12.0/22','149.154.160.0/20','91.105.192.0/23','91.108.20.0/22',
+    '185.76.151.0/24'
+)
+$script:TelegramCidr6=@(
+    '2001:b28:f23d::/48','2001:b28:f23f::/48','2001:67c:4e8::/48',
+    '2001:b28:f23c::/48','2a0a:f280::/32'
+)
 $script:TunnelIpsetHeader=@(
-    '# Адреса, которые zapret не трогает: трафик в туннель (FakeIP) и серверы туннеля.',
+    '# Адреса, которые zapret не трогает: трафик в туннель (FakeIP, Telegram) и серверы туннеля.',
     '# Файл создаётся автоматически.',
     $script:TunnelFake4,
     $script:TunnelFake6
-)
+)+$script:TelegramCidr4+$script:TelegramCidr6
 # Firefox спрашивает этот домен у системного DNS; ответ "нет такого домена"
 # выключает его встроенный DNS через HTTPS (если тот включён по умолчанию, а
 # не вручную). Иначе Firefox узнаёт адреса сайтов мимо туннеля.
@@ -2421,10 +2434,10 @@ function Write-TunnelConfig {
     Write-TunnelRulesFileOnly
     $parts=Get-ProfileParts $Prof
     $fake=[ordered]@{ type='fakeip'; tag='fakeip'; inet4_range=$script:TunnelFake4 }
-    $tunAddr=@($script:TunnelAddr4); $tunRoute=@($script:TunnelFake4)
+    $tunAddr=@($script:TunnelAddr4); $tunRoute=@($script:TunnelFake4)+$script:TelegramCidr4
     if(Test-Ipv6Available){
         $fake.inet6_range=$script:TunnelFake6
-        $tunAddr+=$script:TunnelAddr6; $tunRoute+=$script:TunnelFake6
+        $tunAddr+=$script:TunnelAddr6; $tunRoute+=@($script:TunnelFake6)+$script:TelegramCidr6
     }
     $cfg=[ordered]@{
         log=[ordered]@{ level='warn'; timestamp=$true; output=$p.Log }
@@ -2446,7 +2459,7 @@ function Write-TunnelConfig {
                 type='tun'; tag='tun-in'; interface_name=$script:TunnelIf
                 address=@($tunAddr); mtu=1400
                 auto_route=$true; strict_route=$false; stack='gvisor'
-                # В TUN идут только FakeIP: остальной трафик мимо sing-box.
+                # В TUN идут только FakeIP и подсети Telegram: остальной трафик мимо sing-box.
                 route_address=@($tunRoute)
             },
             [ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:TunnelMixedPort }
