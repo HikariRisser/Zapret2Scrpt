@@ -118,7 +118,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.2'
+$script:ScriptVersion='1.8.3'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -550,6 +550,33 @@ function Install-Runtime {
     Write-Host "Боевой каталог: $script:TrustedRuntime" -ForegroundColor DarkGray
     Write-Host 'Права: Администраторы/SYSTEM — полный доступ, Пользователи — только чтение.' -ForegroundColor DarkGray
 }
+function Get-CircularResetFlag { Join-Path $script:TrustedRuntime 'circular-reset.off' }
+function Test-CircularReset {
+    # Обрыв зависших соединений при подборе стратегии (по умолчанию включён).
+    -not (Test-Path -LiteralPath (Get-CircularResetFlag))
+}
+function Toggle-CircularReset {
+    Ensure-Admin
+    if(-not (Test-Path (Join-Path $script:TrustedRuntime 'winws2.exe'))){
+        throw 'Среда не установлена - сначала выполните установку (пункт 1).'
+    }
+    $f=Get-CircularResetFlag
+    if(Test-CircularReset){
+        [IO.File]::WriteAllText($f,'off',[Text.Encoding]::ASCII)
+        Write-Host '  Обрыв зависших соединений при подборе стратегии выключен.' -ForegroundColor Yellow
+    } else {
+        Remove-Item -LiteralPath $f -Force
+        Write-Host '  Обрыв зависших соединений при подборе стратегии включён.' -ForegroundColor Green
+    }
+    Write-Host '  Соединение, на котором стратегия не сработала, сразу обрывается, и программа' -ForegroundColor DarkGray
+    Write-Host '  переподключается со следующей стратегией, а не ждёт таймаутов (видео не зависает).' -ForegroundColor DarkGray
+    Write-LaunchConfig
+    if((Get-Status).Running){
+        Write-Host '  Перезапуск обхода...' -ForegroundColor DarkGray
+        Start-Zapret
+    }
+}
+
 function Write-LaunchConfig {
     # Конфиг и все ресурсы берутся из ЗАЩИЩЁННОГО каталога (System32),
     # а не из рабочей папки проекта, которая может быть доступна на запись
@@ -628,7 +655,10 @@ function Write-LaunchConfig {
       '--new','--filter-tcp=443','--filter-l7=tls',
       "--hostlist=$blocked","--hostlist-auto=$auto","--hostlist-exclude=$exclude",
       '--out-range=-d10',
-      '--in-range=-s5556','--lua-desync=circular:fails=2:retrans=2:nld=2',
+      # reset: соединение, на котором обнаружен сбой, сразу обрывается, и
+      # программа переподключается, а не ждёт таймаутов TCP (иначе видео
+      # YouTube и подобное надолго зависают, пока подбирается стратегия).
+      '--in-range=-s5556',$(if(Test-CircularReset){'--lua-desync=circular:fails=2:retrans=2:nld=2:reset'}else{'--lua-desync=circular:fails=2:retrans=2:nld=2'}),
       '--in-range=x','--payload=tls_client_hello',
       '--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6:strategy=1',
       '--lua-desync=multidisorder:pos=1,midsld:strategy=1',
@@ -671,6 +701,9 @@ function Start-Zapret {
     if(-not (Test-Path (Join-Path $script:TrustedRuntime 'winws2.exe'))){Install-Runtime}
     Stop-Zapret -Quiet
     if(-not (Test-Path (Join-Path $script:TrustedRuntime 'winws2.exe'))){Install-Runtime}
+    # Параметры запуска - по текущей версии скрипта и настройкам меню (после
+    # обновления скрипта не нужно помнить про пункт [1]).
+    Write-LaunchConfig
     $exe=Join-Path $script:TrustedRuntime 'winws2.exe'
     $cfg=Join-Path $script:TrustedRuntime 'winws2.args'
     $out=Join-Path $script:TrustedRuntime 'logs\stdout.log'; $err=Join-Path $script:TrustedRuntime 'logs\stderr.log'
@@ -3500,6 +3533,7 @@ function Show-Menu {
         Write-Host ('  [9] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
         Write-Host '  [10] Удалить из системы' -ForegroundColor Yellow
         Write-Host '  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)'
+        Write-Host ('  [12] Быстрый подбор стратегий (обрыв зависших соединений): ' + $(if(Test-CircularReset){'выключить'}else{'включить'}))
         Write-Host '  [0] Выход'
         $choice=Read-Host '  Выбор'
         try {
@@ -3533,6 +3567,7 @@ function Show-Menu {
                 '9' {Update-Self; if($script:ScriptVersion){Read-Host '  Нажмите Enter'}}
                 '10' {Remove-All; Read-Host '  Нажмите Enter'}
                 '11' {Show-TunnelMenu}
+                '12' {Toggle-CircularReset; Read-Host '  Нажмите Enter'}
                 '0' {return}
             }
         } catch {Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red; Read-Host '  Нажмите Enter'}

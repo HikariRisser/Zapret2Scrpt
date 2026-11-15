@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -789,8 +789,12 @@ def build_config():
     profiles += [
         # [3] TLS для доменов из списков: автоперебор стратегий (circular)
         # отдельно для каждого домена 2-го уровня. Стратегия 1 — прежняя.
+        # reset: соединение, на котором обнаружен сбой, сразу обрывается, и
+        # программа переподключается, а не ждёт таймаутов TCP (иначе видео
+        # YouTube и подобное надолго зависают, пока подбирается стратегия).
         f"--filter-tcp=443 --filter-l7=tls <HOSTLIST> {wx} "
-        "--in-range=-s5556 --lua-desync=circular:fails=2:retrans=2:nld=2 "
+        "--in-range=-s5556 --lua-desync=circular:fails=2:retrans=2:nld=2"
+        + (":reset " if circular_reset_enabled() else " ") +
         "--in-range=x --payload=tls_client_hello "
         "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6:strategy=1 "
         "--lua-desync=multidisorder:pos=1,midsld:strategy=1 "
@@ -912,6 +916,34 @@ def seed_lists():
     auto = os.path.join(ipset_dir(), "zapret-hosts-auto.txt")
     if not os.path.isfile(auto):
         open(auto, "w", encoding="utf-8").close()
+
+
+def circular_reset_flag():
+    return os.path.join(ipset_dir(), "zapret2win-circular-reset.off")
+
+
+def circular_reset_enabled():
+    """Обрыв зависших соединений при подборе стратегии (по умолчанию включён)."""
+    return not os.path.isfile(circular_reset_flag())
+
+
+def toggle_circular_reset():
+    ensure_root(sys.argv)
+    if not runtime_installed():
+        raise RuntimeError("среда не установлена — сначала выполните установку (пункт 1)")
+    if circular_reset_enabled():
+        open(circular_reset_flag(), "w", encoding="utf-8").close()
+        ok("Обрыв зависших соединений при подборе стратегии выключен")
+    else:
+        os.remove(circular_reset_flag())
+        ok("Обрыв зависших соединений при подборе стратегии включён")
+    info("Соединение, на котором стратегия не сработала, сразу обрывается, и программа "
+         "переподключается со следующей стратегией, а не ждёт таймаутов (видео не зависает).")
+    write_config()
+    if nfqws2_running():
+        info("Перезапуск обхода...")
+        stop_bypass()
+        start_bypass()
 
 
 def write_config():
@@ -4623,6 +4655,8 @@ def menu():
         print(f"  [9] Обновить скрипт (у вас {VERSION})")
         print(_c(C.YELLOW, "  [10] Удалить из системы"))
         print("  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)")
+        print("  [12] Быстрый подбор стратегий (обрыв зависших соединений): "
+              + ("выключить" if circular_reset_enabled() else "включить"))
         print("  [0] Выход")
 
         try:
@@ -4667,6 +4701,9 @@ def menu():
                 pause()
             elif choice == "11":
                 tunnel_menu()
+            elif choice == "12":
+                toggle_circular_reset()
+                pause()
             elif choice == "0":
                 return
         except KeyboardInterrupt:

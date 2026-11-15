@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Script version: 1.8.2. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
+Script version: 1.8.3. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
@@ -67,6 +67,7 @@ The same on both systems.
 | [9] | Update the script |
 | [10] | Remove from the system |
 | [11] | Tunnel for sites zapret cannot open |
+| [12] | Fast strategy switching (drop stalled connections): on / off |
 | [0] | Exit |
 
 ## How the bypass works
@@ -82,7 +83,7 @@ engine, so speed is unaffected.
 | Traffic | What is applied |
 |---|---|
 | HTTP | `fake` + `multisplit` |
-| TLS, listed domains | four strategies rotated per domain by the `circular` orchestrator: after two failures the domain moves to the next one |
+| TLS, listed domains | four strategies rotated per domain by the `circular` orchestrator: after two failures the domain moves to the next one; the stalled connection is dropped at once so the app reconnects (menu item [12], on by default) |
 | TLS, large hosting subnets | fake ClientHello with a whitelisted SNI against the cut-off after ~16 KB |
 | QUIC | `fake` on `quic_initial` |
 | Discord voice, STUN, WireGuard | `fake` on `discord_ip_discovery`, `stun`, WireGuard handshake |
