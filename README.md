@@ -308,8 +308,9 @@ points:
   launch through `sh`, `dash` and `bash`.
 - **Release workflow:** releases are published by it automatically.
 - **Windows, in CI (since 1.8.4):** the script is parsed by PowerShell 5.1,
-  checked by PSScriptAnalyzer, all definitions are loaded without errors,
-  read-only smoke actions run on a real Windows runner.
+  checked by PSScriptAnalyzer, 18 Pester tests of pure functions run
+  (version compare, link parsing, base64, bogon IPs, hosts encoding,
+  pinned checksums), read-only smoke actions run on a real Windows runner.
 - **Not tested:** the reworked Windows version has never been run on a real
   Windows machine (tunnel, single-file launch, speed-ups);
   tunnel autostart at boot on Linux; region detection against real site

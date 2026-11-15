@@ -385,6 +385,14 @@ function Test-AutostartTask {
 }
 function Ensure-Admin {
     if(Test-Admin){return}
+    # Путь попадает в командную строку перезапуска с ручным квотированием:
+    # кавычки и переводы строк в нём исказили бы её. Это параметр пользователя.
+    foreach($v in @($ZapretRoot,$TunnelConfig,$TunnelLink,$TunnelProfile)){
+        if($v -and ($v -match '["`r`n]')){
+            Write-Host "Недопустимые символы в параметре: $v" -ForegroundColor Red
+            exit 1
+        }
+    }
     $argList=@('-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
     if($NoAutostart){$argList+='-NoAutostart'}
     if($KeepLogs){$argList+='-KeepLogs'}
@@ -1305,8 +1313,11 @@ function Diagnose {
         $tcp=Test-Tcp443 $d
         $code='000'
         if(Get-Command curl.exe -ErrorAction SilentlyContinue){
-            $cmdLine = 'curl.exe -sS -o NUL -L --max-time 8 -A "Mozilla/5.0" -w "%{http_code}" https://' + $d + '/ 2>NUL'
-            $r = & cmd.exe /c $cmdLine
+            # Прямой вызов без cmd.exe /c: домены фиксированные, но так
+            # паттерн не зависит от экранирования и быстрее.
+            $ErrorActionPreference='Continue'
+            $r = & curl.exe -sS -o NUL -L --max-time 8 -A 'Mozilla/5.0' -w '%{http_code}' ("https://{0}/" -f $d) 2>$null
+            $ErrorActionPreference='Stop'
             if($r){$code=($r|Out-String).Trim()}
         }
         $class=if(-not $tcp){'TCP недоступен: нужен внешний маршрут'}elseif($code -eq '200'){'HTTP 200'}elseif($st.Running){'сбой DPI или протокола; смотрите журнал'}else{'ещё не проверялось с обходом'}
@@ -2109,6 +2120,7 @@ function ConvertFrom-ServerLink {
             $body=$body.TrimEnd('/')
             if($body -notmatch '@'){ $body=ConvertFrom-AnyBase64 $body }       # ss://base64(method:pass@host:port)
             $at=$body.LastIndexOf('@')
+            if($at -lt 1){ throw 'в ссылке ss:// нет userinfo@host:port (повреждённая ссылка или не base64)' }
             $cred=$body.Substring(0,$at); $addr=$body.Substring($at+1)
             if($cred -notmatch ':'){ $cred=ConvertFrom-AnyBase64 ([uri]::UnescapeDataString($cred)) }   # ss://base64(method:pass)@host:port
             else { $cred=[uri]::UnescapeDataString($cred) }
@@ -3070,9 +3082,15 @@ function Test-TunnelGeo {
 
 function Get-TunnelStarterProcess {
     # Фоновый запуск туннеля, если он ещё идёт.
+    # PID мог быть переиспят другой программой после перезагрузки -
+    # стартёр обязательно powershell/pwsh, иначе файл устарел.
     $p=Get-TunnelPaths
     if(-not (Test-Path $p.StarterPid)){ return $null }
-    try { return (Get-Process -Id ([int](Get-Content $p.StarterPid -Raw)) -ErrorAction Stop) } catch { return $null }
+    try {
+        $pr=Get-Process -Id ([int](Get-Content $p.StarterPid -Raw)) -ErrorAction Stop
+        if($pr.ProcessName -notin @('powershell','pwsh')){ return $null }
+        return $pr
+    } catch { return $null }
 }
 
 function Get-TunnelStatus {
@@ -3111,7 +3129,8 @@ function Start-TunnelProcess {
     $LASTEXITCODE=0
     $chk=& $p.Exe check -c $p.Config 2>&1
     if($LASTEXITCODE -ne 0){
-        Set-TunnelError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" })
+        # Чистим ANSI-цвета sing-box: они не читаются в last-error.txt.
+        Set-TunnelError 'Конфиг sing-box не прошёл проверку.' @($chk | ForEach-Object { "$_" -replace "$([char]27)\[[0-9;]*m",'' })
         return 'crash'
     }
     foreach($f in @($p.Log,$p.ErrLog)){ Remove-Item $f -Force -ErrorAction SilentlyContinue }
@@ -3866,8 +3885,15 @@ function Get-WorkingIPFor {
 function Test-BogonIP {
     # Адреса, которые провайдерский DNS подставляет вместо настоящих
     # (заглушки, 0.0.0.0, локальные сети) - это признак DNS-подмены.
+    # IPv6: ::, ::1, link-local fe80::/10, ULA fc00::/7; многоадресные
+    # 224/4 и зарезервированные 240/4, широковещательный 255.255.255.255.
     param([string]$IP)
-    return ($IP -match '^(0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)')
+    if($IP -match '^(0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|22[3-9]\.|2[3-5]\d\.|255\.255\.255\.255)'){ return $true }
+    if($IP -eq '::' -or $IP -eq '::1'){ return $true }
+    if($IP -match '^fe[89ab][0-9a-f]:'){ return $true }      # fe80::/10 link-local
+    if($IP -match '^f[cd][0-9a-f]{2}:'){ return $true }      # fc00::/7 ULA
+    if($IP -match '^ff[0-9a-f]{2}:'){ return $true }         # ff00::/8 multicast
+    return $false
 }
 
 function Test-TlsCert {

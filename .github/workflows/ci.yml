@@ -81,18 +81,12 @@ jobs:
           }
           Write-Host 'PSScriptAnalyzer: нет ошибок уровня Error'
 
-      - name: Холодная загрузка определений (до switch по действиям)
+      - name: Pester-тесты чистых функций
         shell: powershell
         run: |
-          # Всё до финального try/switch: определения функций и константы.
-          $text = Get-Content -LiteralPath Zapret2Windows.ps1 -Raw
-          $idx = $text.IndexOf("try {`r`nswitch(`$Action){")
-          if ($idx -lt 0) { Write-Host 'Не найден блок диспетчера'; exit 1 }
-          $head = $text.Substring(0, $idx)
-          $tmp = Join-Path $env:TEMP 'zapret2-definitions.ps1'
-          [IO.File]::WriteAllText($tmp, $head, (New-Object Text.UTF8Encoding $true))
-          . $tmp -Action Status -ErrorAction Stop
-          Write-Host 'Определения загружаются без ошибок'
+          # Загружает скрипт до блока диспетчера действий (только определения)
+          # и гоняет tests/Zapret2Windows.Tests.ps1 (18 тестов).
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-pester.ps1
 
       - name: Смок чтения -Action Check и -Action Status
         # Read-only действия без прав администратора. Пока не гейт: среда
