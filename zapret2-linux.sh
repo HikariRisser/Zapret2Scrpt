@@ -201,7 +201,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -1471,7 +1471,7 @@ def doh_update():
         domains = [ln.strip() for ln in f
                    if ln.strip() and not ln.strip().startswith("#")]
     # Домены туннеля разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
-    in_tunnel = set(list_entries(tunnel_list_path()))
+    in_tunnel = set(tunnel_domains())
     domains = [d for d in domains if d.lower() not in in_tunnel]
 
     # hosts сопоставляет точное имя: www-варианты нужны отдельно
@@ -1722,6 +1722,7 @@ def collect_report():
     cmd(["sh", "-c", "ip -br link 2>&1 | grep -iE 'tun|wg|tap|throne|nekoray|hiddify|sing' || echo 'нет'"])
     cmd(["sh", "-c", "ps -eo pid,args | grep -iE '[s]ing-box|[x]ray|[t]hrone|[n]ekoray|[h]iddify|[c]lash|[m]ihomo' | cut -c1-160 || true"])
 
+    lines.append(f"внешний список: {geolist_status()}; всего доменов в туннеле: {len(tunnel_domains())}")
     sec("Туннель: журналы")
     st = read_json(tunnel_path("state.json")) or {}
     lines.append(f"state: active={st.get('active')} tested={st.get('tested')} ranked={st.get('ranked')}")
@@ -1993,6 +1994,7 @@ def uninstall(assume_yes=False):
 
     stop_tunnel(quiet=True)
     cleanup_legacy_warp()
+    remove_geolist_timer()
 
     head("[2/4] Удаление службы...")
     run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
@@ -2026,7 +2028,7 @@ def uninstall(assume_yes=False):
 
     print()
     head("Проверка результата:")
-    units = [UNIT_PATH, TUNNEL_UNIT_PATH, XRAY_UNIT_PATH] + \
+    units = [UNIT_PATH, TUNNEL_UNIT_PATH, XRAY_UNIT_PATH, GEOLIST_UNIT_PATH, GEOLIST_TIMER_PATH] + \
             [f"/etc/systemd/system/{u}.service" for u in LEGACY_WARP_UNITS]
     rc_nft = 1
     if which("nft"):
@@ -3074,11 +3076,239 @@ def ipv6_available():
     return os.path.isfile("/proc/net/if_inet6")
 
 
+# --- внешний список сайтов с региональными ограничениями ---------------------
+#
+# Сайты, которые сами не пускают из России (claude.ai, chatgpt.com...),
+# «обучением» не найти: соединение с ними проходит, отказ приходит уже от
+# сайта. Их список ведёт сообщество (itdoginfo/allow-domains, раздел
+# GeoBlock). При включённом туннеле он скачивается, добавляется к списку
+# туннеля и обновляется раз в сутки. Свой список туннеля при этом не меняется.
+
+GEOLIST_URL = "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst"
+GEOLIST_FILE = "zapret2win-hosts-geoblock.txt"
+GEOLIST_SERVICE = "zapret2win-geolist"
+GEOLIST_UNIT_PATH = f"/etc/systemd/system/{GEOLIST_SERVICE}.service"
+GEOLIST_TIMER_PATH = f"/etc/systemd/system/{GEOLIST_SERVICE}.timer"
+GEOLIST_MAX_AGE = 24 * 3600
+# systemd-resolved принимает не больше 1024 доменов на интерфейс.
+TUNNEL_DOMAINS_MAX = 1000
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?\.)+[a-z0-9-]{2,}$")
+
+
+def geolist_path():
+    return os.path.join(ipset_dir(), GEOLIST_FILE)
+
+
+def geolist_enabled():
+    return not os.path.isfile(tunnel_path("geolist.off"))
+
+
+def geolist_entries():
+    return list_entries(geolist_path()) if geolist_enabled() else []
+
+
+def geolist_age():
+    """Сколько секунд назад список обновлялся; None, если его ещё нет."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(geolist_path()))
+    except OSError:
+        return None
+
+
+def tunnel_domains():
+    """Все домены, идущие в туннель: свой список и внешний, без повторов."""
+    doms = list_entries(tunnel_list_path())
+    seen = set(doms)
+    for d in geolist_entries():
+        if d not in seen:
+            seen.add(d)
+            doms.append(d)
+    return doms[:TUNNEL_DOMAINS_MAX]
+
+
+def parse_geolist(text):
+    """Домены из скачанного списка: по одному в строке, прочее отбрасывается."""
+    out, seen = [], set()
+    for ln in text.splitlines():
+        d = ln.split("#", 1)[0].strip().lower().strip(".")
+        if d and _DOMAIN_RE.match(d) and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def fetch_geolist():
+    """Скачивает список: напрямую, а если не вышло и туннель работает - через него."""
+    last = None
+    openers = [urllib.request.build_opener()]
+    if tunnel_running():
+        proxy = f"http://127.0.0.1:{TUNNEL_MIXED_PORT}"
+        openers.append(urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})))
+    for op in openers:
+        try:
+            req = urllib.request.Request(GEOLIST_URL, headers={"User-Agent": f"zapret2-linux/{VERSION}"})
+            with op.open(req, timeout=30) as r:
+                doms = parse_geolist(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
+            if len(doms) < 50:
+                raise ValueError(f"в ответе только {len(doms)} доменов - это не список")
+            return doms
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"список не скачался: {last}")
+
+
+def update_geolist(force=False):
+    """
+    Обновляет внешний список, если он старше суток (или force). Возвращает
+    True, если список скачан заново. Сбой не мешает работе: остаётся прежний.
+    """
+    if not geolist_enabled():
+        return False
+    age = geolist_age()
+    if not force and age is not None and age < GEOLIST_MAX_AGE - 3600:
+        return False
+    try:
+        doms = fetch_geolist()
+    except Exception as e:
+        warn(f"Внешний список сайтов с региональными ограничениями: {e}")
+        if age is not None:
+            info("Используется прежний список.")
+        return False
+    old = set(list_entries(geolist_path()))
+    os.makedirs(ipset_dir(), exist_ok=True)
+    tmp = geolist_path() + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# Сайты, которые сами не пускают из России. Источник:\n"
+                f"# {GEOLIST_URL}\n"
+                "# Файл обновляется автоматически раз в сутки - правки здесь будут потеряны.\n"
+                "# Свои сайты добавляйте в " + TUNNEL_LIST_FILE + ".\n")
+        f.write("\n".join(doms) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, geolist_path())
+    new = set(doms)
+    ok(f"Внешний список сайтов с региональными ограничениями: {len(doms)} доменов"
+       + (f" (добавлено {len(new - old)}, убрано {len(old - new)})" if old else ""))
+    remove_hosts_domains(doms)
+    write_tunnel_rules()
+    flush_dns()
+    return True
+
+
+def install_geolist_timer():
+    """
+    Обновление списка раз в сутки - таймер systemd. Таймеру нужен скрипт по
+    постоянному адресу, поэтому в каталог туннеля кладётся его копия.
+    """
+    if not which("systemctl"):
+        return
+    copy = tunnel_path("zapret2-linux.sh")
+    try:
+        if os.path.abspath(__file__) != copy:
+            shutil.copy2(os.path.abspath(__file__), copy)
+            os.chmod(copy, 0o755)
+    except OSError:
+        return
+    with open(GEOLIST_UNIT_PATH, "w", encoding="utf-8") as f:
+        f.write(f"""[Unit]
+Description=Zapret2: update the list of region-restricted sites for the tunnel
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={sys.executable} {copy} --action tunnel-geolist-auto
+""")
+    with open(GEOLIST_TIMER_PATH, "w", encoding="utf-8") as f:
+        f.write(f"""[Unit]
+Description=Zapret2: daily update of the region-restricted sites list
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
+""")
+    run(["systemctl", "daemon-reload"], timeout=60)
+    run(["systemctl", "enable", "--now", f"{GEOLIST_SERVICE}.timer"], timeout=60)
+
+
+def remove_geolist_timer():
+    if which("systemctl"):
+        run(["systemctl", "disable", "--now", f"{GEOLIST_SERVICE}.timer"], timeout=60)
+    removed = False
+    for unit in (GEOLIST_TIMER_PATH, GEOLIST_UNIT_PATH):
+        try:
+            os.remove(unit)
+            removed = True
+        except OSError:
+            pass
+    if removed and which("systemctl"):
+        run(["systemctl", "daemon-reload"], timeout=60)
+
+
+def sync_geolist():
+    """Таймер и свежий список есть, пока включены туннель и внешний список."""
+    if tunnel_enabled() and geolist_enabled():
+        install_geolist_timer()
+        update_geolist()
+    else:
+        remove_geolist_timer()
+
+
+def geolist_action(force=True):
+    ensure_root(sys.argv)
+    if not geolist_enabled():
+        info("Внешний список выключен (меню туннеля, пункт [12]).")
+        return
+    update_geolist(force=force)
+
+
+def toggle_geolist():
+    ensure_root(sys.argv)
+    flag = tunnel_path("geolist.off")
+    if geolist_enabled():
+        os.makedirs(tunnel_dir(), exist_ok=True)
+        with open(flag, "w") as f:
+            f.write("1")
+        remove_geolist_timer()
+        write_tunnel_rules()
+        flush_dns()
+        ok("Внешний список выключен: в туннель идут только сайты из своего списка.")
+    else:
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+        sync_geolist()
+        write_tunnel_rules()
+        flush_dns()
+        if tunnel_enabled():
+            ok(f"Внешний список включён: {len(geolist_entries())} доменов.")
+        else:
+            ok("Внешний список включён: он скачается при включении туннеля.")
+
+
+def geolist_status():
+    if not geolist_enabled():
+        return "выключен"
+    n = len(geolist_entries())
+    age = geolist_age()
+    if age is None or not n:
+        return "ещё не скачан"
+    when = "меньше часа назад" if age < 3600 else f"{int(age // 3600)} ч назад"
+    return f"{n} доменов, обновлён {when}"
+
+
 def write_tunnel_rules():
     """rule-set для sing-box из списка туннеля; sing-box перечитывает его сам."""
-    doms = list_entries(tunnel_list_path()) or ["tunnel.invalid"]
+    doms = tunnel_domains() or ["tunnel.invalid"]
     write_json(tunnel_path("rules.json"),
                {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
+    # Полный перечень доменов для скрипта DNS (свой список + внешний).
+    with open(tunnel_path("domains.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(tunnel_domains()) + "\n")
     write_tunnel_dns_script()
     if tunnel_tun_exists():
         apply_tunnel_dns()
@@ -3098,7 +3328,7 @@ def write_tunnel_dns_script():
     script = f"""#!/bin/sh
 # Сгенерировано zapret2-linux: DNS доменов туннеля -> sing-box (FakeIP)
 IF={TUNNEL_TUN}
-LIST='{tunnel_list_path()}'
+LIST='{tunnel_path("domains.txt")}'
 command -v resolvectl >/dev/null 2>&1 || exit 0
 i=0
 while [ $i -lt 30 ] && ! ip link show "$IF" >/dev/null 2>&1; do sleep 0.5; i=$((i+1)); done
@@ -3165,7 +3395,7 @@ def warn_browser_dns():
 
 def check_tunnel_dns():
     """Проверяет, что домен из списка туннеля действительно получает FakeIP."""
-    doms = list_entries(tunnel_list_path())
+    doms = tunnel_domains()
     if not doms:
         return
     try:
@@ -3754,6 +3984,7 @@ def start_tunnel():
         set_tunnel_error(lines[0], lines[1:])
         return
     stop_tunnel(quiet=True)
+    sync_geolist()      # список старше суток обновляется; таймер на месте
     st = read_json(tunnel_path("state.json")) or {}
     profile = find_profile(st.get("active", ""))
     if not profile:
@@ -3780,8 +4011,7 @@ def start_tunnel():
     sync_tunnel_autostart()
     apply_tunnel_dns()
     flush_dns()
-    ok(f"Туннель работает: «{profile['name']}». Сайтов в списке туннеля: "
-       f"{len(list_entries(tunnel_list_path()))}")
+    ok(f"Туннель работает: «{profile['name']}». Сайтов в туннеле: {tunnel_sites_summary()}")
     report_tunnel_exit()
     check_tunnel_dns()
 
@@ -3871,6 +4101,7 @@ def enable_tunnel(assume_yes=False):
         return
     with open(tunnel_path("enabled"), "w") as f:
         f.write("1")
+    sync_geolist()
     start_tunnel()
     if tunnel_running():
         ans = "y"
@@ -3891,6 +4122,7 @@ def disable_tunnel():
     except OSError:
         pass
     stop_tunnel()
+    remove_geolist_timer()
     if os.path.isfile(TUNNEL_UNIT_PATH):
         run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
     flush_dns()
@@ -3971,7 +4203,7 @@ def update_tunnel_routes():
         return
     if not nfqws2_running():
         warn("zapret не запущен — в туннель попадут и сайты, которые zapret открыл бы сам")
-    in_tunnel = set(list_entries(tunnel_list_path()))
+    in_tunnel = set(tunnel_domains())
     excl = set(list_entries(os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt")))
     cands = []
     for name in ("zapret-hosts-user.txt", "zapret-hosts-auto.txt"):
@@ -4016,7 +4248,8 @@ def tunnel_test(domains=None):
     if not tunnel_running():
         err("Туннель не запущен")
         return
-    doms = domains or list_entries(tunnel_list_path())
+    # Внешний список большой - проверяем свой, а из внешнего берём несколько для примера.
+    doms = domains or (list_entries(tunnel_list_path()) + geolist_entries()[:5])
     if not doms:
         info("Список туннеля пуст")
         return
@@ -4057,6 +4290,12 @@ CUSTOM_HELP = f"""
 """
 
 
+def tunnel_sites_summary():
+    own = len(list_entries(tunnel_list_path()))
+    ext = len(tunnel_domains()) - own
+    return f"{own} своих + {ext} из внешнего списка" if ext > 0 else str(own)
+
+
 def tunnel_status_line():
     st = read_json(tunnel_path("state.json")) or {}
     if tunnel_running():
@@ -4069,8 +4308,7 @@ def tunnel_status_line():
     ex = read_json(tunnel_path("exit.json")) or {}
     where = f" | выход: {ex.get('loc')}" if ex and tunnel_running() else ""
     print(f"  Туннель: {'включён' if tunnel_enabled() else 'выключен'} | {state} | "
-          f"профилей: {len(load_profiles())} | сайтов в списке: "
-          f"{len(list_entries(tunnel_list_path()))}{where}")
+          f"профилей: {len(load_profiles())} | сайтов: {tunnel_sites_summary()}{where}")
 
 
 def show_profiles():
@@ -4119,6 +4357,8 @@ def tunnel_menu():
         print("  [8] Проверить сайты из списка туннеля (как в браузере)")
         print("  [9] Профили: показать / удалить")
         print("  [10] Региональные ограничения: проверить сайты через активный профиль")
+        print(f"  [11] Внешний список сайтов с региональными ограничениями: обновить сейчас ({geolist_status()})")
+        print("  [12] Внешний список: " + ("выключить" if geolist_enabled() else "включить"))
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
@@ -4156,6 +4396,10 @@ def tunnel_menu_action(ch, en):
         select_profile()
     elif ch == "6":
         update_tunnel_routes()
+    elif ch == "11":
+        geolist_action()
+    elif ch == "12":
+        toggle_geolist()
     elif ch == "10":
         tunnel_geo()
     elif ch == "7":
@@ -4356,6 +4600,8 @@ ACTIONS = {
     "tunnel-select": None,
     "tunnel-use": None,
     "tunnel-geo": None,
+    "tunnel-geolist": None,
+    "tunnel-geolist-auto": None,
     "tunnel-routes": None,
     "tunnel-test": None,
     "tunnel-list": None,
@@ -4398,6 +4644,7 @@ def main():
   tunnel-select  проверить профили и выбрать лучший (с учётом региональных ограничений сайтов)
   tunnel-use     выбрать профиль вручную: --profile <номер | имя | auto>
   tunnel-geo     проверить сайты с региональными ограничениями через активный профиль
+  tunnel-geolist обновить внешний список сайтов с региональными ограничениями
   tunnel-routes  проверить сайты и перенести неоткрывающиеся в туннель
   tunnel-test    проверить сайты из списка туннеля так, как их видит браузер
   tunnel-list    показать профили
@@ -4452,6 +4699,8 @@ def main():
         "tunnel-select": lambda: (ensure_root(sys.argv), select_profile()),
         "tunnel-use": lambda: use_profile(args.profile or "") if args.profile else (show_profiles(), info("укажите --profile <номер | имя | auto>")),
         "tunnel-geo": tunnel_geo,
+        "tunnel-geolist": geolist_action,
+        "tunnel-geolist-auto": lambda: geolist_action(force=False),
         "tunnel-routes": update_tunnel_routes,
         "tunnel-test": tunnel_test,
         "tunnel-list": show_profiles,

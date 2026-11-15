@@ -11,10 +11,18 @@
   Это средство обхода DPI, а не VPN. Оно не создаёт маршрут в обход
   IP/маршрутизационных блокировок: для них нужен доступный внешний туннель
   или иной VPN-endpoint.
+
+  Zapret2Windows.ps1 и Zapret2Windows.cmd - один и тот же скрипт в двух
+  видах, каждый работает сам по себе, второй файл рядом не нужен:
+    * Zapret2Windows.cmd - запуск двойным щелчком;
+    * Zapret2Windows.ps1 - правой кнопкой "Выполнить с помощью PowerShell"
+      либо  powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1
+      (файл .ps1 должен оставаться в кодировке UTF-8 с BOM).
+  Права администратора скрипт запрашивает сам.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelGeoList','TunnelGeoListAuto','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -24,18 +32,46 @@ param(
     [string]$TunnelConfig = '',  # с TunnelImport: путь к файлу (WireGuard .conf, JSON, список ссылок)
     [string]$TunnelLink = '',    # с TunnelImport: ссылка на сервер или адрес подписки
     [switch]$Proton,             # с TunnelImport: это конфиг Proton VPN Free
-    [string]$TunnelProfile = ''  # с TunnelUse: номер или имя профиля; auto - выбрать автоматически
+    [string]$TunnelProfile = '', # с TunnelUse: номер или имя профиля; auto - выбрать автоматически
+    [switch]$Elevated            # служебный: скрипт перезапущен с правами администратора
 )
 $ErrorActionPreference='Stop'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch {}
-# Корень проекта. $PSScriptRoot может быть пустым (например, при запуске
-# через .cmd или из другого хоста), поэтому используем запасные варианты.
-$script:AppRoot=$(
-    if($PSScriptRoot){ $PSScriptRoot }
-    elseif($PSCommandPath){ Split-Path -Parent $PSCommandPath }
-    elseif($MyInvocation.MyCommand.Path){ Split-Path -Parent $MyInvocation.MyCommand.Path }
-    else { (Get-Location).Path }
-)
+if($PSVersionTable.PSVersion.Major -lt 5){
+    Write-Host 'Нужен Windows PowerShell 5.1 (есть в Windows 10/11).' -ForegroundColor Red
+    exit 1
+}
+# Путь к самому файлу скрипта. При запуске из Zapret2Windows.cmd код
+# исполняется как блок, $PSCommandPath пуст - путь и аргументы командной
+# строки лаунчер передаёт в переменных окружения ZAPRET2_SELF и ZAPRET2_ARGS.
+$script:SelfPath=$PSCommandPath
+if(-not $script:SelfPath -and $env:ZAPRET2_SELF){
+    $script:SelfPath=$env:ZAPRET2_SELF
+    $zArgs="$env:ZAPRET2_ARGS"
+    $env:ZAPRET2_SELF=$null; $env:ZAPRET2_ARGS=$null     # не передавать дочерним процессам
+    $zTokens=@([regex]::Matches($zArgs,'"([^"]*)"|(\S+)') |
+               ForEach-Object { if($_.Groups[1].Success){ $_.Groups[1].Value } else { $_.Groups[2].Value } })
+    $zSwitches=@('NoAutostart','KeepLogs','IncludeProject','Force','Proton','Elevated')
+    $zStrings=@('Action','ZapretRoot','TunnelConfig','TunnelLink','TunnelProfile')
+    for($zi=0; $zi -lt $zTokens.Count; $zi++){
+        $zName=$zTokens[$zi].TrimStart('-')
+        if($zTokens[$zi] -notmatch '^-' -or (($zSwitches + $zStrings) -notcontains $zName)){
+            Write-Host "Неизвестный параметр: $($zTokens[$zi])" -ForegroundColor Red
+            exit 1
+        }
+        if($zSwitches -contains $zName){ Set-Variable -Name $zName -Value ([switch]$true); continue }
+        $zi++
+        if($zi -ge $zTokens.Count){ Write-Host "У параметра -$zName нет значения." -ForegroundColor Red; exit 1 }
+        try { Set-Variable -Name $zName -Value $zTokens[$zi] }
+        catch { Write-Host "Недопустимое значение параметра -${zName}: $($zTokens[$zi])" -ForegroundColor Red; exit 1 }
+    }
+}
+if(-not $script:SelfPath -and $MyInvocation.MyCommand.Path){ $script:SelfPath=$MyInvocation.MyCommand.Path }
+$script:SelfIsCmd=("$($script:SelfPath)" -match '\.(cmd|bat)$')
+$script:SelfName=$(if($script:SelfIsCmd){'Zapret2Windows.cmd'}else{'Zapret2Windows.ps1'})
+# Корень проекта - каталог, где лежит файл скрипта.
+$script:AppRoot=$(if($script:SelfPath){ Split-Path -Parent $script:SelfPath } else { (Get-Location).Path })
+$script:IsAdmin=$null
 if(-not $ZapretRoot){ $ZapretRoot = Join-Path $script:AppRoot 'zapret2-v1.0.6' }
 $script:Runtime=Join-Path $script:AppRoot 'runtime\winws2'
 $script:TrustedRuntime=Join-Path $env:SystemRoot 'System32\Zapret2Windows'
@@ -47,7 +83,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.7.1'
+$script:ScriptVersion='1.8.0'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -242,26 +278,73 @@ $script:SeedHostingIpset=@(
 )
 
 function Test-Admin {
-    $id=[Security.Principal.WindowsIdentity]::GetCurrent()
-    return ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # Результат не меняется, пока процесс жив, - считаем один раз.
+    if($null -eq $script:IsAdmin){
+        $id=[Security.Principal.WindowsIdentity]::GetCurrent()
+        $script:IsAdmin=([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    return $script:IsAdmin
+}
+function Get-SelfLaunch {
+    <#
+      Команда для повторного запуска этого же скрипта (с правами
+      администратора, в фоне, из планировщика): File и Args.
+      Скрипт в виде .cmd запускается через cmd.exe, в виде .ps1 - через
+      powershell.exe -File.
+    #>
+    param([string[]]$Arguments=@(),[switch]$Hidden)
+    $self=$script:SelfPath
+    if(-not $self -or -not (Test-Path -LiteralPath $self)){ throw "Не найден файл скрипта: $self" }
+    $tail=($Arguments -join ' ')
+    if($script:SelfIsCmd){
+        return [pscustomobject]@{ File=$env:ComSpec; Args=('/c ""{0}" {1}"' -f $self,$tail) }
+    }
+    $hide=$(if($Hidden){'-WindowStyle Hidden '}else{''})
+    return [pscustomobject]@{ File=(Join-Path $PSHOME 'powershell.exe')
+                              Args=('-NoProfile -ExecutionPolicy Bypass {0}-File "{1}" {2}' -f $hide,$self,$tail) }
+}
+function Get-ProcessByExe {
+    <#
+      Процессы с данным именем, запущенные из данного файла. Заметно быстрее
+      запроса WMI (Win32_Process), а статус нужен при каждой отрисовке меню.
+      Без прав администратора путь чужого процесса не читается - тогда
+      считаем совпадением само имя.
+    #>
+    param([string]$Name,[string]$Path)
+    $found=@()
+    foreach($pr in [Diagnostics.Process]::GetProcessesByName($Name)){
+        $file=$null
+        try { $file=$pr.MainModule.FileName } catch {}
+        if(-not $file -or $file -ieq $Path){ $found+=$pr }
+    }
+    return $found
+}
+function Test-AutostartTask {
+    # Есть ли задача автозапуска. Файл задачи проверяется мгновенно, но виден
+    # только администратору; иначе - обычный (медленный) запрос планировщика.
+    if(Test-Admin){ return (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\Tasks\$($script:TaskName)")) }
+    return [bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
 }
 function Ensure-Admin {
     if(Test-Admin){return}
-    $self=$PSCommandPath
-    if(-not $self){ $self = Join-Path $script:AppRoot 'Zapret2Windows.ps1' }
-    $argList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $self),
-               '-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
+    $argList=@('-Action',$Action,'-ZapretRoot',('"{0}"' -f $ZapretRoot))
     if($NoAutostart){$argList+='-NoAutostart'}
+    if($KeepLogs){$argList+='-KeepLogs'}
+    if($IncludeProject){$argList+='-IncludeProject'}
+    if($Force){$argList+='-Force'}
+    # Новое окно закрылось бы сразу после действия - по этому признаку
+    # скрипт в конце ждёт нажатия Enter.
+    $argList+='-Elevated'
     if($TunnelConfig){$argList+=@('-TunnelConfig',('"{0}"' -f $TunnelConfig))}
     if($TunnelLink){$argList+=@('-TunnelLink',('"{0}"' -f $TunnelLink))}
     if($Proton){$argList+='-Proton'}
     if($TunnelProfile){$argList+=@('-TunnelProfile',('"{0}"' -f $TunnelProfile))}
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs | Out-Null
+    $l=Get-SelfLaunch $argList
+    Start-Process -FilePath $l.File -ArgumentList $l.Args -Verb RunAs | Out-Null
     exit
 }
 function Find-Source {
     if(-not (Test-Path $ZapretRoot)){throw "Не найден исходный релиз zapret2: $ZapretRoot"}
-    $p=Get-CimInstance Win32_OperatingSystem
     if([Environment]::Is64BitOperatingSystem){$arch='windows-x86_64'}else{$arch='windows-x86'}
     $bin=Join-Path $ZapretRoot "binaries\$arch"
     if(-not (Test-Path (Join-Path $bin 'winws2.exe'))){throw "В bundled release нет winws2 для $arch"}
@@ -352,6 +435,9 @@ function Merge-ListFile {
 }
 function Install-Runtime {
     Ensure-Admin
+    # Автозапуск включаем только при первой установке: при обновлении среды
+    # выключенный пользователем автозапуск не должен включаться снова.
+    $firstInstall=-not (Test-Path (Join-Path $script:TrustedRuntime 'winws2.exe'))
     if(-not (Test-Path $ZapretRoot)){Get-Upstream}
     Find-Source
     # Останавливаем работающий экземпляр: иначе занятый winws2.exe не заменить.
@@ -421,9 +507,10 @@ function Install-Runtime {
 
     Write-LaunchConfig
     Fix-DriverService
-    # DNS-блок не лечится десинхронизацией: разрешаем имена через DoH.
-    Update-DohHosts -Quiet
-    if(-not $NoAutostart){Install-Autostart}
+    # Проверка DNS (DoH) выполняется при первом запуске обхода, а не здесь:
+    # без обхода нельзя отличить подмену DNS от блокировки DPI, и проверка
+    # каждого домена упиралась в таймауты (установка шла минутами).
+    if(-not $NoAutostart -and $firstInstall){Install-Autostart}
     Write-Host "Среда установлена ($($script:Arch))" -ForegroundColor Green
     Write-Host "Боевой каталог: $script:TrustedRuntime" -ForegroundColor DarkGray
     Write-Host 'Права: Администраторы/SYSTEM — полный доступ, Пользователи — только чтение.' -ForegroundColor DarkGray
@@ -561,6 +648,15 @@ function Start-Zapret {
     [IO.File]::WriteAllText((Join-Path $script:TrustedRuntime 'winws2.pid'),[string]$p.Id,[Text.Encoding]::ASCII)
     Write-Host "winws2 запущен, PID $($p.Id). WinDivert обрабатывает сетевой трафик системы." -ForegroundColor Green
     Write-Host 'Автосписок включён: домен добавится после сигналов неуспешного доступа.' -ForegroundColor DarkGray
+    # Первичная проверка DNS - один раз, когда обход уже работает.
+    $dohDone=Join-Path $script:TrustedRuntime 'lists\doh.done'
+    if(-not (Test-Path -LiteralPath $dohDone)){
+        Write-Host 'Первичная проверка DNS (один раз, до минуты)...' -ForegroundColor DarkGray
+        try {
+            Update-DohHosts -Quiet
+            [IO.File]::WriteAllText($dohDone,(Get-Date).ToString('s'),[Text.Encoding]::ASCII)
+        } catch { Write-Host ('  Проверка DNS не выполнена: ' + $_.Exception.Message) -ForegroundColor Yellow }
+    }
     if((Get-TunnelStatus).Enabled){ Start-TunnelBackground }
 }
 function Stop-Zapret {
@@ -579,20 +675,19 @@ function Stop-Zapret {
     # Ждём фактического завершения: иначе занятый winws2.exe не заменить
     # при обновлении (гонка между kill и последующим Copy-Item).
     for($i=0; $i -lt 12; $i++){
-        $procs=@(Get-CimInstance Win32_Process -Filter "Name='winws2.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ExecutablePath -eq $exe })
+        $procs=@(Get-ProcessByExe 'winws2' $exe)
         if(-not $procs.Count){break}
-        $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $procs | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 400
     }
     if(-not $Quiet){Write-Host 'winws2 остановлен.' -ForegroundColor Yellow}
 }
 function Get-Status {
-    $p=Get-CimInstance Win32_Process -Filter "Name='winws2.exe'" -ErrorAction SilentlyContinue | Where-Object {$_.ExecutablePath -eq (Join-Path $script:TrustedRuntime 'winws2.exe')}
+    $p=@(Get-ProcessByExe 'winws2' (Join-Path $script:TrustedRuntime 'winws2.exe')) | Select-Object -First 1
     [pscustomobject]@{
-        Running=[bool]$p; Pid=if($p){$p.ProcessId}else{$null};
+        Running=[bool]$p; Pid=if($p){$p.Id}else{$null};
         Runtime=(Test-Path (Join-Path $script:TrustedRuntime 'winws2.exe'));
-        AutoStart=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue);
+        AutoStart=(Test-AutostartTask);
         LearnedDomains=if(Test-Path (Join-Path $script:TrustedRuntime 'lists\autohostlist.txt')){@(Get-Content (Join-Path $script:TrustedRuntime 'lists\autohostlist.txt')|Where-Object {$_ -and $_ -notmatch '^\s*#'}).Count}else{0}
     }
 }
@@ -640,8 +735,7 @@ function Test-Tls12Enabled {
     $c=(Get-ItemProperty "$base\Client" -Name Enabled,DisabledByDefault -ErrorAction SilentlyContinue)
     if($c -and $c.Enabled -eq 1 -and $c.DisabledByDefault -eq 0){ return $true }
     # 3) современная сборка Windows 10/11 включает TLS 1.2 по умолчанию
-    $build=[int](Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber
-    return ($build -ge 17763)
+    return ([Environment]::OSVersion.Version.Build -ge 17763)
 }
 
 function Get-DependencyReport {
@@ -650,13 +744,17 @@ function Get-DependencyReport {
         Name, Detail, Status (OK/FAIL/WARN), Required, Fixable
     #>
     $r=New-Object System.Collections.Generic.List[object]
-    $os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    $build=if($os){[int]$os.BuildNumber}else{0}
+    # Сведения о системе - из реестра и .NET: запрос WMI занимал до секунды
+    # при каждом открытии меню.
+    $build=[Environment]::OSVersion.Version.Build
+    $osName=''
+    try { $osName="$((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction Stop).ProductName)" } catch {}
+    if($build -ge 22000){ $osName=($osName -replace 'Windows 10','Windows 11') }   # в реестре Windows 11 записана как 10
 
     $r.Add([pscustomobject]@{
         Name='Windows 10/11'; Required=$true; Fixable=$false
         Status=$(if($build -ge 10240){'OK'}else{'FAIL'})
-        Detail=$(if($os){"$($os.Caption) (build $build)"}else{'не удалось определить'})
+        Detail=$(if($osName){"$osName (build $build)"}else{"build $build"})
     })
 
     $r.Add([pscustomobject]@{
@@ -759,6 +857,8 @@ function Install-DotNet {
       Устанавливает .NET Framework 4.8: сначала менеджером пакетов,
       иначе прямым загрузчиком Microsoft. Возвращает $true при успехе.
     #>
+    # stderr внешних программ при 'Stop' в PS 5.1 превращается в исключение.
+    $ErrorActionPreference='Continue'
     $pm=Get-PackageManager
     if($pm -and $pm.Name -eq 'winget'){
         Write-Host '    Установка через winget...' -ForegroundColor DarkGray
@@ -800,6 +900,7 @@ function Install-DotNet {
 }
 
 function Install-Node {
+    $ErrorActionPreference='Continue'
     $pm=Get-PackageManager
     if(-not $pm){ return $false }
     if($pm.Name -eq 'winget'){
@@ -924,7 +1025,7 @@ function Show-Check {
     if($fail){
         $fixable=@($report | Where-Object { $_.Status -eq 'FAIL' -and $_.Fixable }).Count
         if($fixable){
-            Write-Host ("  Часть проблем исправляется автоматически (пункт [12]): $fixable") -ForegroundColor Yellow
+            Write-Host ("  Часть проблем исправляется автоматически (пункт [6]): $fixable") -ForegroundColor Yellow
         }
         Write-Host '  Остальное требует ручного вмешательства — см. пометки выше.' -ForegroundColor Red
     } elseif($warn){
@@ -952,11 +1053,14 @@ function Show-Status {
 }
 function Install-Autostart {
     Ensure-Admin
-    $scriptPath=$PSCommandPath
-    $act=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -Action Start -NoAutostart"
+    $l=Get-SelfLaunch @('-Action','Start','-NoAutostart') -Hidden
+    $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
     $trg=New-ScheduledTaskTrigger -AtLogOn
     $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName $script:TaskName -Action $act -Trigger $trg -Principal $pr -Force | Out-Null
+    # По умолчанию планировщик не запускает задачи при работе от батареи и
+    # снимает их через 3 дня - на ноутбуке автозапуск не срабатывал бы.
+    $set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $script:TaskName -Action $act -Trigger $trg -Principal $pr -Settings $set -Force | Out-Null
 }
 function Remove-Autostart {
     Ensure-Admin
@@ -1031,7 +1135,7 @@ function Get-RemoteScript {
     $branches=@($script:UpdateBranch,'main','master') | Select-Object -Unique
     $lastMsg=''
     foreach($b in $branches){
-        $url="https://raw.githubusercontent.com/$($script:UpdateRepo)/$b/Zapret2Windows.ps1"
+        $url="https://raw.githubusercontent.com/$($script:UpdateRepo)/$b/$($script:SelfName)"
         try {
             [Net.ServicePointManager]::SecurityProtocol =
                 [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -1042,7 +1146,7 @@ function Get-RemoteScript {
             # и файл перестанет парситься. Снимаем все ведущие BOM.
             $text=$text.TrimStart([char]0xFEFF)
             # Защита от HTML-страницы ошибки вместо скрипта.
-            if($text -notmatch 'param\s*\(' -or $text -notmatch 'Zapret2Windows'){
+            if($text -notmatch 'param\s*\(' -or $text -notmatch 'Zapret2Windows' -or ($script:SelfIsCmd -and $text -notmatch '^<\# :')){
                 $lastMsg="по адресу $url вернулся не скрипт"
                 continue
             }
@@ -1062,8 +1166,8 @@ function Update-Self {
     #>
     param([switch]$Force)
 
-    $self=Join-Path $script:AppRoot 'Zapret2Windows.ps1'
-    if(-not (Test-Path $self)){ throw "Не найден файл скрипта: $self" }
+    $self=$script:SelfPath
+    if(-not $self -or -not (Test-Path -LiteralPath $self)){ throw "Не найден файл скрипта: $self" }
 
     Write-Host ''
     Write-Host '  Обновление скрипта' -ForegroundColor Cyan
@@ -1130,9 +1234,12 @@ function Update-Self {
     Copy-Item -LiteralPath $self -Destination $bak -Force
     Write-Host ("    Резервная копия: " + (Split-Path -Leaf $bak)) -ForegroundColor DarkGray
 
-    # Запись с UTF-8 BOM — иначе PowerShell 5.1 сломает кириллицу.
+    # .ps1 - с UTF-8 BOM (иначе PowerShell 5.1 сломает кириллицу); .cmd - без
+    # BOM (иначе cmd.exe споткнётся на первой строке) и с переводами строк CRLF.
     try {
-        [IO.File]::WriteAllText($self,$remote.Text,(New-Object Text.UTF8Encoding $true))
+        $newText=$remote.Text
+        if($script:SelfIsCmd){ $newText=(($newText -replace "`r`n","`n") -replace "`n","`r`n") }
+        [IO.File]::WriteAllText($self,$newText,(New-Object Text.UTF8Encoding (-not $script:SelfIsCmd)))
     } catch {
         Copy-Item -LiteralPath $bak -Destination $self -Force
         throw ("Не удалось записать обновление, восстановлена резервная копия.`n  " + $_.Exception.Message)
@@ -1140,7 +1247,7 @@ function Update-Self {
 
     # Проверка синтаксиса нового файла до перезапуска.
     $parseErrors=$null
-    [void][System.Management.Automation.Language.Parser]::ParseFile($self,[ref]$null,[ref]$parseErrors)
+    [void][System.Management.Automation.Language.Parser]::ParseInput($remote.Text,[ref]$null,[ref]$parseErrors)
     if($parseErrors.Count){
         Copy-Item -LiteralPath $bak -Destination $self -Force
         throw ("Скачанный скрипт содержит синтаксические ошибки, восстановлена резервная копия:`n  " + $parseErrors[0].Message)
@@ -1155,10 +1262,8 @@ function Update-Self {
     if(-not $Force){
         $a=Read-Host '    Перезапустить скрипт сейчас? (y/N)'
         if($a -match '^\s*[yYдД]'){
-            Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-                '-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $self),
-                '-ZapretRoot',('"{0}"' -f $ZapretRoot)
-            ) -Verb RunAs
+            $l=Get-SelfLaunch @('-ZapretRoot',('"{0}"' -f $ZapretRoot))
+            Start-Process -FilePath $l.File -ArgumentList $l.Args -Verb RunAs
             exit
         }
     }
@@ -1181,7 +1286,7 @@ function Toggle-Run {
 }
 
 function Toggle-Autostart {
-    $on=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+    $on=Test-AutostartTask
     if($on){
         Remove-Autostart
         Write-Host '  Автозапуск при входе выключен.' -ForegroundColor Yellow
@@ -1250,6 +1355,14 @@ $script:SeedGeo=@(
 # Признаки отказа по региону: в адресе перенаправления или в тексте страницы.
 $script:GeoRegex='(?i)app-unavailable-in-region|unavailable[-_ ]in[-_ ](your[-_ ])?(region|country)|unsupported[-_ ](country|region)|country[-_ ]not[-_ ]supported|not[-_ ](available|supported)[-_ ]in[-_ ]your[-_ ](country|region|location)|region[-_ ](restricted|blocked)|geo[-_ ]?(block|restrict)|недоступ\w+ в ваш\w+ (стране|регионе)'
 $script:GeoLabel=@{ ok='открывается'; challenge='отвечает (проверка браузера)'; geo='отказ по региону'; deny='отказ (403)'; fail='нет ответа' }
+# Внешний список сайтов, которые сами не пускают из России (claude.ai,
+# chatgpt.com...). "Обучением" их не найти: соединение проходит, отказ приходит
+# уже от сайта. Список ведёт сообщество (itdoginfo/allow-domains, раздел
+# GeoBlock). При включённом туннеле он скачивается, добавляется к списку
+# туннеля и обновляется раз в сутки. Свой список туннеля при этом не меняется.
+$script:GeoListUrl='https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst'
+$script:GeoListTask='Zapret2WindowsGeoList'
+$script:TunnelDomainsMax=1000
 $script:TunnelTraceLast=''       # чем закончилась последняя проверка туннеля
 $script:TunnelExit=@{}           # откуда туннель выходит в интернет: loc, ip
 
@@ -1282,7 +1395,23 @@ function Get-TunnelPaths {
         StartLog=Join-Path $script:TrustedRuntime 'logs\tunnel-start.log'
         List=Join-Path $script:TrustedRuntime 'lists\tunnel.txt'
         Servers=Join-Path $script:TrustedRuntime 'lists\ipset-tunnel-servers.txt'
+        GeoList=Join-Path $script:TrustedRuntime 'lists\tunnel-geoblock.txt'
+        GeoListOff=Join-Path $d 'geolist.off'
     }
+}
+
+function Initialize-TunnelDirs {
+    # Туннель можно настроить и до установки среды zapret (пункт [1]):
+    # каталоги для профилей, списков и журналов создаём сами.
+    $p=Get-TunnelPaths
+    foreach($d in @($p.Dir,(Join-Path $script:TrustedRuntime 'lists'),(Join-Path $script:TrustedRuntime 'logs'))){
+        if(-not (Test-Path -LiteralPath $d)){ New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    }
+}
+
+function Test-Ipv6Available {
+    # Если IPv6 в системе выключен, sing-box не сможет назначить TUN v6-адрес.
+    try { return [bool][Net.Sockets.Socket]::OSSupportsIPv6 } catch { return $false }
 }
 
 function Write-JsonFile {
@@ -1301,9 +1430,17 @@ function Read-JsonFile {
 function Get-ListEntries {
     param([string]$Path)
     if(-not (Test-Path -LiteralPath $Path)){ return @() }
-    return @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue |
-             ForEach-Object { $_.Trim().ToLowerInvariant() } |
-             Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
+    # Обычный цикл вместо конвейера: списки читаются при каждой отрисовке
+    # меню, а внешний список - это сотни строк.
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]'
+    $out=New-Object System.Collections.Generic.List[string]
+    try {
+        foreach($l in [IO.File]::ReadAllLines($Path)){
+            $x=$l.Trim().ToLowerInvariant()
+            if($x -and -not $x.StartsWith('#') -and $seen.Add($x)){ $out.Add($x) }
+        }
+    } catch {}
+    return $out.ToArray()
 }
 
 function Get-FileTail {
@@ -2013,6 +2150,7 @@ function Import-TunnelProfiles {
     # Разбирает ввод, проверяет профили sing-box и сохраняет годные.
     param([string]$Text,[string]$Source='custom')
     Ensure-Admin
+    Initialize-TunnelDirs
     Remove-LegacyWarp
     $p=Get-TunnelPaths
     if(-not (Test-Path $p.Exe)){ Install-SingBox }
@@ -2071,10 +2209,161 @@ function Read-UserInput {
 
 # --- конфигурация sing-box ----------------------------------------------------
 
-function Write-TunnelRules {
-    # rule-set для sing-box из lists\tunnel.txt; sing-box перечитывает его сам.
+# --- внешний список сайтов с региональными ограничениями ----------------------
+
+function Test-GeoListEnabled { return (-not (Test-Path -LiteralPath (Get-TunnelPaths).GeoListOff)) }
+
+function Get-GeoListEntries {
+    if(-not (Test-GeoListEnabled)){ return @() }
+    return @(Get-ListEntries (Get-TunnelPaths).GeoList)
+}
+
+function Get-TunnelDomains {
+    # Все домены, идущие в туннель: свой список и внешний, без повторов.
     $p=Get-TunnelPaths
-    $d=@(Get-ListEntries $p.List)
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $all=New-Object System.Collections.Generic.List[string]
+    foreach($d in (@(Get-ListEntries $p.List) + @(Get-GeoListEntries))){
+        if($all.Count -ge $script:TunnelDomainsMax){ break }
+        if($seen.Add($d)){ $all.Add($d) }
+    }
+    return $all.ToArray()
+}
+
+function Get-TunnelSitesSummary {
+    $own=@(Get-ListEntries (Get-TunnelPaths).List).Count
+    $ext=@(Get-TunnelDomains).Count - $own
+    if($ext -gt 0){ return "$own своих + $ext из внешнего списка" }
+    return "$own"
+}
+
+function Get-GeoListAgeHours {
+    # Сколько часов назад список обновлялся; -1, если его ещё нет.
+    $f=(Get-TunnelPaths).GeoList
+    if(-not (Test-Path -LiteralPath $f)){ return -1 }
+    return [Math]::Max(0,((Get-Date) - (Get-Item -LiteralPath $f).LastWriteTime).TotalHours)
+}
+
+function Get-GeoListStatus {
+    if(-not (Test-GeoListEnabled)){ return 'выключен' }
+    $n=@(Get-GeoListEntries).Count
+    $age=Get-GeoListAgeHours
+    if($age -lt 0 -or -not $n){ return 'ещё не скачан' }
+    if($age -lt 1){ return "$n доменов, обновлён меньше часа назад" }
+    return "$n доменов, обновлён $([int][Math]::Floor($age)) ч назад"
+}
+
+function Update-GeoList {
+    <#
+      Обновляет внешний список, если он старше суток (или -Force). Возвращает
+      $true, если список скачан заново. Сбой не мешает работе: остаётся прежний.
+    #>
+    param([switch]$Force)
+    if(-not (Test-GeoListEnabled)){ return $false }
+    $p=Get-TunnelPaths
+    $age=Get-GeoListAgeHours
+    if(-not $Force -and $age -ge 0 -and $age -lt 23){ return $false }
+    Initialize-TunnelDirs
+    $text=$null; $lastErr=''
+    # Напрямую, а если не вышло и туннель работает - через него.
+    $proxies=@('')
+    if((Get-TunnelStatus).Running){ $proxies+="http://127.0.0.1:$($script:TunnelMixedPort)" }
+    foreach($px in $proxies){
+        try {
+            [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+            $wr=@{ Uri=$script:GeoListUrl; UseBasicParsing=$true; TimeoutSec=30; ErrorAction='Stop' }
+            if($px){ $wr.Proxy=$px }
+            $body=(Invoke-WebRequest @wr).Content
+            if($body -is [byte[]]){ $body=[Text.Encoding]::UTF8.GetString($body) }
+            $text="$body"
+            break
+        } catch { $lastErr=$_.Exception.Message }
+    }
+    $doms=New-Object System.Collections.Generic.List[string]
+    if($text){
+        $seen=New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach($ln in $text -split "`r?`n"){
+            $d=($ln -split '#',2)[0].Trim().ToLowerInvariant().Trim('.')
+            if($d -and $d -match '^([a-z0-9_]([a-z0-9_-]*[a-z0-9_])?\.)+[a-z0-9-]{2,}$' -and $seen.Add($d)){ $doms.Add($d) }
+        }
+        if($doms.Count -lt 50){ $lastErr="в ответе только $($doms.Count) доменов - это не список" }
+    }
+    if($doms.Count -lt 50){
+        Write-Host "  ! Внешний список сайтов с региональными ограничениями не скачался: $lastErr" -ForegroundColor Yellow
+        if($age -ge 0){ Write-Host '    Используется прежний список.' -ForegroundColor DarkGray }
+        return $false
+    }
+    $old=@(Get-ListEntries $p.GeoList)
+    $lines=@('# Сайты, которые сами не пускают из России. Источник:',
+             "# $($script:GeoListUrl)",
+             '# Файл обновляется автоматически раз в сутки - правки здесь будут потеряны.',
+             '# Свои сайты добавляйте в tunnel.txt.') + $doms.ToArray()
+    [IO.File]::WriteAllLines($p.GeoList,$lines,[Text.UTF8Encoding]::new($false))
+    $msg="  Внешний список сайтов с региональными ограничениями: $($doms.Count) доменов"
+    if($old.Count){
+        $added=@($doms | Where-Object { $old -notcontains $_ }).Count
+        $gone=@($old | Where-Object { -not $doms.Contains($_) }).Count
+        $msg+=" (добавлено $added, убрано $gone)"
+    }
+    Write-Host $msg -ForegroundColor Green
+    Remove-HostsDomains $doms.ToArray()
+    Write-TunnelRules
+    return $true
+}
+
+function Install-GeoListTask {
+    # Обновление списка раз в сутки - задача планировщика.
+    $l=Get-SelfLaunch @('-Action','TunnelGeoListAuto') -Hidden
+    $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
+    $trg=New-ScheduledTaskTrigger -Daily -At (Get-Date)
+    $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $script:GeoListTask -Action $act -Trigger $trg -Principal $pr -Settings $set -Force | Out-Null
+}
+
+function Remove-GeoListTask {
+    Unregister-ScheduledTask -TaskName $script:GeoListTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Test-GeoListTask {
+    return (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\Tasks\$($script:GeoListTask)"))
+}
+
+function Sync-GeoList {
+    # Задача и свежий список есть, пока включены туннель и внешний список.
+    try {
+        if((Test-Path -LiteralPath (Get-TunnelPaths).Enabled) -and (Test-GeoListEnabled)){
+            if(-not (Test-GeoListTask)){ Install-GeoListTask }
+            [void](Update-GeoList)
+        } elseif(Test-GeoListTask){ Remove-GeoListTask }
+    } catch {
+        Write-Host ('  ! Внешний список: ' + $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+function Switch-GeoList {
+    Ensure-Admin
+    Initialize-TunnelDirs
+    $p=Get-TunnelPaths
+    if(Test-GeoListEnabled){
+        [IO.File]::WriteAllText($p.GeoListOff,'1',[Text.Encoding]::ASCII)
+        Remove-GeoListTask
+        Write-TunnelRules
+        Write-Host '  Внешний список выключен: в туннель идут только сайты из своего списка.' -ForegroundColor Green
+    } else {
+        Remove-Item -LiteralPath $p.GeoListOff -Force -ErrorAction SilentlyContinue
+        Sync-GeoList
+        Write-TunnelRules
+        if(Test-Path -LiteralPath $p.Enabled){ Write-Host "  Внешний список включён: $(@(Get-GeoListEntries).Count) доменов." -ForegroundColor Green }
+        else { Write-Host '  Внешний список включён: он скачается при включении туннеля.' -ForegroundColor Green }
+    }
+}
+
+function Write-TunnelRules {
+    # rule-set для sing-box из списка туннеля (свой + внешний); sing-box перечитывает его сам.
+    $p=Get-TunnelPaths
+    Initialize-TunnelDirs
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ $d=@('tunnel.invalid') }   # пустое правило sing-box не примет
     Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
     if((Get-TunnelStatus).Running){ Set-TunnelDns }
@@ -2096,7 +2385,7 @@ function Set-TunnelDns {
     #>
     $p=Get-TunnelPaths
     Remove-TunnelDns
-    $d=@(Get-ListEntries $p.List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ return }
     $ns=@(); foreach($x in $d){ $ns+=$x; $ns+=".$x" }
     $ns+=$script:DohCanary
@@ -2114,7 +2403,7 @@ function Set-TunnelDns {
 
 function Test-TunnelDns {
     # Проверяет, что домен из списка туннеля действительно получает FakeIP.
-    $d=@(Get-ListEntries (Get-TunnelPaths).List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ return }
     $ips=@()
     try { $ips=@(Resolve-DnsName -Name $d[0] -Type A -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) } catch {}
@@ -2131,12 +2420,18 @@ function Write-TunnelConfig {
     $p=Get-TunnelPaths
     Write-TunnelRulesFileOnly
     $parts=Get-ProfileParts $Prof
+    $fake=[ordered]@{ type='fakeip'; tag='fakeip'; inet4_range=$script:TunnelFake4 }
+    $tunAddr=@($script:TunnelAddr4); $tunRoute=@($script:TunnelFake4)
+    if(Test-Ipv6Available){
+        $fake.inet6_range=$script:TunnelFake6
+        $tunAddr+=$script:TunnelAddr6; $tunRoute+=$script:TunnelFake6
+    }
     $cfg=[ordered]@{
         log=[ordered]@{ level='warn'; timestamp=$true; output=$p.Log }
         dns=[ordered]@{
             servers=@(
                 [ordered]@{ type='local'; tag='local' },
-                [ordered]@{ type='fakeip'; tag='fakeip'; inet4_range=$script:TunnelFake4; inet6_range=$script:TunnelFake6 },
+                $fake,
                 # Настоящие адреса сайтов из списка ищем через сам туннель.
                 [ordered]@{ type='tcp'; tag='tunnel-dns'; server='1.1.1.1'; detour='tunnel' }
             )
@@ -2149,10 +2444,10 @@ function Write-TunnelConfig {
         inbounds=@(
             [ordered]@{
                 type='tun'; tag='tun-in'; interface_name=$script:TunnelIf
-                address=@($script:TunnelAddr4,$script:TunnelAddr6); mtu=1400
+                address=@($tunAddr); mtu=1400
                 auto_route=$true; strict_route=$false; stack='gvisor'
                 # В TUN идут только FakeIP: остальной трафик мимо sing-box.
-                route_address=@($script:TunnelFake4,$script:TunnelFake6)
+                route_address=@($tunRoute)
             },
             [ordered]@{ type='mixed'; tag='mixed-in'; listen='127.0.0.1'; listen_port=$script:TunnelMixedPort }
         )
@@ -2177,7 +2472,7 @@ function Write-TunnelConfig {
 
 function Write-TunnelRulesFileOnly {
     $p=Get-TunnelPaths
-    $d=@(Get-ListEntries $p.List)
+    $d=@(Get-TunnelDomains)
     if(-not $d.Count){ $d=@('tunnel.invalid') }
     Write-JsonFile $p.Rules ([ordered]@{ version=2; rules=@([ordered]@{ domain_suffix=@($d) }) })
 }
@@ -2400,6 +2695,7 @@ function Select-TunnelProfile {
     # открывается больше сайтов из списка региональных ограничений, затем
     # зарубежный выход, затем наименьшая задержка. Снимает ручное закрепление.
     param([string[]]$Skip=@(),[switch]$NoAutostart)
+    Initialize-TunnelDirs
     $p=Get-TunnelPaths
     $null=Merge-ListFile $p.Geo $script:SeedGeo
     $profiles=@(Get-TunnelProfiles)
@@ -2478,6 +2774,7 @@ function Use-TunnelProfile {
 
 function Test-TunnelGeo {
     # Проверка сайтов с региональными ограничениями через работающий туннель.
+    Initialize-TunnelDirs
     $p=Get-TunnelPaths
     $null=Merge-ListFile $p.Geo $script:SeedGeo
     if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
@@ -2501,8 +2798,7 @@ function Get-TunnelStarterProcess {
 
 function Get-TunnelStatus {
     $p=Get-TunnelPaths
-    $proc=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ExecutablePath -eq $p.Exe })
+    $proc=@(Get-ProcessByExe 'sing-box' $p.Exe)
     $st=Read-JsonFile $p.State
     $ex=Read-JsonFile $p.ExitInfo
     [pscustomobject]@{
@@ -2514,7 +2810,7 @@ function Get-TunnelStatus {
         Pinned=[bool]($st -and $st.pinned)
         Loc=$(if($ex){$ex.loc}else{$null})
         Profiles=@(Get-TunnelProfiles).Count
-        Domains=@(Get-ListEntries $p.List).Count
+        Domains=(Get-TunnelSitesSummary)
     }
 }
 
@@ -2578,6 +2874,7 @@ function Start-TunnelProcess {
 
 function Start-Tunnel {
     Ensure-Admin
+    Initialize-TunnelDirs
     Remove-LegacyWarp
     $p=Get-TunnelPaths
     if(-not @(Get-TunnelProfiles).Count){
@@ -2590,6 +2887,7 @@ function Start-Tunnel {
         return
     }
     Stop-Tunnel -Quiet
+    Sync-GeoList      # список старше суток обновляется; задача на месте
     $st=Read-JsonFile $p.State
     $prof=$null
     if($st -and $st.active){ $prof=Find-TunnelProfile $st.active }
@@ -2617,7 +2915,7 @@ function Start-Tunnel {
         return
     }
     Set-TunnelDns
-    Write-Host "  Туннель работает: '$($prof.name)'. Сайтов в списке туннеля: $((Get-TunnelStatus).Domains)" -ForegroundColor Green
+    Write-Host "  Туннель работает: '$($prof.name)'. Сайтов в туннеле: $(Get-TunnelSitesSummary)" -ForegroundColor Green
     if($script:TunnelExit['loc']){
         Write-JsonFile $p.ExitInfo ([ordered]@{ loc=$script:TunnelExit['loc']; ip=$script:TunnelExit['ip'] })
         Write-Host "  Выход в интернет: страна $($script:TunnelExit['loc']), адрес $($script:TunnelExit['ip'])" -ForegroundColor DarkGray
@@ -2636,9 +2934,8 @@ function Start-TunnelBackground {
     #>
     $p=Get-TunnelPaths
     if(Get-TunnelStarterProcess){ Write-Host '  Туннель уже запускается в фоне.' -ForegroundColor DarkGray; return }
-    $ps=Join-Path $PSHOME 'powershell.exe'
-    $argsList=@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Action','TunnelStart')
-    $proc=Start-Process -FilePath $ps -ArgumentList $argsList -WindowStyle Hidden -PassThru `
+    $l=Get-SelfLaunch @('-Action','TunnelStart')
+    $proc=Start-Process -FilePath $l.File -ArgumentList $l.Args -WindowStyle Hidden -PassThru `
               -RedirectStandardOutput $p.StartLog -RedirectStandardError "$($p.StartLog).err"
     [IO.File]::WriteAllText($p.StarterPid,[string]$proc.Id,[Text.Encoding]::ASCII)
     Write-Host '  Туннель запускается в фоне - статус в меню [11].' -ForegroundColor DarkGray
@@ -2660,10 +2957,9 @@ function Stop-Tunnel {
         Remove-Item $p.StarterPid -Force -ErrorAction SilentlyContinue
     }
     for($i=0;$i -lt 10;$i++){
-        $procs=@(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe' OR Name='xray.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ExecutablePath -eq $p.Exe -or $_.ExecutablePath -eq $p.Xray })
+        $procs=@(Get-ProcessByExe 'sing-box' $p.Exe) + @(Get-ProcessByExe 'xray' $p.Xray)
         if(-not $procs.Count){ break }
-        $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $procs | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 300
     }
     Remove-Item $p.Pid -Force -ErrorAction SilentlyContinue
@@ -2673,9 +2969,9 @@ function Stop-Tunnel {
 
 function Enable-Tunnel {
     Ensure-Admin
+    Initialize-TunnelDirs
     Remove-LegacyWarp
     $p=Get-TunnelPaths
-    New-Item -ItemType Directory -Path $p.Dir -Force | Out-Null
     if(-not (Test-Path $p.List)){ $null=Merge-ListFile $p.List $script:SeedTunnel }
     $null=Merge-ListFile $p.Geo $script:SeedGeo
     if(-not @(Get-TunnelProfiles).Count){
@@ -2683,6 +2979,7 @@ function Enable-Tunnel {
         return
     }
     [IO.File]::WriteAllText($p.Enabled,'1',[Text.Encoding]::ASCII)
+    Sync-GeoList
     Start-Tunnel
     if((Get-TunnelStatus).Running){
         $a='y'
@@ -2695,6 +2992,7 @@ function Disable-Tunnel {
     $p=Get-TunnelPaths
     Remove-Item $p.Enabled -Force -ErrorAction SilentlyContinue
     Stop-Tunnel
+    Remove-GeoListTask
     & ipconfig.exe /flushdns | Out-Null
 }
 
@@ -2767,6 +3065,7 @@ function Remove-HostsDomains {
 
 function Add-TunnelDomains {
     param([string[]]$Domains)
+    Initialize-TunnelDirs
     $p=Get-TunnelPaths
     $null=Merge-ListFile $p.List $Domains
     Write-TunnelRules
@@ -2787,7 +3086,7 @@ function Update-TunnelRoutes {
         Write-Host '  Внимание: zapret не запущен - в туннель попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
     }
     $lists=Join-Path $script:TrustedRuntime 'lists'
-    $inTunnel=@(Get-ListEntries $p.List)
+    $inTunnel=@(Get-TunnelDomains)
     $excl=@(Get-ListEntries (Join-Path $lists 'exclude.txt'))
     $cands=@(@(Get-ListEntries (Join-Path $lists 'blocked.txt')) + @(Get-ListEntries (Join-Path $lists 'autohostlist.txt')) |
              Select-Object -Unique | Where-Object { $inTunnel -notcontains $_ -and $excl -notcontains $_ })
@@ -2826,7 +3125,8 @@ function Test-TunnelSites {
     param([string[]]$Domains=@())
     $p=Get-TunnelPaths
     if(-not (Get-TunnelStatus).Running){ Write-Host '  Туннель не запущен.' -ForegroundColor Red; return }
-    if(-not $Domains.Count){ $Domains=@(Get-ListEntries $p.List) }
+    # Внешний список большой - проверяем свой, а из внешнего берём несколько для примера.
+    if(-not $Domains.Count){ $Domains=@(Get-ListEntries $p.List) + @(Get-GeoListEntries | Select-Object -First 5) }
     if(-not $Domains.Count){ Write-Host '  Список туннеля пуст.' -ForegroundColor DarkGray; return }
     Write-Host '  Проверка сайтов из списка туннеля (как в браузере)...' -ForegroundColor Yellow
     $res=Test-HttpsBatch -Domains $Domains
@@ -2872,7 +3172,7 @@ function Show-TunnelMenu {
         Write-Host ''
         Write-Host ('  Туннель: ' + $(if($w.Enabled){'включён'}else{'выключен'}) + ' | ' +
                     $(if($w.Running){"работает, профиль '$($w.Active)'" + $(if($w.Pinned){' (выбран вручную)'}else{''})}elseif($w.Starting){'запускается...'}else{'не запущен'}) +
-                    ' | профилей: ' + $w.Profiles + ' | сайтов в списке: ' + $w.Domains +
+                    ' | профилей: ' + $w.Profiles + ' | сайтов: ' + $w.Domains +
                     $(if($w.Running -and $w.Loc){" | выход: $($w.Loc)"}else{''})) -ForegroundColor Cyan
         if($w.Enabled -and -not $w.Running -and -not $w.Starting){
             $le=Get-FileTail (Get-TunnelPaths).LastError 40
@@ -2891,6 +3191,8 @@ function Show-TunnelMenu {
         Write-Host '  [8] Проверить сайты из списка туннеля (как в браузере)'
         Write-Host '  [9] Профили: показать / удалить'
         Write-Host '  [10] Региональные ограничения: проверить сайты через активный профиль'
+        Write-Host "  [11] Внешний список сайтов с региональными ограничениями: обновить сейчас ($(Get-GeoListStatus))"
+        Write-Host ('  [12] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
         Write-Host '  [0] Назад'
         $choice=Read-Host '  Выбор'
         if($choice -eq '0'){ return }
@@ -2925,6 +3227,12 @@ function Show-TunnelMenu {
             '5' { [void](Select-TunnelProfile) }
             '6' { Update-TunnelRoutes }
             '10' { Test-TunnelGeo }
+            '11' {
+                Ensure-Admin
+                if(Test-GeoListEnabled){ [void](Update-GeoList -Force) }
+                else { Write-Host '  Внешний список выключен (пункт [12]).' -ForegroundColor DarkGray }
+            }
+            '12' { Switch-GeoList }
             '7' {
                 $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
                 if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
@@ -2960,6 +3268,9 @@ function Show-TunnelMenu {
 }
 
 function Show-Menu {
+    # Почти все пункты требуют прав администратора: запрашиваем их сразу, а
+    # не на первом выбранном пункте (иначе выбор терялся бы при перезапуске).
+    Ensure-Admin
     # При первом запуске проверяем зависимости и предлагаем их поставить.
     if(-not $script:DepsChecked){
         $script:DepsChecked=$true
@@ -3016,7 +3327,7 @@ function Show-Menu {
                 '3' {Toggle-Autostart; Read-Host '  Нажмите Enter'}
                 '4' {Diagnose; Read-Host '  Нажмите Enter'}
                 '5' {Show-Check; Read-Host '  Нажмите Enter'}
-                '6' {Install-Dependencies -IncludeOptional; Read-Host '  Нажмите Enter'}
+                '6' {[void](Install-Dependencies -IncludeOptional); Read-Host '  Нажмите Enter'}
                 '7' {Update-DohHosts; Read-Host '  Нажмите Enter'}
                 '8' {
                     $f=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'
@@ -3038,7 +3349,7 @@ function Show-Menu {
                     Read-Host '  Нажмите Enter'
                 }
                 '9' {Update-Self; if($script:ScriptVersion){Read-Host '  Нажмите Enter'}}
-                '10' {Remove-All}
+                '10' {Remove-All; Read-Host '  Нажмите Enter'}
                 '11' {Show-TunnelMenu}
                 '0' {return}
             }
@@ -3208,6 +3519,67 @@ function Test-SystemDnsOk {
     return $false
 }
 
+function Test-SystemDnsBatch {
+    <#
+      То же, что Test-SystemDnsOk, но для всего списка сразу: адреса берутся
+      у системного DNS по очереди (это быстро), а TLS-соединения с проверкой
+      сертификата идут одновременно. Проверка ~170 имён занимает секунды, а
+      не минуты. Возвращает множество доменов, которым пиннинг не нужен.
+    #>
+    param([string[]]$Domains,[int]$TimeoutMs=3000)
+    $good=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $jobs=New-Object System.Collections.Generic.List[object]
+    $proto=[Security.Authentication.SslProtocols]::Tls12
+    try { $proto=$proto -bor [Security.Authentication.SslProtocols]'Tls13' } catch {}
+    foreach($d in $Domains){
+        $ips=@()
+        try {
+            $ips=@(Resolve-DnsName -Name $d -Type A -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop |
+                   Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress })
+        } catch { continue }
+        if(-not $ips.Count){ continue }
+        if(@($ips | Where-Object { Test-BogonIP $_ }).Count){ continue }
+        foreach($ip in @($ips | Select-Object -First 2)){
+            try {
+                $tcp=[Net.Sockets.TcpClient]::new()
+                $jobs.Add([pscustomobject]@{ Domain=$d; Tcp=$tcp; Ar=$tcp.BeginConnect($ip,443,$null,$null); Ssl=$null; Ar2=$null })
+            } catch {}
+        }
+    }
+    # 1) ждём TCP-соединения
+    $sw=[Diagnostics.Stopwatch]::StartNew()
+    while($sw.ElapsedMilliseconds -lt $TimeoutMs){
+        if(-not @($jobs | Where-Object { -not $_.Ar.IsCompleted }).Count){ break }
+        Start-Sleep -Milliseconds 50
+    }
+    # 2) начинаем TLS-рукопожатия на установленных соединениях
+    foreach($j in $jobs){
+        if(-not $j.Ar.IsCompleted){ continue }
+        try {
+            $j.Tcp.EndConnect($j.Ar)
+            $j.Ssl=[Net.Security.SslStream]::new($j.Tcp.GetStream(),$false)
+            $j.Ar2=$j.Ssl.BeginAuthenticateAsClient($j.Domain,$null,$proto,$false,$null,$null)
+        } catch { $j.Ar2=$null }
+    }
+    $sw.Restart()
+    while($sw.ElapsedMilliseconds -lt $TimeoutMs){
+        if(-not @($jobs | Where-Object { $_.Ar2 -and -not $_.Ar2.IsCompleted }).Count){ break }
+        Start-Sleep -Milliseconds 50
+    }
+    # 3) сертификат выдан на это имя - системный DNS отдаёт рабочий адрес
+    foreach($j in $jobs){
+        try {
+            if($j.Ar2 -and $j.Ar2.IsCompleted){
+                $j.Ssl.EndAuthenticateAsClient($j.Ar2)
+                if($j.Ssl.IsAuthenticated){ [void]$good.Add($j.Domain) }
+            }
+        } catch {}
+        try { if($j.Ssl){ $j.Ssl.Dispose() } } catch {}
+        try { $j.Tcp.Dispose() } catch {}
+    }
+    return ,$good
+}
+
 function Update-DohHosts {
     param([switch]$Quiet)
     Ensure-Admin
@@ -3221,7 +3593,7 @@ function Update-DohHosts {
                Where-Object { $_ -and $_ -notmatch '^\s*#' } |
                ForEach-Object { $_.Trim() } | Select-Object -Unique)
     # Домены туннеля разрешает DNS sing-box; запись в hosts увела бы их мимо туннеля.
-    $inWarp=@(Get-ListEntries (Join-Path $script:TrustedRuntime 'lists\tunnel.txt'))
+    $inWarp=@(Get-TunnelDomains)
     $domains=@($domains | Where-Object { $inWarp -notcontains $_.ToLowerInvariant() })
     if(-not $domains.Count){Write-Host '  Список доменов пуст.' -ForegroundColor Yellow; return}
     # hosts сопоставляет ТОЧНОЕ имя, поэтому www-вариант разрешаем отдельно:
@@ -3239,12 +3611,15 @@ function Update-DohHosts {
     $failed=New-Object System.Collections.Generic.List[string]
     $sysOk=New-Object System.Collections.Generic.List[string]
     $haveResolveDns=[bool](Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)
+    # Все домены разом: кому системный DNS уже отдаёт рабочий адрес.
+    $sysGood=New-Object 'System.Collections.Generic.HashSet[string]'
+    if($haveResolveDns){ $sysGood=Test-SystemDnsBatch -Domains $domains }
     $i=0
     foreach($d in $domains){
         $i++
         if(-not $Quiet){Write-Host ("    [{0}/{1}] {2,-34} " -f $i,$domains.Count,$d) -NoNewline}
         # Системный DNS честный и адрес рабочий - в hosts не пишем.
-        if($haveResolveDns -and (Test-SystemDnsOk -Domain $d)){
+        if($sysGood.Contains($d)){
             $sysOk.Add($d)
             if(-not $Quiet){Write-Host 'системный DNS в порядке' -ForegroundColor DarkGray}
             continue
@@ -3356,8 +3731,9 @@ function Remove-All {
     Stop-Zapret -Quiet
 
     # 2) задача автозапуска
-    Write-Host '  [2/5] Удаление задачи автозапуска...' -ForegroundColor Yellow
+    Write-Host '  [2/5] Удаление задач планировщика...' -ForegroundColor Yellow
     Remove-Autostart
+    Remove-GeoListTask
 
     # 3) служба ядра WinDivert
     Write-Host '  [3/5] Удаление службы драйвера WinDivert...' -ForegroundColor Yellow
@@ -3411,14 +3787,15 @@ function Remove-All {
                Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($tunDir,[StringComparison]::OrdinalIgnoreCase) }).Count
     $nrpt=0
     try { $nrpt=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq $script:TunnelNrptComment }).Count } catch {}
-    $task=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+    $task=[bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue) -or
+          [bool](Get-ScheduledTask -TaskName $script:GeoListTask -ErrorAction SilentlyContinue)
     $drv=[bool](Get-CimInstance Win32_SystemDriver -Filter "Name='WinDivert'" -ErrorAction SilentlyContinue)
     $dir=Test-Path (Join-Path $env:SystemRoot 'System32\Zapret2Windows')
     $hostsLeft=Remove-HostsEntries -CountOnly
     Write-Host ("    процесс winws2:        {0}" -f $(if($proc -eq 0){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if($proc -eq 0){'Green'}else{'Red'})
     Write-Host ("    процессы туннеля:      {0}" -f $(if($tunProc -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($tunProc -eq 0){'Green'}else{'Red'})
     Write-Host ("    правила DNS туннеля:   {0}" -f $(if($nrpt -eq 0){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if($nrpt -eq 0){'Green'}else{'Red'})
-    Write-Host ("    задача автозапуска:    {0}" -f $(if(-not $task){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $task){'Green'}else{'Red'})
+    Write-Host ("    задачи планировщика:   {0}" -f $(if(-not $task){'удалены'}else{'ОСТАЛИСЬ'})) -ForegroundColor $(if(-not $task){'Green'}else{'Red'})
     Write-Host ("    служба WinDivert:      {0}" -f $(if(-not $drv){'удалена'}else{'ОСТАЛАСЬ'})) -ForegroundColor $(if(-not $drv){'Green'}else{'Red'})
     Write-Host ("    каталог в System32:    {0}" -f $(if(-not $dir){'удалён'}else{'ОСТАЛСЯ'})) -ForegroundColor $(if(-not $dir){'Green'}else{'Red'})
     Write-Host ("    записи hosts:          {0}" -f $(if($hostsLeft -eq 0){'очищены'}else{"осталось $hostsLeft"})) -ForegroundColor $(if($hostsLeft -eq 0){'Green'}else{'Yellow'})
@@ -3442,7 +3819,7 @@ switch($Action){
     'Status' {Show-Status}
     'Diagnose' {Diagnose}
     'Check' {Show-Check}
-    'Deps' {Install-Dependencies -IncludeOptional -Yes:$Force}
+    'Deps' {[void](Install-Dependencies -IncludeOptional -Yes:$Force)}
     'DohHosts' {Update-DohHosts}
     'Update' {Update-Self -Force:$Force}
     'Uninstall' {Remove-All -KeepLogs:$KeepLogs -Force:$Force}
@@ -3462,11 +3839,19 @@ switch($Action){
         else { [void](Show-TunnelProfiles); Write-Host '  Укажите -TunnelProfile <номер | имя | auto>.' -ForegroundColor DarkGray }
     }
     'TunnelGeo' {Test-TunnelGeo}
+    'TunnelGeoList' {Ensure-Admin; [void](Update-GeoList -Force)}
+    'TunnelGeoListAuto' {Ensure-Admin; [void](Update-GeoList)}
     'TunnelRoutes' {Update-TunnelRoutes}
     'TunnelTest' {Test-TunnelSites}
     'TunnelList' {[void](Show-TunnelProfiles)}
     'TunnelStart' {Ensure-Admin; Invoke-TunnelStartAction}
     'Menu' {Show-Menu}
+}
+# Действие выполнялось в отдельном окне с правами администратора: не даём
+# ему закрыться, пока результат не прочитан.
+if($Elevated -and $Action -ne 'Menu' -and $Action -ne 'TunnelStart' -and $Action -ne 'TunnelGeoListAuto' -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost'){
+    Write-Host ''
+    [void](Read-Host '  Нажмите Enter для выхода')
 }
 } catch {
     Write-Host ''
@@ -3481,6 +3866,11 @@ switch($Action){
     Write-Host '  Подробности:' -ForegroundColor Yellow
     Write-Host ('  ' + $_.ScriptStackTrace) -ForegroundColor DarkGray
     Write-Host ''
-    if($Host.Name -eq 'ConsoleHost'){ [void](Read-Host '  Нажмите Enter для выхода') }
-    exit 1
+    # Фоновый запуск туннеля и задача автозапуска идут в скрытом окне: там
+    # ждать Enter некому, процесс повис бы навсегда.
+    if($Host.Name -eq 'ConsoleHost' -and [Environment]::UserInteractive -and $Action -ne 'TunnelStart' -and $Action -ne 'TunnelGeoListAuto' -and -not $NoAutostart){
+        [void](Read-Host '  Нажмите Enter для выхода')
+    }
+    # Код 2 - ошибка уже показана и прочитана (лаунчер .cmd не ждёт Enter повторно).
+    exit 2
 }
