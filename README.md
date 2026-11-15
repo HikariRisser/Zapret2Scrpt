@@ -16,14 +16,14 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Script version: 1.8.0. **The console UI is in Russian.** The
+Script version: 1.8.0. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
 
 ### Linux
 
-One file is needed, `zapret2-linux.sh`:
+One file is needed, `zapret2-linux.sh`, from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest):
 
 ```bash
 sh zapret2-linux.sh
@@ -38,7 +38,8 @@ runs the rest. Running it through `sh` needs no executable bit.
 
 ### Windows
 
-One file is needed, either of the two (they are the same script):
+One file is needed, either of the two (they are the same script), from the
+[latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest):
 
 - **`Zapret2Windows.cmd`** — double-click it.
 - **`Zapret2Windows.ps1`** — right-click → "Run with PowerShell", or
@@ -218,7 +219,16 @@ Hyper-V, WSL2, VirtualBox and third-party VPN clients.
 - A tunnel site that does not open in the browser: restart the browser and turn
   off its DNS over HTTPS.
 
-## Update and removal
+## Releases, update and removal
+
+**Releases.** Ready-to-use files are on the
+[Releases](https://github.com/HikariRisser/Zapret2Scrpt/releases) page: every
+release carries `zapret2-linux.sh`, `Zapret2Windows.cmd` and
+`Zapret2Windows.ps1`, the changes and SHA-256 checksums. Releases are published
+automatically by `.github/workflows/release.yml` when `main` gets a version
+that has no release yet and a matching `release-notes/<version>.md`; the
+workflow first checks that the Linux script compiles and that the `.cmd`
+matches the `.ps1`.
 
 Item **[9]** downloads the script from the `main` branch, compares versions,
 makes a backup and checks the new file's syntax before replacing the old one.
@@ -247,16 +257,30 @@ for the updater of old versions and need not be downloaded.
 
 ## Security and limits
 
-Runtime files live in a directory writable only by the administrator, because
-the engines run Lua with elevated rights; see [SECURITY.md](SECURITY.md). On
-Windows, move `Zapret2Windows.ps1` to a protected directory before enabling
-autostart: the scheduled task runs it as SYSTEM.
+Full audit of version 1.8.0: [SECURITY.md](SECURITY.md) (in Russian). Key
+points:
+
+- Runtime files live in directories writable only by the administrator
+  (`C:\Windows\System32\Zapret2Windows`, `/opt/zapret2`). No TLS
+  interception, no root certificates.
+- **Windows: the scheduled tasks run the script as SYSTEM from wherever it
+  lies.** The autostart task is created by menu item [3], the daily list-update
+  task when the tunnel is enabled. A script in Downloads can be replaced by any
+  program running as you, and the replacement runs as SYSTEM. Until this is
+  fixed, keep the script in a directory ordinary users cannot write to (F-05).
+  On Linux, services and the timer run only files from `/opt/zapret2`.
+- Windows: tunnel profile keys are readable by all local users (F-17).
+- Downloads are not checked against checksums, only HTTPS (F-06); the
+  self-update takes the script from `main` without a signature (F-18).
+- The tunnel server operator sees which sites go through the tunnel; a
+  subscription means trusting its author (F-20).
 
 - DPI bypass is not a VPN; blocked addresses and regional refusals need the
   tunnel.
 - Proton VPN is blocked in Russia and may fail to connect; a DPI-resistant
   protocol on your own server (VLESS + Reality) is the fallback.
-- Profile keys are stored in `tunnel/profiles.json` (mode 600 on Linux).
+- Profile keys are stored in `tunnel/profiles.json` (mode 600 on Linux;
+  readable by all users on Windows, F-17).
 
 ## Testing status
 
@@ -266,6 +290,7 @@ autostart: the scheduled task runs it as SYSTEM.
   sing-box 1.14.4 and xray-core; the sing-box → xray-core → VLESS + XHTTP chain
   works on localhost; bypass parameters pass `nfqws2 --dry-run`; single-file
   launch through `sh`, `dash` and `bash`.
+- **Release workflow:** release 1.8.0 was published by it automatically.
 - **Not tested:** the reworked Windows version (tunnel, single-file launch,
   speed-ups) has never been run or even parsed by PowerShell;
   tunnel autostart at boot on Linux; region detection against real site
@@ -279,6 +304,8 @@ zapret2-linux.py      transitional stub for updating from versions before 1.7.0
 Zapret2Windows.ps1    Windows controller
 Zapret2Windows.cmd    the same controller for double-click launch (built from the .ps1 by tools/build-cmd.py)
 README.md / README.ru.md / SECURITY.md / LICENSE
+release-notes/        release descriptions (<version>.md)
+.github/workflows/    release.yml — automatic release publishing
 tools/                optional Node.js diagnostics (probe-h2.js, probe-voice.js)
 ```
 
