@@ -91,7 +91,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.6'
+$script:ScriptVersion='1.8.7'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
