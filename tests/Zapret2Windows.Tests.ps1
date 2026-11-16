@@ -215,6 +215,42 @@ Describe 'ACL: учётки задаются SID-ами, а не локализ�
     }
 }
 
+Describe 'ACL: у ранее существовавших файлов не пустой DACL' {
+    # Регрессия 1.8.7: icacls молча игнорирует grant с флагами наследования
+    # (OI)(CI) на ФАЙЛЕ (код 0, ACE не добавляется), а /inheritance:r с /T
+    # срезал унаследованные ACE. Результат: все файлы, существовавшие до
+    # вызова Protect-Directory, оставались с ПУСТЫМ DACL - не могли читать
+    # и писать даже администраторы ("Access to the path is denied").
+    # Поведенческий тест: реально запускает icacls на временном каталоге.
+    # Владелец временного каталога может выдавать любые ACE без прав
+    # администратора (проверено), поэтому тест работает и в CI.
+    BeforeAll {
+        $script:aclDir = Join-Path ([IO.Path]::GetTempPath()) ("z2acl-" + [guid]::NewGuid().ToString('N'))
+        $script:aclFile = Join-Path $script:aclDir 'lists\autohostlist.txt'
+        New-Item -ItemType Directory -Path (Split-Path $script:aclFile) -Force | Out-Null
+        [IO.File]::WriteAllText($script:aclFile, 'seed', (New-Object Text.UTF8Encoding $false))
+        Protect-Directory $script:aclDir
+    }
+    AfterAll {
+        Remove-Item $script:aclDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    It 'у дочернего файла есть ACE-ы (не пустой DACL)' {
+        @(Get-Acl $script:aclFile).Access.Count | Should -BeGreaterThan 0
+    }
+    It 'файл можно прочитать и перезаписать' {
+        (Get-Content $script:aclFile -Raw).Trim() | Should -Be 'seed'
+        [IO.File]::WriteAllText($script:aclFile, 'updated', (New-Object Text.UTF8Encoding $false))
+        (Get-Content $script:aclFile -Raw).Trim() | Should -Be 'updated'
+    }
+    It 'у каталога нет унаследованных от родителя ACE-ов' {
+        # /inheritance:r на каталоге: все его ACE должны быть собственными.
+        @(Get-Acl $script:aclDir).Access | Where-Object { $_.IsInherited } | Should -BeNullOrEmpty
+    }
+    It 'файл наследует права от каталога (не от System32/родителя)' {
+        @(Get-Acl $script:aclFile).Access | Where-Object { -not $_.IsInherited } | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Закреплённые версии и SHA-256 (из файла скрипта)' {
     BeforeAll {
         # Переменные $script: области Pester не видны - читаем сам артефакт.
