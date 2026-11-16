@@ -138,8 +138,9 @@ is validated by its engine before it is saved.
 - The Telegram app connects to its servers by IP, without DNS, so with the
   tunnel on it always goes through the tunnel. Without the tunnel the Telegram
   app does not work: zapret does not handle its traffic.
-- Discord media servers on Cloudflare (`104.29.0.0/16`, used by Go Live
-  streams and increasingly by voice) are reached by IP, without DNS. Some ISPs
+- Discord media servers on Cloudflare (several ranges, e.g. `104.29.0.0/16`,
+  `162.159.0.0/16`; used by Go Live streams and increasingly by voice) are
+  reached by IP, without DNS. Only their media UDP ports go into the tunnel. Some ISPs
   cut UDP to them about a second into the connection, which zapret cannot fix.
   Tunnel menu item [6] tests this (an IP discovery packet, ~3 s of traffic,
   another IP discovery packet) and, if the server stops answering, routes UDP to

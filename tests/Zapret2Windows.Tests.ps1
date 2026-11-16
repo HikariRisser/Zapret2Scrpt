@@ -366,3 +366,27 @@ Describe 'Test-LaunchArgSafe (валидация параметров до UAC-�
         Test-LaunchArgSafe "a`r`nb" | Should -BeFalse
     }
 }
+
+Describe 'Discord-медиа: паритет Linux и Windows' {
+    BeforeAll {
+        $ps1 = $env:Z2_PS1_PATH
+        $sh  = Join-Path (Split-Path -Parent $ps1) 'zapret2-linux.sh'
+        $script:winText = [IO.File]::ReadAllText($ps1)
+        $script:shText  = [IO.File]::ReadAllText($sh)
+        $mw = [regex]::Match($script:winText, '(?s)\$script:DiscordMediaCidr4=@\((.*?)\)')
+        $ml = [regex]::Match($script:shText,  '(?s)DISCORD_MEDIA_CIDR4 = \[(.*?)\]')
+        $script:winCidr = @([regex]::Matches($mw.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        $script:linCidr = @([regex]::Matches($ml.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    }
+    It 'списки подсетей совпадают (порядок не важен)' {
+        $script:winCidr.Count | Should -BeGreaterThan 10
+        (@($script:winCidr | Sort-Object) -join ',') | Should -Be (@($script:linCidr | Sort-Object) -join ',')
+    }
+    It 'подсети - корректный CIDR' {
+        foreach ($c in $script:winCidr) { $c | Should -Match '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' }
+    }
+    It 'диапазон портов медиа одинаков (sing-box port_range: a:b)' {
+        $script:winText | Should -Match "'19294:19344','50000:50099'"
+        $script:shText  | Should -Match 'DISCORD_MEDIA_PORTS = \[\(19294, 19344\), \(50000, 50099\)\]'
+    }
+}

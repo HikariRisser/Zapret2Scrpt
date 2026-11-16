@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.8.10"
+VERSION = "1.8.11"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -2300,7 +2300,37 @@ TELEGRAM_CIDR6 = ["2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48
 # список доменов туннеля их не касается. У части провайдеров UDP к ним обрезается
 # через ~1 с после начала соединения, и zapret это не исправляет: тогда (по
 # итогам проверки) в туннель направляется UDP к этим адресам, TCP идёт напрямую.
-DISCORD_MEDIA_CIDR4 = ["104.29.0.0/16"]
+#
+# Список - НЕ одна подсеть: медиасерверы Discord разбросаны по диапазонам
+# Cloudflare, и закреплённый 104.29.0.0/16 покрывал лишь часть из них. Когда
+# медиасервер оказывался в другом диапазоне (например, 162.159.0.0/16), UDP
+# уходил напрямую, обрезался провайдером и трансляция не открывалась - хотя
+# у другого человека с другим медиасервером она работала.
+# Чтобы не затащить в туннель весь чужой Cloudflare-UDP (QUIC, игры, другие
+# голосовые сервисы), диапазоны ниже дополняются ограничением по портам
+# (DISCORD_MEDIA_PORTS): голос/медиа Discord ходит на 19294-19344 и 50000-50099.
+DISCORD_MEDIA_CIDR4 = [
+    "104.29.0.0/16",    # наблюдаемые медиасерверы Discord
+    "162.158.0.0/15",   # Cloudflare (официальный список ips)
+    "162.159.0.0/16",   # тут наблюдается media.discordapp.net
+    "172.64.0.0/13",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "188.114.96.0/20",
+    "190.93.240.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "131.0.72.0/22",
+]
+# Порты медиа Discord (UDP). Ограничение по портам не даёт увести в туннель
+# весь UDP к Cloudflare - только голос/трансляции Discord.
+DISCORD_MEDIA_PORTS = [(19294, 19344), (50000, 50099)]
 # Серверы для проверки: отвечают на пакет определения IP без входа в аккаунт.
 DISCORD_PROBE_SERVERS = [("104.29.149.69", 19298), ("104.29.155.188", 19298)]
 TUNNEL_RT_TABLE = 2649
@@ -3605,10 +3635,16 @@ def build_tunnel_config(profile):
     fake = {"type": "fakeip", "tag": "fakeip", "inet4_range": TUNNEL_FAKE4}
     if v6:
         fake["inet6_range"] = TUNNEL_FAKE6
-    discord_media = DISCORD_MEDIA_CIDR4 if discord_media_tunneled() else []
+    discord_media = list(DISCORD_MEDIA_CIDR4) if discord_media_tunneled() else []
+    # sing-box: диапазоны портов как "a:b" в поле port_range.
+    discord_ports = ["%d:%d" % (a, b) for a, b in DISCORD_MEDIA_PORTS] if discord_media else []
     # Из адресов Discord в туннель идёт только UDP (медиа); TCP к ним - напрямую.
     discord_tcp = ([{"inbound": ["tun-in"], "network": "tcp", "ip_cidr": discord_media,
                      "outbound": "direct"}] if discord_media else [])
+    # UDP к медиасерверам Discord: только на порты медиа; остальной трафик к тем
+    # же диапазонам Cloudflare идёт мимо туннеля.
+    discord_udp = ([{"inbound": ["tun-in"], "network": "udp", "port_range": discord_ports,
+                     "ip_cidr": discord_media, "outbound": "tunnel"}] if discord_media else [])
     cfg = {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -3646,7 +3682,7 @@ def build_tunnel_config(profile):
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
-            ] + discord_tcp + [
+            ] + discord_tcp + discord_udp + [
                 {"inbound": ["tun-in", "mixed-in"], "action": "resolve", "server": "tunnel-dns"},
                 {"inbound": ["tun-in", "mixed-in"], "outbound": "tunnel"},
             ],
