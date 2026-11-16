@@ -127,6 +127,7 @@ $script:SeedDomains=@(
     'discord-activities.com','discordactivities.com','discordmerch.com','discordpartygames.com',
     'discordsays.com','discordsez.com','frankerfacez.com','ffzap.com',
     'betterttv.net','7tv.app','7tv.io',
+    'meduza.io','the-village.ru','novayagazeta.eu','republic.ru','bbc.com','dw.com','svoboda.org','rferl.org','mediazona.ca','tvrain.tv','rutracker.net','kinozal.tv','kinozal.me','nnmstatic.win','rezka.ag','lostfilm.tv',
     'discord.gift','discord.media','discord.new','discordapp.com',
     'discordapp.net','discordcdn.com','discordstatus.com','facebook.com',
     'facebook.net','fb.com','fb.me','fbcdn.net',
