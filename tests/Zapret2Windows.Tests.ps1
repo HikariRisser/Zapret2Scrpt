@@ -98,6 +98,37 @@ Describe 'Get-HostsEncoding' {
     }
 }
 
+Describe 'Write-HostsFile' {
+    BeforeAll {
+        $script:tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("z2test-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:tmpDir -Force | Out-Null
+    }
+    AfterAll {
+        Remove-Item $script:tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    It 'пишет строки и возвращает $true' {
+        $f = Join-Path $script:tmpDir 'hosts'
+        $lines = [System.Collections.Generic.List[string]]@('127.0.0.1 localhost', '# --- Zapret2Windows DoH begin ---', '1.2.3.4 example.com', '# --- Zapret2Windows DoH end ---')
+        (Write-HostsFile -Path $f -Lines $lines) | Should -BeTrue
+        ((Get-Content -LiteralPath $f) -join "`n") | Should -Be ($lines -join "`n")
+    }
+    It 'снимает атрибут "только чтение" и перезаписывает' {
+        $f = Join-Path $script:tmpDir 'hosts-ro'
+        [IO.File]::WriteAllLines($f, @('old line'), [Text.Encoding]::ASCII)
+        (Get-Item -LiteralPath $f).IsReadOnly = $true
+        $lines = [System.Collections.Generic.List[string]]@('1.2.3.4 example.com')
+        (Write-HostsFile -Path $f -Lines $lines) | Should -BeTrue
+        (Get-Item -LiteralPath $f).IsReadOnly | Should -BeFalse
+        ((Get-Content -LiteralPath $f) -join "`n") | Should -Be '1.2.3.4 example.com'
+    }
+    It 'ascii-содержимое пишется без BOM' {
+        $f = Join-Path $script:tmpDir 'hosts-ascii'
+        [void](Write-HostsFile -Path $f -Lines ([System.Collections.Generic.List[string]]@('1.2.3.4 example.com')))
+        $bytes = [IO.File]::ReadAllBytes($f)
+        ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse
+    }
+}
+
 Describe 'Merge-ListFile' {
     BeforeAll {
         $script:tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("z2test-" + [guid]::NewGuid().ToString('N'))

@@ -91,7 +91,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.8'
+$script:ScriptVersion='1.8.9'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -928,7 +928,10 @@ function Start-Zapret {
     [IO.File]::WriteAllText((Join-Path $script:TrustedRuntime 'winws2.pid'),[string]$p.Id,[Text.Encoding]::ASCII)
     Write-Host "winws2 запущен, PID $($p.Id). WinDivert обрабатывает сетевой трафик системы." -ForegroundColor Green
     Write-Host 'Автосписок включён: домен добавится после сигналов неуспешного доступа.' -ForegroundColor DarkGray
-    # Первичная проверка DNS - один раз, когда обход уже работает.
+    # Первичная проверка DNS - один раз, когда обход уже работает. Отказ
+    # записи в hosts (антивирус, атрибут "только чтение") Write-HostsFile
+    # не бросает: маркер doh.done ставится, заведомо неудачная попытка не
+    # повторяется при каждом старте. Ручной повтор - пункт меню [7].
     $dohDone=Join-Path $script:TrustedRuntime 'lists\doh.done'
     if(-not (Test-Path -LiteralPath $dohDone)){
         Write-Host 'Первичная проверка DNS (один раз)...' -ForegroundColor DarkGray
@@ -3416,7 +3419,7 @@ function Remove-HostsDomains {
         elseif($in -and $l -match '^\s*\S+\s+(\S+)' -and $set.Contains($Matches[1])){ $changed=$true; continue }
         $out.Add($l)
     }
-    if($changed){ [IO.File]::WriteAllLines($hf,$out,[Text.Encoding]::ASCII) }
+    if($changed){ [void](Write-HostsFile -Path $hf -Lines $out) }
 }
 
 function Add-TunnelDomains {
@@ -4180,11 +4183,13 @@ function Update-DohHosts {
     foreach($l in $resolved){$lines.Add($l)}
     $lines.Add('# --- Zapret2Windows DoH end ---')
     Copy-Item -LiteralPath $hf -Destination "$hf.zapret-backup" -Force -ErrorAction SilentlyContinue
-    [IO.File]::WriteAllLines($hf,$lines,(Get-HostsEncoding $lines))
-    & ipconfig.exe /flushdns | Out-Null
+    $hostsWritten=Write-HostsFile -Path $hf -Lines $lines
+    if($hostsWritten){ & ipconfig.exe /flushdns | Out-Null }
 
     Write-Host ''
-    Write-Host ("  Записано в hosts: {0}, системный DNS в порядке: {1}, не разрешилось: {2}" -f $resolved.Count,$sysOk.Count,$failed.Count) -ForegroundColor Green
+    if($hostsWritten){
+        Write-Host ("  Записано в hosts: {0}, системный DNS в порядке: {1}, не разрешилось: {2}" -f $resolved.Count,$sysOk.Count,$failed.Count) -ForegroundColor Green
+    }
     if($resolved.Count -and -not (Get-Status).Running){
         Write-Host '  Совет: повторите это обновление при ЗАПУЩЕННОМ обходе - тогда проверка' -ForegroundColor DarkGray
         Write-Host '  сертификатов проходит и в hosts попадут только домены с подменой DNS.' -ForegroundColor DarkGray
@@ -4212,6 +4217,36 @@ function Get-HostsEncoding {
     foreach($l in $Lines){ if($l -match '[^\x00-\x7F]'){ return [Text.UTF8Encoding]::new($false) } }
     return [Text.Encoding]::ASCII
 }
+function Write-HostsFile {
+    <#
+      Целиком перезаписывает hosts выбранной кодировкой. Возвращает $true
+      при успехе. Сначала снимает атрибут "только чтение": WriteAllLines
+      падает с UnauthorizedAccessException даже у администратора, если он
+      установлен (частая причина отказа на чистой системе). Если запись
+      запрещена и после этого - hosts защищён антивирусом (самозащита
+      файла hosts у Kaspersky, Dr.Web, Avast, 360 и др.) либо
+      "Контролируемым доступом к папкам" Защитника Windows; обход
+      работает и без записи в hosts, повторить можно пунктом [7].
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()]$Lines
+    )
+    try {
+        $fi=New-Object System.IO.FileInfo($Path)
+        if($fi.Exists -and $fi.IsReadOnly){ $fi.IsReadOnly=$false }
+    } catch {}
+    try {
+        [IO.File]::WriteAllLines($Path,$Lines,(Get-HostsEncoding $Lines))
+        return $true
+    } catch [UnauthorizedAccessException],[IOException] {
+        Write-Host '  Не удалось записать hosts: доступ запрещён.' -ForegroundColor Yellow
+        Write-Host '  Обычно файл защищает антивирус (самозащита hosts: Kaspersky, Dr.Web,' -ForegroundColor DarkGray
+        Write-Host '  Avast, 360 и др.) или "Контролируемый доступ к папкам" Защитника Windows.' -ForegroundColor DarkGray
+        Write-Host '  Обход работает и без записи в hosts; повторить - пункт меню [7].' -ForegroundColor DarkGray
+        return $false
+    }
+}
 function Remove-HostsEntries {
     param([switch]$CountOnly)
     $hf=Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
@@ -4227,7 +4262,7 @@ function Remove-HostsEntries {
     }
     if($removed -eq 0 -or $CountOnly){return $removed}
     Copy-Item -LiteralPath $hf -Destination "$hf.zapret-backup" -Force -ErrorAction SilentlyContinue
-    [IO.File]::WriteAllLines($hf,$out,(Get-HostsEncoding $out))
+    if(-not (Write-HostsFile -Path $hf -Lines $out)){ return $removed }
     & ipconfig.exe /flushdns | Out-Null
     return $removed
 }
