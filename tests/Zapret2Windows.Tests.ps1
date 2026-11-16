@@ -190,6 +190,31 @@ Describe 'Read-TextLinesAuto' {
     }
 }
 
+Describe 'ACL: учётки задаются SID-ами, а не локализованными именами' {
+    BeforeAll {
+        $text = [IO.File]::ReadAllText($env:Z2_PS1_PATH)
+        $m = [regex]::Match($text, '(?s)function Protect-Directory\s*\{.*?\n\}')
+        $script:pdpBody = if ($m.Success) { $m.Value } else { '' }
+    }
+    It 'функция Protect-Directory найдена' {
+        $script:pdpBody | Should -Not -BeNullOrEmpty
+    }
+    It 'grant-ы заданы через SID (*S-1-5-...)' {
+        # Регрессия: icacls с именами 'Administrators'/'Users' падает на
+        # русской/украинской Windows: "No mapping between account names and
+        # security IDs was done" (имена встроенных групп локализованы).
+        $script:pdpBody | Should -Match '\*S-1-5-18'
+        $script:pdpBody | Should -Match '\*S-1-5-32-544'
+        $script:pdpBody | Should -Match '\*S-1-5-32-545'
+    }
+    It 'в grant-ах нет английских имён групп' {
+        # Ловим именно аргументы icacls вида 'Administrators:...' /
+        # 'Users:...' - не упоминания в комментариях и не пути.
+        $script:pdpBody | Should -Not -Match "'(SYSTEM|Administrators|Users):\(OI\)"
+        $script:pdpBody | Should -Not -Match '"(SYSTEM|Administrators|Users):\(OI\)'
+    }
+}
+
 Describe 'Закреплённые версии и SHA-256 (из файла скрипта)' {
     BeforeAll {
         # Переменные $script: области Pester не видны - читаем сам артефакт.
