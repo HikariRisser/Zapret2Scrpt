@@ -348,13 +348,28 @@ function Test-AutostartTask {
     if(Test-Admin){ return (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\Tasks\$($script:TaskName)")) }
     return [bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
 }
+function Test-LaunchArgSafe {
+    <#
+      Значение годится для ручного квотирования в командной строке
+      перезапуска с правами администратора: внутри не должно быть кавычек
+      и переводов строк - они исказили бы командную строку.
+
+      Важно: регулярка в ОДИНАРНЫХ кавычках. Ранее здесь было '["`r`n]':
+      в одинарных кавычках PS не раскрывает `r`n, и класс символов состоял
+      из литеральных букв r и n - из-за этого отвергался любой путь с
+      этими буквами (C:\Users, ...\zapret2-v1.0.6, Program Files).
+      \r и \n здесь - экранирование самой регулярки, а не PowerShell.
+    #>
+    param([string]$Value)
+    return ($null -ne $Value -and -not ($Value -match '["\r\n]'))
+}
 function Ensure-Admin {
     if(Test-Admin){return}
     # Путь попадает в командную строку перезапуска с ручным квотированием:
     # кавычки и переводы строк в нём исказили бы её. Это параметр пользователя.
     foreach($v in @($ZapretRoot,$TunnelConfig,$TunnelLink,$TunnelProfile)){
-        if($v -and ($v -match '["`r`n]')){
-            Write-Host "Недопустимые символы в параметре: $v" -ForegroundColor Red
+        if($v -and -not (Test-LaunchArgSafe $v)){
+            Write-Host "Недопустимые символы в параметре (кавычки или перевод строки): $v" -ForegroundColor Red
             exit 1
         }
     }
