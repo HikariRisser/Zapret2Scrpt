@@ -1,4 +1,4 @@
-# Запуск Pester-тестов чистых функций Zapret2Windows.ps1.
+﻿# Запуск Pester-тестов чистых функций Zapret2Windows.ps1.
 #
 # powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-pester.ps1
 #

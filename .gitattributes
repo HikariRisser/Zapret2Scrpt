@@ -1,0 +1,19 @@
+# .ps1 читаются Windows PowerShell 5.1; без BOM он трактует файл как ANSI
+# (cp1251 на русской локали) и падает на русских строках. Поэтому:
+#  - BOM обязателен (проверяется в CI, job windows);
+#  - CRLF сохраняем как в рабочем файле Zapret2Windows.ps1.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Оболочка/питон/JS читаются на Linux - LF.
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+
+# .cmd - CRLF (cmd.exe терпит и LF, но так консистентнее).
+*.cmd text eol=crlf
+
+# Бинарные артефакты сборки не конвертируем.
+*.zip binary
+*.exe binary

@@ -58,6 +58,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: BOM у .ps1 (иначе PS 5.1 читает как ANSI и падает)
+        shell: powershell
+        run: |
+          # Windows PowerShell 5.1 без BOM трактует файл как ANSI (cp1251 на
+          # русской локали) и не разбирает русские строки. BOM обязателен.
+          $bad = @()
+          foreach ($f in @('Zapret2Windows.ps1', 'tests\Zapret2Windows.Tests.ps1', 'tools\run-pester.ps1')) {
+            $b = [IO.File]::ReadAllBytes((Join-Path $PWD $f))[0..2]
+            if (-not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $bad += $f }
+          }
+          if ($bad) { Write-Host ("Нет BOM: " + ($bad -join ', ')); exit 1 }
+          Write-Host 'BOM OK'
+
       - name: Разбор PowerShell 5.1 (целевая среда)
         shell: powershell
         run: |

@@ -1,4 +1,4 @@
-# Pester-тесты чистых функций Zapret2Windows.ps1.
+﻿# Pester-тесты чистых функций Zapret2Windows.ps1.
 #
 # Запуск (Windows, из корня репозитория):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-pester.ps1
