@@ -16,7 +16,7 @@ Controller for [`bol-van/zapret2`](https://github.com/bol-van/zapret2)
 | Linux | [`zapret2-linux.sh`](zapret2-linux.sh) — a single file | `nfqws2` + nftables/iptables |
 | Windows | [`Zapret2Windows.cmd`](Zapret2Windows.cmd) **or** [`Zapret2Windows.ps1`](Zapret2Windows.ps1) — either single file | `winws2` + WinDivert |
 
-Script version: 1.8.4. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
+Script version: 1.9.0. Download from the [latest release](https://github.com/HikariRisser/Zapret2Scrpt/releases/latest). **The console UI is in Russian.** The
 [Russian README](README.ru.md) is the more detailed one.
 
 ## Quick start
@@ -81,7 +81,7 @@ engine, so speed is unaffected.
 | QUIC | `fake` on `quic_initial` |
 | Discord voice, STUN, WireGuard | `fake` on `discord_ip_discovery`, `stun`, WireGuard handshake |
 
-The seed list has 86 domains; zapret2's autohostlist adds domains on which it
+The seed list has 117 domains; zapret2's autohostlist adds domains on which it
 sees retransmissions or resets. Updating the runtime (item [1]) appends new seed
 domains and keeps manual edits and learned domains.
 
