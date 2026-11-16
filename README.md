@@ -107,8 +107,9 @@ Item **[11]**. A [sing-box](https://github.com/SagerNet/sing-box) tunnel
 
 ### Servers
 
-- **Proton VPN Free**: import the WireGuard `.conf` created at
-  account.protonvpn.com (Downloads → WireGuard configuration).
+- **Proton VPN Free**: a WireGuard `.conf` created at
+  account.protonvpn.com (Downloads → WireGuard configuration), imported through
+  **Your own server** (menu item [2]).
 - **Your own server**: a link, a file path or a subscription URL.
 
 | Format | Accepted |
@@ -142,7 +143,7 @@ is validated by its engine before it is saved.
   `162.159.0.0/16`; used by Go Live streams and increasingly by voice) are
   reached by IP, without DNS. Only their media UDP ports go into the tunnel. Some ISPs
   cut UDP to them about a second into the connection, which zapret cannot fix.
-  Tunnel menu item [6] tests this (an IP discovery packet, ~3 s of traffic,
+  Tunnel menu item [5] tests this (an IP discovery packet, ~3 s of traffic,
   another IP discovery packet) and, if the server stops answering, routes UDP to
   these addresses through the tunnel (TCP still goes direct through zapret).
 - DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
@@ -153,11 +154,11 @@ is validated by its engine before it is saved.
 
 ### Choosing a profile
 
-- **Automatic** (tunnel menu [5]): every profile is probed for exit country,
+- **Automatic** (tunnel menu [4]): every profile is probed for exit country,
   latency and a list of region-restricted sites (claude.ai, chatgpt.com,
   gemini.google.com by default, editable). Order: more sites open → foreign exit
   → lower latency.
-- **Manual** (tunnel menu [4]): the chosen profile is pinned and automatic
+- **Manual** (tunnel menu [3]): the chosen profile is pinned and automatic
   selection will not replace it.
 
 ### External list of region-restricted sites
@@ -169,7 +170,7 @@ GeoBlock list of [itdoginfo/allow-domains](https://github.com/itdoginfo/allow-do
 every 24 hours (systemd timer `zapret2win-geolist.timer` on Linux, scheduled
 task `Zapret2WindowsGeoList` on Windows) and whenever the tunnel starts with a
 copy older than a day. It is kept in a separate file; your own tunnel list is
-untouched. Tunnel menu [11] updates it now, [12] turns it off.
+untouched. Tunnel menu [10] updates it now, [11] turns it off.
 
 ### Browsers and DNS
 

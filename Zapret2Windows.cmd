@@ -158,6 +158,10 @@ $script:SeedDomains=@(
     'archive.org','cdn-telegram.org','cdninstagram.com','cloudflare-dns.com',
     'cloudflare-ech.com','cloudflare.com','dis.gd','discord-attachments-uploads-prd.storage.googleapis.com',
     'discord.co','discord.com','discord.dev','discord.gg',
+    'discord.app','discord.design','discord.status','discord.store',
+    'discord-activities.com','discordactivities.com','discordmerch.com','discordpartygames.com',
+    'discordsays.com','discordsez.com','frankerfacez.com','ffzap.com',
+    'betterttv.net','7tv.app','7tv.io',
     'discord.gift','discord.media','discord.new','discordapp.com',
     'discordapp.net','discordcdn.com','discordstatus.com','facebook.com',
     'facebook.net','fb.com','fb.me','fbcdn.net',
@@ -3105,7 +3109,7 @@ function Select-TunnelProfile {
     $null=Merge-ListFile $p.Geo $script:SeedGeo
     $profiles=@(Get-TunnelProfiles)
     if(-not $profiles.Count){
-        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.'
+        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг своего сервера.'
         return $null
     }
     $wasRunning=(Get-TunnelStatus).Running
@@ -3291,7 +3295,7 @@ function Start-Tunnel {
     Remove-LegacyWarp
     $p=Get-TunnelPaths
     if(-not @(Get-TunnelProfiles).Count){
-        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.'
+        Set-TunnelError 'Нет ни одного профиля: импортируйте конфиг своего сервера.'
         return
     }
     try { if(-not (Test-Path $p.Exe)){ Install-SingBox } }
@@ -3312,7 +3316,7 @@ function Start-Tunnel {
     Write-Host "  Запуск туннеля (профиль '$($prof.name)')..." -ForegroundColor Yellow
     $r=Start-TunnelProcess $prof
     if($r -eq 'notunnel' -and $st -and $st.pinned){
-        Write-Host '  Профиль выбран вручную, поэтому на другой не переключаюсь. Автовыбор: меню туннеля, пункт [5].' -ForegroundColor Yellow
+        Write-Host '  Профиль выбран вручную, поэтому на другой не переключаюсь. Автовыбор: меню туннеля, пункт [4].' -ForegroundColor Yellow
     } elseif($r -eq 'notunnel' -and @(Get-TunnelProfiles).Count -gt 1){
         Write-Host '  Профиль не отвечает, проверяю остальные...' -ForegroundColor Yellow
         Stop-Tunnel -Quiet
@@ -3388,7 +3392,7 @@ function Enable-Tunnel {
     if(-not (Test-Path $p.List)){ $null=Merge-ListFile $p.List $script:SeedTunnel }
     $null=Merge-ListFile $p.Geo $script:SeedGeo
     if(-not @(Get-TunnelProfiles).Count){
-        Write-Host '  Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).' -ForegroundColor Red
+        Write-Host '  Сначала добавьте профиль: свой сервер (пункт [2] меню туннеля).' -ForegroundColor Red
         return
     }
     [IO.File]::WriteAllText($p.Enabled,'1',[Text.Encoding]::ASCII)
@@ -3711,17 +3715,16 @@ function Show-TunnelMenu {
             }
         }
         Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить туннель'}else{'Включить туннель'}))
-        Write-Host '  [2] Proton VPN Free: импортировать конфиг WireGuard'
-        Write-Host '  [3] Свой сервер: импортировать конфиг, ссылку или подписку'
-        Write-Host '  [4] Выбрать профиль вручную'
-        Write-Host '  [5] Проверить профили и выбрать лучший автоматически'
-        Write-Host '  [6] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель'
-        Write-Host '  [7] Добавить домен в туннель вручную'
-        Write-Host '  [8] Проверить сайты из списка туннеля (как в браузере)'
-        Write-Host '  [9] Профили: показать / удалить'
-        Write-Host '  [10] Региональные ограничения: проверить сайты через активный профиль'
-        Write-Host "  [11] Внешний список сайтов с региональными ограничениями: обновить сейчас ($(Get-GeoListStatus))"
-        Write-Host ('  [12] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
+        Write-Host '  [2] Свой сервер: импортировать конфиг, ссылку или подписку'
+        Write-Host '  [3] Выбрать профиль вручную'
+        Write-Host '  [4] Проверить профили и выбрать лучший автоматически'
+        Write-Host '  [5] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель'
+        Write-Host '  [6] Добавить домен в туннель вручную'
+        Write-Host '  [7] Проверить сайты из списка туннеля (как в браузере)'
+        Write-Host '  [8] Профили: показать / удалить'
+        Write-Host '  [9] Региональные ограничения: проверить сайты через активный профиль'
+        Write-Host "  [10] Внешний список сайтов с региональными ограничениями: обновить сейчас ($(Get-GeoListStatus))"
+        Write-Host ('  [11] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
         Write-Host '  [0] Назад'
         $choice=Read-Host '  Выбор'
         if($choice -eq '0'){ return }
@@ -3730,39 +3733,27 @@ function Show-TunnelMenu {
             '1' { if($w.Enabled){ Disable-Tunnel } else { Enable-Tunnel } }
             '2' {
                 Write-Host ''
-                Write-Host '  Proton VPN Free - бесплатный тариф без ограничения трафика.' -ForegroundColor DarkGray
-                Write-Host '    1. Зарегистрируйтесь на https://account.protonvpn.com (нужна почта).' -ForegroundColor DarkGray
-                Write-Host '    2. Раздел "Downloads" -> "WireGuard configuration".' -ForegroundColor DarkGray
-                Write-Host '    3. Платформа: Windows (или Router). Protocol: WireGuard.' -ForegroundColor DarkGray
-                Write-Host '    4. Выберите бесплатный сервер (Free). Для Дальнего Востока ближе Япония (JP).' -ForegroundColor DarkGray
-                Write-Host '    5. Нажмите "Create" и скачайте файл .conf.' -ForegroundColor DarkGray
-                Write-Host '  Можно импортировать несколько файлов (разные страны) - скрипт выберет лучший.' -ForegroundColor DarkGray
-                $v=Read-Host '  Путь к файлу .conf'
-                if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'proton'; [void](Select-TunnelProfile) }
-            }
-            '3' {
-                Write-Host ''
                 Write-Host '  Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.' -ForegroundColor DarkGray
                 Write-Host "  Поддерживается: $($script:SupportedFormats)." -ForegroundColor DarkGray
                 $v=Read-Host '  Ссылка, путь к файлу или адрес подписки'
                 if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'custom'; [void](Select-TunnelProfile) }
             }
-            '4' {
+            '3' {
                 if(@(Show-TunnelProfiles).Count){
                     $n=(Read-Host '  Номер профиля (a - выбрать автоматически, Enter - отмена)').Trim()
                     if($n){ [void](Use-TunnelProfile $(if($n -ieq 'a' -or $n -ieq 'а'){'auto'}else{$n})) }
                 }
             }
-            '5' { [void](Select-TunnelProfile) }
-            '6' { Update-TunnelRoutes }
-            '10' { Test-TunnelGeo }
-            '11' {
+            '4' { [void](Select-TunnelProfile) }
+            '5' { Update-TunnelRoutes }
+            '9' { Test-TunnelGeo }
+            '10' {
                 Ensure-Admin
                 if(Test-GeoListEnabled){ [void](Update-GeoList -Force) }
-                else { Write-Host '  Внешний список выключен (пункт [12]).' -ForegroundColor DarkGray }
+                else { Write-Host '  Внешний список выключен (пункт [11]).' -ForegroundColor DarkGray }
             }
-            '12' { Switch-GeoList }
-            '7' {
+            '11' { Switch-GeoList }
+            '6' {
                 $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
                 if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
                     Add-TunnelDomains @($d)
@@ -3770,8 +3761,8 @@ function Show-TunnelMenu {
                     if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
                 } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
             }
-            '8' { Test-TunnelSites }
-            '9' {
+            '7' { Test-TunnelSites }
+            '8' {
                 $profiles=@(Show-TunnelProfiles)
                 if($profiles.Count){
                     $n=Read-Host '  Номер профиля для удаления (Enter - ничего не удалять)'
@@ -3796,6 +3787,23 @@ function Show-TunnelMenu {
     }
 }
 
+function Get-StrategyLines {
+    # Применённые сейчас параметры обхода (winws2.args): по строке на профиль.
+    # Пути к спискам и lua-файлам не выводятся - только сам набор параметров.
+    $cfg=Join-Path $script:TrustedRuntime 'winws2.args'
+    if(-not (Test-Path -LiteralPath $cfg)){ return @() }
+    $profiles=New-Object System.Collections.Generic.List[string]
+    $cur=New-Object System.Collections.Generic.List[string]
+    foreach($a in @(Get-Content -LiteralPath $cfg -Encoding UTF8)){
+        if($a -eq '--new'){ if($cur.Count){ $profiles.Add(($cur -join ' ')) }; $cur.Clear(); continue }
+        if($a -match '^--(hostlist|ipset|lua-init|wf-)'){ continue }
+        $cur.Add($a)
+    }
+    if($cur.Count){ $profiles.Add(($cur -join ' ')) }
+    $lines=@('  Стратегия: circular - автоперебор стратегий на каждый домен (после 2 сбоев - следующая)')
+    for($i=0; $i -lt $profiles.Count; $i++){ $lines+=("    профиль $($i+1): " + $profiles[$i]) }
+    return $lines
+}
 function Show-Menu {
     # Почти все пункты требуют прав администратора: запрашиваем их сразу, а
     # не на первом выбранном пункте (иначе выбор терялся бы при перезапуске).
@@ -3827,6 +3835,7 @@ function Show-Menu {
         Clear-Host
         Write-Host '  Zapret2 Windows — системная DPI-десинхронизация' -ForegroundColor Cyan
         Write-Host ('  Версия ' + $script:ScriptVersion + ' | zapret2 v1.0.6 | перехват WinDivert') -ForegroundColor DarkGray
+        foreach($sl in (Get-StrategyLines)){ Write-Host $sl -ForegroundColor DarkGray }
         $st=Get-Status
         Write-Host ('  winws2: ' + $(if($st.Running){"работает (PID $($st.Pid))"}else{'остановлен'}) +
                     ' | автозапуск: ' + $(if($st.AutoStart){'включён'}else{'выключен'}) +
@@ -3846,7 +3855,7 @@ function Show-Menu {
         Write-Host '  [8] Выученные домены и журналы'
         Write-Host ('  [9] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
         Write-Host '  [10] Удалить из системы' -ForegroundColor Yellow
-        Write-Host '  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)'
+        Write-Host '  [11] Туннель для сайтов, которые не открывает zapret (свой сервер)'
         Write-Host ('  [12] Быстрый подбор стратегий (обрыв зависших соединений): ' + $(if(Test-CircularReset){'выключить'}else{'включить'}))
         Write-Host '  [0] Выход'
         $choice=Read-Host '  Выбор'
