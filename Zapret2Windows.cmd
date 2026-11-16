@@ -126,7 +126,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.9'
+$script:ScriptVersion='1.8.10'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -4274,7 +4274,7 @@ function Write-HostsFile {
     try {
         [IO.File]::WriteAllLines($Path,$Lines,(Get-HostsEncoding $Lines))
         return $true
-    } catch [UnauthorizedAccessException],[IOException] {
+    } catch [System.UnauthorizedAccessException],[System.IO.IOException] {
         Write-Host '  Не удалось записать hosts: доступ запрещён.' -ForegroundColor Yellow
         Write-Host '  Обычно файл защищает антивирус (самозащита hosts: Kaspersky, Dr.Web,' -ForegroundColor DarkGray
         Write-Host '  Avast, 360 и др.) или "Контролируемый доступ к папкам" Защитника Windows.' -ForegroundColor DarkGray
