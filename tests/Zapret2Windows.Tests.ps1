@@ -217,3 +217,27 @@ Describe 'Закреплённые версии и SHA-256 (из файла ск
         }
     }
 }
+
+Describe 'Test-LaunchArgSafe (валидация параметров до UAC-перезапуска)' {
+    It 'обычные пути проходят - включая кириллицу и буквы r/n' {
+        # Регрессия: прежняя проверка '["`r`n]' в одинарных кавычках давала
+        # класс из литеральных букв r и n, и пути C:\Users\...,
+        # ...\zapret2-v1.0.6, D:\Проги\Запрет\... отвергались как опасные.
+        Test-LaunchArgSafe 'C:\Users\hikari\Downloads\Zapret2Windows' | Should -BeTrue
+        Test-LaunchArgSafe 'D:\Проги\Запрет\zapret2-v1.0.6' | Should -BeTrue
+        Test-LaunchArgSafe 'E:\z2' | Should -BeTrue
+        Test-LaunchArgSafe 'C:\Program Files\Zapret2Windows' | Should -BeTrue
+    }
+    It 'кириллица и пробелы в пути не мешают' {
+        Test-LaunchArgSafe 'D:\Новая папка (2)\Запрет' | Should -BeTrue
+    }
+    It 'кавычка отклоняется' {
+        Test-LaunchArgSafe 'C:"evil' | Should -BeFalse
+        Test-LaunchArgSafe '"quoted path"' | Should -BeFalse
+    }
+    It 'переводы строк отклоняются' {
+        Test-LaunchArgSafe "a`rb" | Should -BeFalse
+        Test-LaunchArgSafe "a`nb" | Should -BeFalse
+        Test-LaunchArgSafe "a`r`nb" | Should -BeFalse
+    }
+}

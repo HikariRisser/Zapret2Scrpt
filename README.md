@@ -309,7 +309,7 @@ points:
   launch through `sh`, `dash` and `bash`.
 - **Release workflow:** releases are published by it automatically.
 - **Windows, in CI (since 1.8.4):** the script is parsed by PowerShell 5.1,
-  checked by PSScriptAnalyzer, 24 Pester tests of pure functions run
+  checked by PSScriptAnalyzer, 28 Pester tests of pure functions run
   (version compare, link parsing, base64, bogon IPs, hosts/list encoding
   detection, pinned checksums), read-only smoke actions run on a real
   Windows runner.
