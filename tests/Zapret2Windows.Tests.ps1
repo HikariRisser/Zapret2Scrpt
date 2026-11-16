@@ -79,7 +79,9 @@ Describe 'Split-ServerLink' {
     }
     It 'ipv6-хост в скобках' {
         $l=Split-ServerLink 'trojan://pw@[2001:db8::1]:8443?security=tls#v6'
-        $l.Host | Should -Be '2001:db8::1'
+        # [uri] канонизирует IPv6 по-разному в .NET Framework и .NET 5+:
+        # 5.1 -> полная форма, pwsh -> сжатая. Сравниваем по разобранному адресу.
+        ([Net.IPAddress]::Parse($l.Host)).Equals([Net.IPAddress]::Parse('2001:db8::1')) | Should -BeTrue
         $l.Port | Should -Be 8443
     }
 }
@@ -100,25 +102,84 @@ Describe 'Merge-ListFile' {
     BeforeAll {
         $script:tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("z2test-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:tmpDir -Force | Out-Null
+        $script:utf8Bom = New-Object Text.UTF8Encoding $true
     }
     AfterAll {
         Remove-Item $script:tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     It 'добавляет только недостающее, сохраняя порядок и комментарии' {
         $f = Join-Path $script:tmpDir 'list.txt'
-        [IO.File]::WriteAllLines($f, @('# комментарий', 'a.example'))
+        # Кодировка задаётся явно: WriteAllLines без неё в PS 5.1 пишет UTF-8
+        # без BOM, а Get-Content без BOM читает как ANSI (cp1251).
+        [IO.File]::WriteAllLines($f, @('# комментарий', 'a.example'), $script:utf8Bom)
         $added = Merge-ListFile $f @('a.example','b.example')
         $added | Should -Be 1
-        $lines = Get-Content $f
+        $lines = @(Read-TextLinesAuto $f)
         $lines.Count | Should -Be 3
         $lines[0] | Should -Be '# комментарий'
         $lines[2] | Should -Be 'b.example'
+    }
+    It 'кириллица в ANSI-файле не мешает распознать дубликат' {
+        # Регрессия: ReadAllLines на ANSI-файле давал мусор, и строка
+        # 'a.example' после кириллического комментария не считалась
+        # существующей (или портила соседние строки).
+        $f = Join-Path $script:tmpDir 'ansi.txt'
+        $ansi = [Text.Encoding]::Default
+        [IO.File]::WriteAllText($f, "# комментарий`r`na.example`r`n", $ansi)
+        $added = Merge-ListFile $f @('a.example','b.example')
+        $added | Should -Be 1
+        $lines = @(Read-TextLinesAuto $f)
+        $lines[-1] | Should -Be 'b.example'
+        # Комментарий сохранился без искажений (сравниваем по байтам ANSI).
+        $bytes = [IO.File]::ReadAllBytes($f)
+        ($ansi.GetString($bytes)) | Should -Match 'комментарий'
     }
     It 'создаёт файл, если его нет' {
         $f = Join-Path $script:tmpDir 'new.txt'
         $added = Merge-ListFile $f @('x.example')
         $added | Should -Be 1
-        (Get-Content $f) | Should -Be 'x.example'
+        (Read-TextLinesAuto $f) | Should -Be 'x.example'
+    }
+}
+
+Describe 'Read-TextLinesAuto' {
+    BeforeAll {
+        $script:tmpDir2 = Join-Path ([IO.Path]::GetTempPath()) ("z2enc-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:tmpDir2 -Force | Out-Null
+    }
+    AfterAll {
+        Remove-Item $script:tmpDir2 -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    It 'UTF-8 с BOM' {
+        $f = Join-Path $script:tmpDir2 'bom.txt'
+        [IO.File]::WriteAllText($f, "# кириллица`r`nx.example`r`n", (New-Object Text.UTF8Encoding $true))
+        $l = @(Read-TextLinesAuto $f)
+        $l.Count | Should -Be 2
+        $l[0] | Should -Be '# кириллица'
+    }
+    It 'UTF-8 без BOM' {
+        $f = Join-Path $script:tmpDir2 'nobom.txt'
+        [IO.File]::WriteAllText($f, "# кириллица`nx.example`n", (New-Object Text.UTF8Encoding $false))
+        $l = @(Read-TextLinesAuto $f)
+        $l[0] | Should -Be '# кириллица'
+        $l.Count | Should -Be 2
+    }
+    It 'UTF-16 LE с BOM' {
+        $f = Join-Path $script:tmpDir2 'u16.txt'
+        [IO.File]::WriteAllText($f, "# кириллица`r`nx.example`r`n", [Text.Encoding]::Unicode)
+        $l = @(Read-TextLinesAuto $f)
+        $l[0] | Should -Be '# кириллица'
+    }
+    It 'ANSI (системная кодировка)' {
+        $f = Join-Path $script:tmpDir2 'ansi.txt'
+        [IO.File]::WriteAllText($f, "# кириллица`r`nx.example`r`n", [Text.Encoding]::Default)
+        $l = @(Read-TextLinesAuto $f)
+        $l[0] | Should -Be '# кириллица'
+    }
+    It 'пустой файл - пустой массив' {
+        $f = Join-Path $script:tmpDir2 'empty.txt'
+        [IO.File]::WriteAllText($f, '', (New-Object Text.UTF8Encoding $false))
+        @(Read-TextLinesAuto $f).Count | Should -Be 0
     }
 }
 

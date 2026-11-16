@@ -597,6 +597,39 @@ function Get-Upstream {
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Write-Host "  Релиз распакован в: $ZapretRoot" -ForegroundColor Green
 }
+function Read-TextLinesAuto {
+    <#
+      Читает текстовый файл, определяя кодировку: BOM (UTF-8/UTF-16) ->
+      UTF-8, если байты валидны как UTF-8 -> иначе системная ANSI (cp1251).
+
+      Без этого ReadAllLines в .NET Framework на русской Windows давал для
+      ANSI-файла мусор вместо кириллицы: «комментарий» превращался в
+      «ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ð¹», и повторные строки не распознавались как дубликаты.
+    #>
+    param([string]$Path)
+    $bytes=[IO.File]::ReadAllBytes($Path)
+    if($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF){
+        $enc=[Text.UTF8Encoding]::new($true)
+    } elseif($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE){
+        $enc=[Text.Encoding]::Unicode
+    } elseif($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF){
+        $enc=[Text.Encoding]::BigEndianUnicode
+    } else {
+        $enc=[Text.UTF8Encoding]::new($false)
+        try { [void]$enc.GetString($bytes) }
+        catch { $enc=[Text.Encoding]::Default }   # не UTF-8 -> системная ANSI
+    }
+    # Разбор строк вручную: ReadAllLines не принимает готовую кодировку
+    # вместе с проверкой валидности UTF-8.
+    $text=$enc.GetString($bytes)
+    if($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF){ $text=$text.Substring(1) }
+    if($text.Length -eq 0){ return @() }
+    $raw=@($text -split "`r`n|`n")
+    # Хвостовой перевод строки не даёт пустого элемента.
+    if($raw.Count -gt 0 -and $raw[$raw.Count-1] -eq ''){ $raw=@($raw | Select-Object -First ($raw.Count-1)) }
+    return $raw
+}
+
 function Merge-ListFile {
     <#
       Дописывает в файл списка недостающие строки из $Seed, ничего не
@@ -607,7 +640,7 @@ function Merge-ListFile {
     $have=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $lines=New-Object System.Collections.Generic.List[string]
     if(Test-Path -LiteralPath $Path){
-        foreach($l in [IO.File]::ReadAllLines($Path)){ $lines.Add($l); [void]$have.Add($l.Trim()) }
+        foreach($l in (Read-TextLinesAuto $Path)){ $lines.Add($l); [void]$have.Add($l.Trim()) }
     }
     $added=0
     foreach($x in $Seed){
