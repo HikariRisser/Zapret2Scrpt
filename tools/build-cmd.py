@@ -11,6 +11,15 @@
 import os
 import sys
 
+# На Windows stdout/stdin по умолчанию в локальной кодировке (cp1252/cp866):
+# вывод кириллицы падает с UnicodeEncodeError, а чтение .ps1 без BOM может
+# испортить текст. Принудительно UTF-8 для всех путей.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PS1 = os.path.join(ROOT, "Zapret2Windows.ps1")
 CMD = os.path.join(ROOT, "Zapret2Windows.cmd")
