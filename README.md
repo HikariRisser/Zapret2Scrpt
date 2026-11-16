@@ -30,7 +30,7 @@ sh zapret2-linux.sh
 ```
 
 The script finds Python 3.8+ (and offers to install it if missing), asks for
-root and opens the menu. Then: **[5]** check requirements → **[1]** install →
+root and opens the menu. Then: **[4]** → check requirements → **[1]** install →
 **[2]** start the bypass.
 
 The file is both a shell script and a Python program: `sh` runs the head, Python
@@ -45,8 +45,7 @@ One file is needed, either of the two (they are the same script), from the
 - **`Zapret2Windows.ps1`** — right-click → "Run with PowerShell", or
   `powershell -ExecutionPolicy Bypass -File .\Zapret2Windows.ps1`.
 
-The script asks for administrator rights itself. Then: **[5]** check
-requirements → **[1]** install → **[2]** start the bypass.
+The script asks for administrator rights itself. Then: **[4]** → check requirements → **[1]** install → **[2]** start the bypass.
 
 The zapret2 build is downloaded from GitHub during installation.
 
@@ -58,16 +57,10 @@ The same on both systems.
 |---|---|
 | [1] | Install or update the zapret2 runtime |
 | [2] | Start / stop the bypass |
-| [3] | Autostart at logon: on / off |
-| [4] | Resource diagnostics |
-| [5] | Check requirements |
-| [6] | Install missing dependencies |
-| [7] | Refresh DNS over DoH |
-| [8] | Learned domains and logs |
-| [9] | Update the script |
-| [10] | Remove from the system |
-| [11] | Tunnel for sites zapret cannot open |
-| [12] | Fast strategy switching (drop stalled connections): on / off |
+| [3] | Tunnel for sites zapret cannot open (submenu) |
+| [4] | Diagnostics and dependencies: resources, requirements, install missing dependencies (submenu) |
+| [5] | Domains and DoH: refresh DNS over DoH, learned domains and logs (submenu) |
+| [6] | Settings: autostart, fast strategy switching, update and remove the script (submenu) |
 | [0] | Exit |
 
 ## How the bypass works
@@ -83,7 +76,7 @@ engine, so speed is unaffected.
 | Traffic | What is applied |
 |---|---|
 | HTTP | `fake` + `multisplit` |
-| TLS, listed domains | four strategies rotated per domain by the `circular` orchestrator: after two failures the domain moves to the next one; the stalled connection is dropped at once so the app reconnects (menu item [12], on by default) |
+| TLS, listed domains | four strategies rotated per domain by the `circular` orchestrator: after two failures the domain moves to the next one; the stalled connection is dropped at once so the app reconnects (Settings menu, on by default) |
 | TLS, large hosting subnets | fake ClientHello with a whitelisted SNI against the cut-off after ~16 KB |
 | QUIC | `fake` on `quic_initial` |
 | Discord voice, STUN, WireGuard | `fake` on `discord_ip_discovery`, `stun`, WireGuard handshake |
@@ -94,7 +87,7 @@ domains and keeps manual edits and learned domains.
 
 ## DNS over DoH
 
-Item **[7]** resolves domains through DoH (Cloudflare, Google, Quad9) and writes
+The Domains and DoH menu (item [5]) resolves domains through DoH (Cloudflare, Google, Quad9) and writes
 them to `hosts` in a marked block, removed on uninstall. Only domains for which
 the system DNS returns a non-working address are pinned, and every candidate
 address is verified with a connection to port 443 before it is written. Tunnel
@@ -102,7 +95,7 @@ domains are never pinned.
 
 ## Tunnel
 
-Item **[11]**. A [sing-box](https://github.com/SagerNet/sing-box) tunnel
+Item **[3]**. A [sing-box](https://github.com/SagerNet/sing-box) tunnel
 (v1.14.4, downloaded on first use) to an external server.
 
 ### Servers
@@ -143,7 +136,7 @@ is validated by its engine before it is saved.
   `162.159.0.0/16`; used by Go Live streams and increasingly by voice) are
   reached by IP, without DNS. Only their media UDP ports go into the tunnel. Some ISPs
   cut UDP to them about a second into the connection, which zapret cannot fix.
-  Tunnel menu item [5] tests this (an IP discovery packet, ~3 s of traffic,
+  The Sites submenu (tunnel item [4]) tests this (an IP discovery packet, ~3 s of traffic,
   another IP discovery packet) and, if the server stops answering, routes UDP to
   these addresses through the tunnel (TCP still goes direct through zapret).
 - DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
@@ -154,11 +147,11 @@ is validated by its engine before it is saved.
 
 ### Choosing a profile
 
-- **Automatic** (tunnel menu [4]): every profile is probed for exit country,
+- **Automatic** (tunnel menu → Profiles → `a`): every profile is probed for exit country,
   latency and a list of region-restricted sites (claude.ai, chatgpt.com,
   gemini.google.com by default, editable). Order: more sites open → foreign exit
   → lower latency.
-- **Manual** (tunnel menu [3]): the chosen profile is pinned and automatic
+- **Manual** (tunnel menu → Profiles → number): the chosen profile is pinned and automatic
   selection will not replace it.
 
 ### External list of region-restricted sites
@@ -170,7 +163,7 @@ GeoBlock list of [itdoginfo/allow-domains](https://github.com/itdoginfo/allow-do
 every 24 hours (systemd timer `zapret2win-geolist.timer` on Linux, scheduled
 task `Zapret2WindowsGeoList` on Windows) and whenever the tunnel starts with a
 copy older than a day. It is kept in a separate file; your own tunnel list is
-untouched. Tunnel menu [10] updates it now, [11] turns it off.
+untouched. The Regional restrictions submenu (tunnel item [5]) updates it now (item 2) or turns it off (item 3).
 
 ### Browsers and DNS
 
@@ -244,10 +237,10 @@ that has no release yet and a matching `release-notes/<version>.md`; the
 workflow first checks that the Linux script compiles and that the `.cmd`
 matches the `.ps1`.
 
-Item **[9]** downloads the script from the `main` branch, compares versions,
+Item **[6]** → Update the script downloads the script from the `main` branch, compares versions,
 makes a backup and checks the new file's syntax before replacing the old one.
 
-Item **[10]** removes processes, autostart, the WinDivert driver service
+Item **[6]** → Remove from the system removes processes, autostart, the WinDivert driver service
 (Windows), the runtime directory (`/opt/zapret2`,
 `C:\Windows\System32\Zapret2Windows`) and the `hosts` block.
 
