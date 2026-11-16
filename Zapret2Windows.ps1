@@ -91,7 +91,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.5'
+$script:ScriptVersion='1.8.6'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -473,18 +473,44 @@ function Protect-Directory {
       По умолчанию Пользователи сохраняют только чтение (нужно, например,
       для меню без прав администратора). -HideFromUsers убирает и чтение -
       для каталога с ключами туннеля (profiles.json и др.).
+
+      Учётки задаются SID-ами (*S-...), а не именами: имена встроенных
+      групп локализованы, и на русской/украинской Windows 'Administrators'
+      не сопоставляется ни с одной учётной записью -
+      "No mapping between account names and security IDs was done".
+      SID одинаков во всех локалях:
+        *S-1-5-18     NT AUTHORITY\SYSTEM
+        *S-1-5-32-544 BUILTIN\Administrators
+        *S-1-5-32-545 BUILTIN\Users
     #>
     param([string]$Path,[switch]$HideFromUsers)
     if(-not (Test-Path -LiteralPath $Path)){ return }
     # /T: права применяются и к уже существующим дочерним файлам - они могли
     # быть созданы раньше с наследованием от System32.
-    $icaclsArgs=@($Path,'/T','/inheritance:r','/grant:r','SYSTEM:(OI)(CI)F','Administrators:(OI)(CI)F')
+    $icaclsArgs=@($Path,'/T','/inheritance:r',
+                  '/grant:r','*S-1-5-18:(OI)(CI)F',
+                  '/grant:r','*S-1-5-32-544:(OI)(CI)F')
     # Без /deny: deny для группы Users заблокировал бы и администраторов -
     # они тоже члены Users. Отсутствие grant даёт тот же эффект безопасно.
-    if(-not $HideFromUsers){ $icaclsArgs+=@('/grant:r','Users:(OI)(CI)RX') }
-    & icacls.exe @icaclsArgs 2>$null | Out-Null
+    if(-not $HideFromUsers){ $icaclsArgs+=@('/grant:r','*S-1-5-32-545:(OI)(CI)RX') }
+    $out=(& icacls.exe @icaclsArgs 2>&1 | Out-String)
     if($LASTEXITCODE -ne 0){
-        Write-Host "    Не удалось задать права на $Path (код $LASTEXITCODE)." -ForegroundColor Yellow
+        # Двухпроходный вариант для старых сборок icacls, где к нескольким
+        # /grant:r в одной команде относится только последний grant:
+        # на таком icacls первый вызов вернёт 0, но применит не все права.
+        foreach($g in @('*S-1-5-18:(OI)(CI)F','*S-1-5-32-544:(OI)(CI)F',
+                        $(if(-not $HideFromUsers){'*S-1-5-32-545:(OI)(CI)RX'}))){
+            if($g){ & icacls.exe $Path '/grant:r' $g 2>&1 | Out-Null }
+        }
+        # Перечитываем фактические права: важнее кода возврата.
+        $acl=$null
+        try { $acl=Get-Acl -LiteralPath $Path } catch {}
+        $sids=@(); if($acl){ $sids=@($acl.Access | ForEach-Object { $_.IdentityReference.Value }) }
+        if($acl -and ($sids -match 'S-1-5-18') -and ($sids -match 'S-1-5-32-544')){
+            Write-Host "    Права на $Path заданы вторым проходом (icacls вернул код $LASTEXITCODE)." -ForegroundColor DarkGray
+            return
+        }
+        Write-Host ("    Не удалось задать права на {0} (код {1}): {2}" -f $Path,$LASTEXITCODE,($out.Trim())) -ForegroundColor Yellow
     }
 }
 function Sync-TrustedScriptCopy {
@@ -714,7 +740,8 @@ function Install-Runtime {
 
     # Явные права вместо наследования (F-17): боевое содержимое - чтение
     # для Пользователей, запись только SYSTEM/Администраторы.
-    Protect-Directory $script:TrustedRuntime
+    # Не критично для установки: сбой ACL не должен её прерывать.
+    try { Protect-Directory $script:TrustedRuntime } catch {}
 
     Write-LaunchConfig
     Fix-DriverService
@@ -1698,7 +1725,10 @@ function Initialize-TunnelDirs {
     }
     # В tunnel лежат profiles.json с закрытыми ключами и паролями - Пользователям
     # читать нельзя (F-17). Вызывается только с правами администратора.
-    Protect-Directory $p.Dir -HideFromUsers
+    # Права - защита, а не условие работы туннеля: если их не удалось
+    # применить, импорт профиля всё равно должен состояться (Linux ведёт
+    # себя так же). Protect-Directory сам сообщает о проблеме.
+    try { Protect-Directory $p.Dir -HideFromUsers } catch {}
 }
 
 function Test-Ipv6Available {
