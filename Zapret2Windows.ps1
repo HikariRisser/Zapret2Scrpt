@@ -91,7 +91,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.10'
+$script:ScriptVersion='1.8.11'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1650,7 +1650,23 @@ $script:TelegramCidr6=@(
 # список доменов туннеля их не касается. У части провайдеров UDP к ним обрезается
 # через ~1 с после начала соединения, и zapret это не исправляет: тогда (по
 # итогам проверки) в туннель направляется UDP к этим адресам, TCP идёт напрямую.
-$script:DiscordMediaCidr4=@('104.29.0.0/16')
+#
+# Список - НЕ одна подсеть: медиасерверы Discord разбросаны по диапазонам
+# Cloudflare, и закреплённый 104.29.0.0/16 покрывал лишь часть из них. Когда
+# медиасервер оказывался в другом диапазоне (например, 162.159.0.0/16), UDP
+# уходил напрямую, обрезался провайдером и трансляция не открывалась.
+# Чтобы не затащить в туннель весь чужой Cloudflare-UDP, в туннель идёт UDP
+# только на порты медиа Discord ($script:DiscordMediaPorts), см. Write-TunnelConfig.
+# Зеркало DISCORD_MEDIA_CIDR4 в zapret2-linux.sh - менять парно.
+$script:DiscordMediaCidr4=@(
+    '104.29.0.0/16','162.158.0.0/15','162.159.0.0/16','172.64.0.0/13',
+    '104.16.0.0/13','104.24.0.0/14','141.101.64.0/18','108.162.192.0/18',
+    '173.245.48.0/20','103.21.244.0/22','103.22.200.0/22','103.31.4.0/22',
+    '188.114.96.0/20','190.93.240.0/20','197.234.240.0/22','198.41.128.0/17',
+    '131.0.72.0/22'
+)
+# Диапазоны портов для sing-box (поле port_range: "a:b").
+$script:DiscordMediaPorts=@('19294:19344','50000:50099')
 # Серверы для проверки: отвечают на пакет определения IP без входа в аккаунт.
 $script:DiscordProbeServers=@(@('104.29.149.69',19298),@('104.29.155.188',19298))
 $script:TunnelIpsetHeader=@(
@@ -2806,6 +2822,9 @@ function Write-TunnelConfig {
                 )+@(
                     # Из адресов Discord в туннель идёт только UDP (медиа); TCP к ним - напрямую.
                     if($discord.Count){ [ordered]@{ inbound=@('tun-in'); network='tcp'; ip_cidr=@($discord); outbound='direct' } }
+                )+@(
+                    # UDP к медиасерверам Discord - в туннель, только на порты медиа.
+                    if($discord.Count){ [ordered]@{ inbound=@('tun-in'); network='udp'; port_range=@($script:DiscordMediaPorts); ip_cidr=@($discord); outbound='tunnel' } }
                 )+@(
                     [ordered]@{ inbound=@('tun-in','mixed-in'); action='resolve'; server='tunnel-dns' },
                     [ordered]@{ inbound=@('tun-in','mixed-in'); outbound='tunnel' }
