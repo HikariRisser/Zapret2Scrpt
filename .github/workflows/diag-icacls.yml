@@ -1,0 +1,63 @@
+name: DIAG icacls
+on: workflow_dispatch
+permissions: {}
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Environment
+        shell: powershell
+        run: |
+          $ci = [Globalization.CultureInfo]::CurrentCulture
+          $ui = [Globalization.CultureInfo]::CurrentUICulture
+          $inst = (Get-Culture).Name
+          Write-Host ("CurrentCulture={0} UI={1} Get-Culture={2}" -f $ci.Name,$ui.Name,$inst.Name)
+          Write-Host ("oslang=" + (Get-Culture).EnglishName)
+          Write-Host ("chcp: " + (chcp))
+          Write-Host ("Encoding.Default: " + [Text.Encoding]::Default.WebName)
+
+      - name: icacls with English well-known names (as in current code)
+        shell: powershell
+        run: |
+          $d = Join-Path $env:TEMP ("z2diag-eng-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $d -Force | Out-Null
+          $args = @($d,'/T','/inheritance:r','/grant:r','SYSTEM:(OI)(CI)F','Administrators:(OI)(CI)F','Users:(OI)(CI)RX')
+          $out = & icacls.exe @args 2>&1 | Out-String
+          Write-Host ("exit=" + $LASTEXITCODE)
+          Write-Host "--- output ---"
+          Write-Host $out
+          Write-Host "--- acl now ---"
+          (Get-Acl $d).Access | ForEach-Object { Write-Host ("  {0} {1}" -f $_.IdentityReference, $_.FileSystemRights) }
+          Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: icacls with SID form (candidate fix)
+        shell: powershell
+        run: |
+          $d = Join-Path $env:TEMP ("z2diag-sid-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $d -Force | Out-Null
+          $args = @($d,'/T','/inheritance:r',
+                    '/grant:r','*S-1-5-18:(OI)(CI)F',
+                    '/grant:r','*S-1-5-32-544:(OI)(CI)F',
+                    '/grant:r','*S-1-5-32-545:(OI)(CI)RX')
+          $out = & icacls.exe @args 2>&1 | Out-String
+          Write-Host ("exit=" + $LASTEXITCODE)
+          Write-Host "--- output ---"
+          Write-Host $out
+          Write-Host "--- acl now ---"
+          (Get-Acl $d).Access | ForEach-Object { Write-Host ("  {0} {1}" -f $_.IdentityReference, $_.FileSystemRights) }
+          Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: icacls with localized names (what Russian/Ukrainian Windows would see)
+        shell: powershell
+        run: |
+          $d = Join-Path $env:TEMP ("z2diag-loc-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $d -Force | Out-Null
+          foreach ($n in @('Администраторы:(OI)(CI)F','Адміністратори:(OI)(CI)F','BUILTIN\Администраторы:(OI)(CI)F')) {
+            $out = & icacls.exe $d '/grant:r' $n 2>&1 | Out-String
+            Write-Host ("name='{0}' exit={1} out={2}" -f $n,$LASTEXITCODE,($out.Trim() -replace "\r?\n",' | '))
+          }
+          Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
