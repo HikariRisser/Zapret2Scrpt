@@ -970,7 +970,7 @@ function Start-Zapret {
     # Первичная проверка DNS - один раз, когда обход уже работает. Отказ
     # записи в hosts (антивирус, атрибут "только чтение") Write-HostsFile
     # не бросает: маркер doh.done ставится, заведомо неудачная попытка не
-    # повторяется при каждом старте. Ручной повтор - пункт меню [7].
+    # повторяется при каждом старте. Ручной повтор - меню «Домены и DoH».
     $dohDone=Join-Path $script:TrustedRuntime 'lists\doh.done'
     if(-not (Test-Path -LiteralPath $dohDone)){
         Write-Host 'Первичная проверка DNS (один раз)...' -ForegroundColor DarkGray
@@ -1354,7 +1354,7 @@ function Show-Check {
     if($fail){
         $fixable=@($report | Where-Object { $_.Status -eq 'FAIL' -and $_.Fixable }).Count
         if($fixable){
-            Write-Host ("  Часть проблем исправляется автоматически (пункт [6]): $fixable") -ForegroundColor Yellow
+            Write-Host ("  Часть проблем исправляется автоматически (меню «Диагностика и зависимости»): $fixable") -ForegroundColor Yellow
         }
         Write-Host '  Остальное требует ручного вмешательства — см. пометки выше.' -ForegroundColor Red
     } elseif($warn){
@@ -3316,7 +3316,7 @@ function Start-Tunnel {
     Write-Host "  Запуск туннеля (профиль '$($prof.name)')..." -ForegroundColor Yellow
     $r=Start-TunnelProcess $prof
     if($r -eq 'notunnel' -and $st -and $st.pinned){
-        Write-Host '  Профиль выбран вручную, поэтому на другой не переключаюсь. Автовыбор: меню туннеля, пункт [4].' -ForegroundColor Yellow
+        Write-Host '  Профиль выбран вручную, поэтому на другой не переключаюсь. Автовыбор: меню туннеля, «Профили», a.' -ForegroundColor Yellow
     } elseif($r -eq 'notunnel' -and @(Get-TunnelProfiles).Count -gt 1){
         Write-Host '  Профиль не отвечает, проверяю остальные...' -ForegroundColor Yellow
         Stop-Tunnel -Quiet
@@ -3355,7 +3355,7 @@ function Start-TunnelBackground {
     $proc=Start-Process -FilePath $l.File -ArgumentList $l.Args -WindowStyle Hidden -PassThru `
               -RedirectStandardOutput $p.StartLog -RedirectStandardError "$($p.StartLog).err"
     [IO.File]::WriteAllText($p.StarterPid,[string]$proc.Id,[Text.Encoding]::ASCII)
-    Write-Host '  Туннель запускается в фоне - статус в меню [11].' -ForegroundColor DarkGray
+    Write-Host '  Туннель запускается в фоне - статус в меню туннеля (пункт [3] главного меню).' -ForegroundColor DarkGray
 }
 
 function Invoke-TunnelStartAction {
@@ -3699,6 +3699,67 @@ function Show-TunnelProfiles {
     return $profiles
 }
 
+function Show-TunnelProfilesMenu {
+    $profiles=@(Show-TunnelProfiles)
+    if(-not $profiles.Count){ return }
+    $n=(Read-Host '  Номер - выбрать профиль, a - выбрать лучший автоматически, dN - удалить (Enter - назад)').Trim()
+    if(-not $n){ return }
+    if($n -ieq 'a' -or $n -ieq 'а'){ [void](Select-TunnelProfile); return }
+    if($n -match '^[dDдД](\d+)$'){
+        $idx=[int]$Matches[1]
+        if($idx -ge 1 -and $idx -le $profiles.Count){
+            $gone=$profiles[$idx-1]
+            $rest=@($profiles | Where-Object { $_.name -ne $gone.name })
+            Save-TunnelProfiles $rest
+            if((Get-TunnelStatus).Active -eq $gone.name){
+                Stop-Tunnel -Quiet
+                Remove-Item (Get-TunnelPaths).State -Force -ErrorAction SilentlyContinue
+            }
+            Write-LaunchConfig
+            Write-Host "  Профиль '$($gone.name)' удалён." -ForegroundColor Green
+        }
+        return
+    }
+    $idx=0
+    if([int]::TryParse($n,[ref]$idx) -and $idx -ge 1 -and $idx -le $profiles.Count){
+        [void](Use-TunnelProfile $n)
+    }
+}
+function Show-TunnelSitesMenu {
+    Write-Host ''
+    Write-Host '  [1] Проверить сайты из списка zapret и Discord; что не работает через zapret - в туннель'
+    Write-Host '  [2] Добавить домен в туннель вручную'
+    Write-Host '  [3] Проверить сайты из списка туннеля (как в браузере)'
+    Write-Host '  [0] Назад'
+    switch((Read-Host '  Выбор').Trim()){
+        '1' { Update-TunnelRoutes }
+        '2' {
+            $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
+            if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
+                Add-TunnelDomains @($d)
+                Write-Host "  $d добавлен в туннель." -ForegroundColor Green
+                if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
+            } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
+        }
+        '3' { Test-TunnelSites }
+    }
+}
+function Show-TunnelGeoMenu {
+    Write-Host ''
+    Write-Host '  [1] Проверить региональные ограничения через активный профиль'
+    Write-Host "  [2] Обновить внешний список сайтов с региональными ограничениями сейчас ($(Get-GeoListStatus))"
+    Write-Host ('  [3] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
+    Write-Host '  [0] Назад'
+    switch((Read-Host '  Выбор').Trim()){
+        '1' { Test-TunnelGeo }
+        '2' {
+            Ensure-Admin
+            if(Test-GeoListEnabled){ [void](Update-GeoList -Force) }
+            else { Write-Host '  Внешний список выключен (пункт [3]).' -ForegroundColor DarkGray }
+        }
+        '3' { Switch-GeoList }
+    }
+}
 function Show-TunnelMenu {
     while($true){
         $w=Get-TunnelStatus
@@ -3715,94 +3776,86 @@ function Show-TunnelMenu {
             }
         }
         Write-Host ('  [1] ' + $(if($w.Enabled){'Выключить туннель'}else{'Включить туннель'}))
-        Write-Host '  [2] Свой сервер: импортировать конфиг, ссылку или подписку'
-        Write-Host '  [3] Выбрать профиль вручную'
-        Write-Host '  [4] Проверить профили и выбрать лучший автоматически'
-        Write-Host '  [5] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель'
-        Write-Host '  [6] Добавить домен в туннель вручную'
-        Write-Host '  [7] Проверить сайты из списка туннеля (как в браузере)'
-        Write-Host '  [8] Профили: показать / удалить'
-        Write-Host '  [9] Региональные ограничения: проверить сайты через активный профиль'
-        Write-Host "  [10] Внешний список сайтов с региональными ограничениями: обновить сейчас ($(Get-GeoListStatus))"
-        Write-Host ('  [11] Внешний список: ' + $(if(Test-GeoListEnabled){'выключить'}else{'включить'}))
+        Write-Host '  [2] Добавить свой сервер: конфиг, ссылку или подписку'
+        Write-Host '  [3] Профили: выбрать, автовыбор, удалить'
+        Write-Host '  [4] Сайты: проверка и добавление в туннель'
+        Write-Host '  [5] Региональные ограничения и внешний список'
         Write-Host '  [0] Назад'
-        $choice=Read-Host '  Выбор'
+        $choice=(Read-Host '  Выбор').Trim()
         if($choice -eq '0'){ return }
         try {
-        switch($choice){
-            '1' { if($w.Enabled){ Disable-Tunnel } else { Enable-Tunnel } }
-            '2' {
-                Write-Host ''
-                Write-Host '  Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.' -ForegroundColor DarkGray
-                Write-Host "  Поддерживается: $($script:SupportedFormats)." -ForegroundColor DarkGray
-                $v=Read-Host '  Ссылка, путь к файлу или адрес подписки'
-                if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'custom'; [void](Select-TunnelProfile) }
-            }
-            '3' {
-                if(@(Show-TunnelProfiles).Count){
-                    $n=(Read-Host '  Номер профиля (a - выбрать автоматически, Enter - отмена)').Trim()
-                    if($n){ [void](Use-TunnelProfile $(if($n -ieq 'a' -or $n -ieq 'а'){'auto'}else{$n})) }
+            switch($choice){
+                '1' { if($w.Enabled){ Disable-Tunnel } else { Enable-Tunnel } }
+                '2' {
+                    Write-Host ''
+                    Write-Host '  Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.' -ForegroundColor DarkGray
+                    Write-Host "  Поддерживается: $($script:SupportedFormats)." -ForegroundColor DarkGray
+                    $v=Read-Host '  Ссылка, путь к файлу или адрес подписки'
+                    if($v){ Import-TunnelProfiles -Text (Read-UserInput $v) -Source 'custom'; [void](Select-TunnelProfile) }
                 }
+                '3' { Show-TunnelProfilesMenu }
+                '4' { Show-TunnelSitesMenu }
+                '5' { Show-TunnelGeoMenu }
             }
-            '4' { [void](Select-TunnelProfile) }
-            '5' { Update-TunnelRoutes }
-            '9' { Test-TunnelGeo }
-            '10' {
-                Ensure-Admin
-                if(Test-GeoListEnabled){ [void](Update-GeoList -Force) }
-                else { Write-Host '  Внешний список выключен (пункт [11]).' -ForegroundColor DarkGray }
-            }
-            '11' { Switch-GeoList }
-            '6' {
-                $d=(Read-Host '  Домен (например, example.com)').Trim().ToLowerInvariant()
-                if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
-                    Add-TunnelDomains @($d)
-                    Write-Host "  $d добавлен в туннель." -ForegroundColor Green
-                    if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
-                } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
-            }
-            '7' { Test-TunnelSites }
-            '8' {
-                $profiles=@(Show-TunnelProfiles)
-                if($profiles.Count){
-                    $n=Read-Host '  Номер профиля для удаления (Enter - ничего не удалять)'
-                    $idx=0
-                    if([int]::TryParse($n,[ref]$idx) -and $idx -ge 1 -and $idx -le $profiles.Count){
-                        $gone=$profiles[$idx-1]
-                        $rest=@($profiles | Where-Object { $_.name -ne $gone.name })
-                        Save-TunnelProfiles $rest
-                        if((Get-TunnelStatus).Active -eq $gone.name){
-                            Stop-Tunnel -Quiet
-                            Remove-Item (Get-TunnelPaths).State -Force -ErrorAction SilentlyContinue
-                        }
-                        Write-LaunchConfig
-                        Write-Host "  Профиль '$($gone.name)' удалён." -ForegroundColor Green
-                    }
-                }
-            }
-        }
         } catch {
             Write-Host ('  Ошибка: ' + $_.Exception.Message) -ForegroundColor Red
         }
     }
 }
-
-function Get-StrategyLines {
-    # Применённые сейчас параметры обхода (winws2.args): по строке на профиль.
-    # Пути к спискам и lua-файлам не выводятся - только сам набор параметров.
-    $cfg=Join-Path $script:TrustedRuntime 'winws2.args'
-    if(-not (Test-Path -LiteralPath $cfg)){ return @() }
-    $profiles=New-Object System.Collections.Generic.List[string]
-    $cur=New-Object System.Collections.Generic.List[string]
-    foreach($a in @(Get-Content -LiteralPath $cfg -Encoding UTF8)){
-        if($a -eq '--new'){ if($cur.Count){ $profiles.Add(($cur -join ' ')) }; $cur.Clear(); continue }
-        if($a -match '^--(hostlist|ipset|lua-init|wf-)'){ continue }
-        $cur.Add($a)
+function Show-DiagMenu {
+    Write-Host ''
+    Write-Host '  [1] Диагностика ресурсов'
+    Write-Host '  [2] Проверить требования'
+    Write-Host '  [3] Установить отсутствующие зависимости'
+    Write-Host '  [0] Назад'
+    switch((Read-Host '  Выбор').Trim()){
+        '1' { Diagnose; Read-Host '  Нажмите Enter' }
+        '2' { Show-Check; Read-Host '  Нажмите Enter' }
+        '3' { [void](Install-Dependencies -IncludeOptional); Read-Host '  Нажмите Enter' }
     }
-    if($cur.Count){ $profiles.Add(($cur -join ' ')) }
-    $lines=@('  Стратегия: circular - автоперебор стратегий на каждый домен (после 2 сбоев - следующая)')
-    for($i=0; $i -lt $profiles.Count; $i++){ $lines+=("    профиль $($i+1): " + $profiles[$i]) }
-    return $lines
+}
+function Show-DomainsMenu {
+    Write-Host ''
+    Write-Host '  [1] Обновить DNS через DoH'
+    Write-Host '  [2] Выученные домены и журналы'
+    Write-Host '  [0] Назад'
+    switch((Read-Host '  Выбор').Trim()){
+        '1' { Update-DohHosts; Read-Host '  Нажмите Enter' }
+        '2' {
+            $f=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'
+            Write-Host ''
+            if(Test-Path $f){
+                $learned=@(Get-Content $f | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+                Write-Host ("  Выучено доменов: " + $learned.Count) -ForegroundColor Cyan
+                $learned | Select-Object -First 30 | ForEach-Object { Write-Host ('    ' + $_) -ForegroundColor DarkGray }
+                if($learned.Count -gt 30){ Write-Host ('    ... и ещё ' + ($learned.Count-30)) -ForegroundColor DarkGray }
+            } else {
+                Write-Host '  Среда не установлена — список пуст.' -ForegroundColor Yellow
+            }
+            $logs=Join-Path $script:TrustedRuntime 'logs'
+            if(Test-Path $logs){
+                Write-Host ''
+                Write-Host ('  Журналы: ' + $logs) -ForegroundColor DarkGray
+                Start-Process explorer.exe $logs
+            }
+            Read-Host '  Нажмите Enter'
+        }
+    }
+}
+function Show-SettingsMenu {
+    $st=Get-Status
+    Write-Host ''
+    Write-Host ('  [1] Автозапуск при входе: ' + $(if($st.AutoStart){'выключить'}else{'включить'}))
+    Write-Host ('  [2] Быстрый подбор стратегий (обрыв зависших соединений): ' + $(if(Test-CircularReset){'выключить'}else{'включить'}))
+    Write-Host ('  [3] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
+    Write-Host '  [4] Удалить из системы' -ForegroundColor Yellow
+    Write-Host '  [0] Назад'
+    switch((Read-Host '  Выбор').Trim()){
+        '1' { Toggle-Autostart; Read-Host '  Нажмите Enter' }
+        '2' { Toggle-CircularReset; Read-Host '  Нажмите Enter' }
+        '3' { Update-Self; if($script:ScriptVersion){ Read-Host '  Нажмите Enter' } }
+        '4' { Remove-All; Read-Host '  Нажмите Enter' }
+    }
 }
 function Show-Menu {
     # Почти все пункты требуют прав администратора: запрашиваем их сразу, а
@@ -3847,50 +3900,20 @@ function Show-Menu {
         Write-Host ''
         Write-Host ('  [1] ' + $(if($st.Runtime){'Обновить среду zapret2'}else{'Установить среду zapret2'}))
         Write-Host ('  [2] ' + $(if($st.Running){'Остановить обход'}else{'Запустить обход'}))
-        Write-Host ('  [3] Автозапуск при входе: ' + $(if($st.AutoStart){'выключить'}else{'включить'}))
-        Write-Host '  [4] Диагностика ресурсов'
-        Write-Host '  [5] Проверить требования'
-        Write-Host '  [6] Установить отсутствующие зависимости'
-        Write-Host '  [7] Обновить DNS через DoH'
-        Write-Host '  [8] Выученные домены и журналы'
-        Write-Host ('  [9] Обновить скрипт (у вас ' + $script:ScriptVersion + ')')
-        Write-Host '  [10] Удалить из системы' -ForegroundColor Yellow
-        Write-Host '  [11] Туннель для сайтов, которые не открывает zapret (свой сервер)'
-        Write-Host ('  [12] Быстрый подбор стратегий (обрыв зависших соединений): ' + $(if(Test-CircularReset){'выключить'}else{'включить'}))
+        Write-Host '  [3] Туннель для сайтов, которые не открывает zapret'
+        Write-Host '  [4] Диагностика и зависимости'
+        Write-Host '  [5] Домены и DoH'
+        Write-Host '  [6] Настройки'
         Write-Host '  [0] Выход'
-        $choice=Read-Host '  Выбор'
+        $choice=(Read-Host '  Выбор').Trim()
         try {
             switch($choice){
                 '1' {Install-Runtime; Read-Host '  Нажмите Enter'}
                 '2' {Toggle-Run; Read-Host '  Нажмите Enter'}
-                '3' {Toggle-Autostart; Read-Host '  Нажмите Enter'}
-                '4' {Diagnose; Read-Host '  Нажмите Enter'}
-                '5' {Show-Check; Read-Host '  Нажмите Enter'}
-                '6' {[void](Install-Dependencies -IncludeOptional); Read-Host '  Нажмите Enter'}
-                '7' {Update-DohHosts; Read-Host '  Нажмите Enter'}
-                '8' {
-                    $f=Join-Path $script:TrustedRuntime 'lists\autohostlist.txt'
-                    Write-Host ''
-                    if(Test-Path $f){
-                        $learned=@(Get-Content $f | Where-Object { $_ -and $_ -notmatch '^\s*#' })
-                        Write-Host ("  Выучено доменов: " + $learned.Count) -ForegroundColor Cyan
-                        $learned | Select-Object -First 30 | ForEach-Object { Write-Host ('    ' + $_) -ForegroundColor DarkGray }
-                        if($learned.Count -gt 30){ Write-Host ('    ... и ещё ' + ($learned.Count-30)) -ForegroundColor DarkGray }
-                    } else {
-                        Write-Host '  Среда не установлена — список пуст.' -ForegroundColor Yellow
-                    }
-                    $logs=Join-Path $script:TrustedRuntime 'logs'
-                    if(Test-Path $logs){
-                        Write-Host ''
-                        Write-Host ('  Журналы: ' + $logs) -ForegroundColor DarkGray
-                        Start-Process explorer.exe $logs
-                    }
-                    Read-Host '  Нажмите Enter'
-                }
-                '9' {Update-Self; if($script:ScriptVersion){Read-Host '  Нажмите Enter'}}
-                '10' {Remove-All; Read-Host '  Нажмите Enter'}
-                '11' {Show-TunnelMenu}
-                '12' {Toggle-CircularReset; Read-Host '  Нажмите Enter'}
+                '3' {Show-TunnelMenu}
+                '4' {Show-DiagMenu}
+                '5' {Show-DomainsMenu}
+                '6' {Show-SettingsMenu}
                 '0' {return}
             }
         } catch {Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red; Read-Host '  Нажмите Enter'}
@@ -4289,7 +4312,7 @@ function Write-HostsFile {
       запрещена и после этого - hosts защищён антивирусом (самозащита
       файла hosts у Kaspersky, Dr.Web, Avast, 360 и др.) либо
       "Контролируемым доступом к папкам" Защитника Windows; обход
-      работает и без записи в hosts, повторить можно пунктом [7].
+      работает и без записи в hosts, повторить можно в меню «Домены и DoH».
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -4306,7 +4329,7 @@ function Write-HostsFile {
         Write-Host '  Не удалось записать hosts: доступ запрещён.' -ForegroundColor Yellow
         Write-Host '  Обычно файл защищает антивирус (самозащита hosts: Kaspersky, Dr.Web,' -ForegroundColor DarkGray
         Write-Host '  Avast, 360 и др.) или "Контролируемый доступ к папкам" Защитника Windows.' -ForegroundColor DarkGray
-        Write-Host '  Обход работает и без записи в hosts; повторить - пункт меню [7].' -ForegroundColor DarkGray
+        Write-Host '  Обход работает и без записи в hosts; повторить - меню «Домены и DoH».' -ForegroundColor DarkGray
         return $false
     }
 }

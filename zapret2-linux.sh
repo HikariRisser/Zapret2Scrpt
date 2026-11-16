@@ -1309,7 +1309,7 @@ def check_requirements():
     total = f"успешно {n_ok}, предупреждений {n_warn}, ошибок {n_fail}"
     if n_fail:
         print(_c(C.RED, "  Итог: " + total))
-        print(_c(C.YELLOW, "  Часть проблем исправляется пунктом [6]."))
+        print(_c(C.YELLOW, "  Часть проблем исправляется в меню «Диагностика и зависимости»."))
     elif n_warn:
         print(_c(C.YELLOW, "  Итог: " + total))
     else:
@@ -3477,7 +3477,7 @@ def sync_geolist():
 def geolist_action(force=True):
     ensure_root(sys.argv)
     if not geolist_enabled():
-        info("Внешний список выключен (меню туннеля, пункт [12]).")
+        info("Внешний список выключен (меню туннеля, «Региональные ограничения», пункт [3]).")
         return
     update_geolist(force=force)
 
@@ -4225,7 +4225,7 @@ def start_tunnel():
     r = start_tunnel_process(profile)
     if r == "notunnel" and st.get("pinned"):
         warn("Профиль выбран вручную, поэтому на другой не переключаюсь. "
-             "Автовыбор: меню туннеля, пункт [4].")
+             "Автовыбор: меню туннеля, «Профили», a.")
     elif r == "notunnel" and len(load_profiles()) > 1:
         warn("Профиль не отвечает, проверяю остальные...")
         stop_tunnel(quiet=True)
@@ -4280,7 +4280,7 @@ def start_tunnel_background():
                              start_new_session=True)
     with open(tunnel_path("starting.pid"), "w") as f:
         f.write(str(p.pid))
-    info(f"Туннель запускается в фоне — статус в меню [11], журнал: {log}")
+    info(f"Туннель запускается в фоне — статус в меню туннеля (пункт [3] главного меню), журнал: {log}")
 
 
 def tunnel_start_action():
@@ -4656,6 +4656,73 @@ def show_profiles():
     return profiles
 
 
+def tunnel_profiles_menu():
+    profiles = show_profiles()
+    if not profiles:
+        return
+    n = input("  Номер — выбрать профиль, a — выбрать лучший автоматически, dN — удалить (Enter — назад): ").strip().lower()
+    if not n:
+        return
+    if n in ("a", "а"):
+        select_profile()
+        return
+    m = re.fullmatch(r"[dд](\d+)", n)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= len(profiles):
+            gone = profiles.pop(idx - 1)
+            save_profiles(profiles)
+            st = read_json(tunnel_path("state.json")) or {}
+            if st.get("active") == gone["name"]:
+                stop_tunnel(quiet=True)
+                try:
+                    os.remove(tunnel_path("state.json"))
+                except OSError:
+                    pass
+            write_config()
+            ok(f"Профиль «{gone['name']}» удалён")
+    elif n.isdigit():
+        use_profile(n)
+
+
+def tunnel_sites_menu():
+    print()
+    print("  [1] Проверить сайты из списка zapret и Discord; что не работает через zapret — в туннель")
+    print("  [2] Добавить домен в туннель вручную")
+    print("  [3] Проверить сайты из списка туннеля (как в браузере)")
+    print("  [0] Назад")
+    ch = input("\n  Выбор: ").strip()
+    if ch == "1":
+        update_tunnel_routes()
+    elif ch == "2":
+        d = input("  Домен (например, example.com): ").strip().lower()
+        if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
+            add_tunnel_domains([d])
+            ok(f"{d} добавлен в туннель")
+            if tunnel_running():
+                time.sleep(1)
+                tunnel_test([d])
+        else:
+            err("Некорректный домен")
+    elif ch == "3":
+        tunnel_test()
+
+
+def tunnel_geo_menu():
+    print()
+    print("  [1] Проверить региональные ограничения через активный профиль")
+    print(f"  [2] Обновить внешний список сайтов с региональными ограничениями сейчас ({geolist_status()})")
+    print("  [3] Внешний список: " + ("выключить" if geolist_enabled() else "включить"))
+    print("  [0] Назад")
+    ch = input("\n  Выбор: ").strip()
+    if ch == "1":
+        tunnel_geo()
+    elif ch == "2":
+        geolist_action()
+    elif ch == "3":
+        toggle_geolist()
+
+
 def tunnel_menu():
     while True:
         print()
@@ -4668,16 +4735,10 @@ def tunnel_menu():
                 for ln in le:
                     print(_c(C.GRAY, f"    {ln}"))
         print(f"  [1] {'Выключить' if en else 'Включить'} туннель")
-        print("  [2] Свой сервер: импортировать конфиг, ссылку или подписку")
-        print("  [3] Выбрать профиль вручную")
-        print("  [4] Проверить профили и выбрать лучший автоматически")
-        print("  [5] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель")
-        print("  [6] Добавить домен в туннель вручную")
-        print("  [7] Проверить сайты из списка туннеля (как в браузере)")
-        print("  [8] Профили: показать / удалить")
-        print("  [9] Региональные ограничения: проверить сайты через активный профиль")
-        print(f"  [10] Внешний список сайтов с региональными ограничениями: обновить сейчас ({geolist_status()})")
-        print("  [11] Внешний список: " + ("выключить" if geolist_enabled() else "включить"))
+        print("  [2] Добавить свой сервер: конфиг, ссылку или подписку")
+        print("  [3] Профили: выбрать, автовыбор, удалить")
+        print("  [4] Сайты: проверка и добавление в туннель")
+        print("  [5] Региональные ограничения и внешний список")
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
@@ -4705,50 +4766,67 @@ def tunnel_menu_action(ch, en):
         import_profiles(read_user_input(value), "custom")
         select_profile()
     elif ch == "3":
-        if not show_profiles():
-            return
-        n = input("  Номер профиля (a — выбрать автоматически, Enter — отмена): ").strip()
-        if n:
-            use_profile("auto" if n.lower() in ("a", "а") else n)
+        tunnel_profiles_menu()
     elif ch == "4":
-        select_profile()
+        tunnel_sites_menu()
     elif ch == "5":
-        update_tunnel_routes()
-    elif ch == "10":
-        geolist_action()
-    elif ch == "11":
-        toggle_geolist()
-    elif ch == "9":
-        tunnel_geo()
-    elif ch == "6":
-        d = input("  Домен (например, example.com): ").strip().lower()
-        if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
-            add_tunnel_domains([d])
-            ok(f"{d} добавлен в туннель")
-            if tunnel_running():
-                time.sleep(1)
-                tunnel_test([d])
-        else:
-            err("Некорректный домен")
-    elif ch == "7":
-        tunnel_test()
-    elif ch == "8":
-        profiles = show_profiles()
-        if not profiles:
-            return
-        n = input("  Номер профиля для удаления (Enter — ничего не удалять): ").strip()
-        if n.isdigit() and 1 <= int(n) <= len(profiles):
-            gone = profiles.pop(int(n) - 1)
-            save_profiles(profiles)
-            st = read_json(tunnel_path("state.json")) or {}
-            if st.get("active") == gone["name"]:
-                stop_tunnel(quiet=True)
-                try:
-                    os.remove(tunnel_path("state.json"))
-                except OSError:
-                    pass
-            write_config()
-            ok(f"Профиль «{gone['name']}» удалён")
+        tunnel_geo_menu()
+
+
+def diag_menu():
+    print()
+    print("  [1] Диагностика ресурсов")
+    print("  [2] Проверить требования")
+    print("  [3] Установить отсутствующие зависимости")
+    print("  [0] Назад")
+    ch = input("\n  Выбор: ").strip()
+    if ch == "1":
+        diagnose()
+        pause()
+    elif ch == "2":
+        check_requirements()
+        pause()
+    elif ch == "3":
+        install_dependencies()
+        pause()
+
+
+def domains_menu():
+    print()
+    print("  [1] Обновить DNS через DoH")
+    print("  [2] Выученные домены и журналы")
+    print("  [0] Назад")
+    ch = input("\n  Выбор: ").strip()
+    if ch == "1":
+        doh_update()
+        pause()
+    elif ch == "2":
+        show_domains_and_logs()
+        pause()
+
+
+def settings_menu():
+    enabled = service_enabled()
+    print()
+    print(f"  [1] Автозапуск при входе: {'выключить' if enabled else 'включить'}")
+    print("  [2] Быстрый подбор стратегий (обрыв зависших соединений): "
+          + ("выключить" if circular_reset_enabled() else "включить"))
+    print(f"  [3] Обновить скрипт (у вас {VERSION})")
+    print(_c(C.YELLOW, "  [4] Удалить из системы"))
+    print("  [0] Назад")
+    ch = input("\n  Выбор: ").strip()
+    if ch == "1":
+        toggle_autostart()
+        pause()
+    elif ch == "2":
+        toggle_circular_reset()
+        pause()
+    elif ch == "3":
+        script_update()
+        pause()
+    elif ch == "4":
+        uninstall()
+        pause()
 
 
 # ----------------------------------------------------------------------------
@@ -4828,21 +4906,13 @@ def menu():
         show_status_block()
         running = nfqws2_running()
         installed = runtime_installed()
-        enabled = service_enabled()
         print()
         print(f"  [1] {'Обновить' if installed else 'Установить'} среду zapret2")
         print(f"  [2] {'Остановить' if running else 'Запустить'} обход")
-        print(f"  [3] Автозапуск при входе: {'выключить' if enabled else 'включить'}")
-        print("  [4] Диагностика ресурсов")
-        print("  [5] Проверить требования")
-        print("  [6] Установить отсутствующие зависимости")
-        print("  [7] Обновить DNS через DoH")
-        print("  [8] Выученные домены и журналы")
-        print(f"  [9] Обновить скрипт (у вас {VERSION})")
-        print(_c(C.YELLOW, "  [10] Удалить из системы"))
-        print("  [11] Туннель для сайтов, которые не открывает zapret (свой сервер)")
-        print("  [12] Быстрый подбор стратегий (обрыв зависших соединений): "
-              + ("выключить" if circular_reset_enabled() else "включить"))
+        print("  [3] Туннель для сайтов, которые не открывает zapret")
+        print("  [4] Диагностика и зависимости")
+        print("  [5] Домены и DoH")
+        print("  [6] Настройки")
         print("  [0] Выход")
 
         try:
@@ -4862,34 +4932,13 @@ def menu():
                     start_bypass()
                 pause()
             elif choice == "3":
-                toggle_autostart()
-                pause()
-            elif choice == "4":
-                diagnose()
-                pause()
-            elif choice == "5":
-                check_requirements()
-                pause()
-            elif choice == "6":
-                install_dependencies()
-                pause()
-            elif choice == "7":
-                doh_update()
-                pause()
-            elif choice == "8":
-                show_domains_and_logs()
-                pause()
-            elif choice == "9":
-                script_update()
-                pause()
-            elif choice == "10":
-                uninstall()
-                pause()
-            elif choice == "11":
                 tunnel_menu()
-            elif choice == "12":
-                toggle_circular_reset()
-                pause()
+            elif choice == "4":
+                diag_menu()
+            elif choice == "5":
+                domains_menu()
+            elif choice == "6":
+                settings_menu()
             elif choice == "0":
                 return
         except KeyboardInterrupt:
