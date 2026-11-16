@@ -126,7 +126,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.8.7'
+$script:ScriptVersion='1.8.8'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -966,9 +966,9 @@ function Start-Zapret {
     # Первичная проверка DNS - один раз, когда обход уже работает.
     $dohDone=Join-Path $script:TrustedRuntime 'lists\doh.done'
     if(-not (Test-Path -LiteralPath $dohDone)){
-        Write-Host 'Первичная проверка DNS (один раз, до минуты)...' -ForegroundColor DarkGray
+        Write-Host 'Первичная проверка DNS (один раз)...' -ForegroundColor DarkGray
         try {
-            Update-DohHosts -Quiet
+            Update-DohHosts
             [IO.File]::WriteAllText($dohDone,(Get-Date).ToString('s'),[Text.Encoding]::ASCII)
         } catch { Write-Host ('  Проверка DNS не выполнена: ' + $_.Exception.Message) -ForegroundColor Yellow }
     }
