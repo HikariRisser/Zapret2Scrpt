@@ -600,13 +600,18 @@ function Get-Upstream {
 function Read-TextLinesAuto {
     <#
       Читает текстовый файл, определяя кодировку: BOM (UTF-8/UTF-16) ->
-      UTF-8, если байты валидны как UTF-8 -> иначе системная ANSI (cp1251).
+      строгий UTF-8 (если байты валидны) -> кодировка отката $FallbackAnsi.
 
       Без этого ReadAllLines в .NET Framework на русской Windows давал для
       ANSI-файла мусор вместо кириллицы: «комментарий» превращался в
       «ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ð¹», и повторные строки не распознавались как дубликаты.
+
+      $FallbackAnsi по умолчанию - системная ANSI-кодовая страница
+      (cp1251 на русской Windows); на машинах с UTF-8-локалом её можно
+      задать иначе при проверках.
     #>
-    param([string]$Path)
+    param([string]$Path,[Text.Encoding]$FallbackAnsi)
+    if(-not $FallbackAnsi){ $FallbackAnsi=[Text.Encoding]::GetEncoding(0) }
     $bytes=[IO.File]::ReadAllBytes($Path)
     if($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF){
         $enc=[Text.UTF8Encoding]::new($true)
@@ -615,9 +620,12 @@ function Read-TextLinesAuto {
     } elseif($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF){
         $enc=[Text.Encoding]::BigEndianUnicode
     } else {
-        $enc=[Text.UTF8Encoding]::new($false)
-        try { [void]$enc.GetString($bytes) }
-        catch { $enc=[Text.Encoding]::Default }   # не UTF-8 -> системная ANSI
+        # Проверка валидности: UTF8Encoding(throwOnInvalidBytes=$true) бросает
+        # на не-UTF-8 байтах. Вариант с $false молча подставил бы U+FFFD и
+        # cp1251-файл читался бы как мусор - именно это и был баг.
+        $strictUtf8=[Text.UTF8Encoding]::new($false,$true)
+        try { [void]$strictUtf8.GetString($bytes); $enc=$strictUtf8 }
+        catch { $enc=$FallbackAnsi }
     }
     # Разбор строк вручную: ReadAllLines не принимает готовую кодировку
     # вместе с проверкой валидности UTF-8.

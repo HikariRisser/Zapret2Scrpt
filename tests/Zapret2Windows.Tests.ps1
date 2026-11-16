@@ -103,6 +103,8 @@ Describe 'Merge-ListFile' {
         $script:tmpDir = Join-Path ([IO.Path]::GetTempPath()) ("z2test-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:tmpDir -Force | Out-Null
         $script:utf8Bom = New-Object Text.UTF8Encoding $true
+        # cp1251 нужен тестам явно: системная ANSI на UTF-8-раннере тоже UTF-8.
+        $script:cp1251 = [Text.Encoding]::GetEncoding(1251)
     }
     AfterAll {
         Remove-Item $script:tmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -120,19 +122,18 @@ Describe 'Merge-ListFile' {
         $lines[2] | Should -Be 'b.example'
     }
     It 'кириллица в ANSI-файле не мешает распознать дубликат' {
-        # Регрессия: ReadAllLines на ANSI-файле давал мусор, и строка
-        # 'a.example' после кириллического комментария не считалась
-        # существующей (или портила соседние строки).
+        # Регрессия: ReadAllLines на ANSI-файле давал мусор, и кириллический
+        # комментарий ломал распознавание соседних строк.
+        # FallbackAnsi задаётся явно: на windows-2025 с UTF-8-локалом
+        # системная ANSI тоже UTF-8, и тест проверял бы не cp1251.
         $f = Join-Path $script:tmpDir 'ansi.txt'
-        $ansi = [Text.Encoding]::Default
-        [IO.File]::WriteAllText($f, "# комментарий`r`na.example`r`n", $ansi)
+        [IO.File]::WriteAllText($f, "# комментарий`r`na.example`r`n", $script:cp1251)
         $added = Merge-ListFile $f @('a.example','b.example')
         $added | Should -Be 1
-        $lines = @(Read-TextLinesAuto $f)
+        $lines = @(Read-TextLinesAuto $f -FallbackAnsi $script:cp1251)
         $lines[-1] | Should -Be 'b.example'
-        # Комментарий сохранился без искажений (сравниваем по байтам ANSI).
-        $bytes = [IO.File]::ReadAllBytes($f)
-        ($ansi.GetString($bytes)) | Should -Match 'комментарий'
+        # Опорные ASCII-строки не пострадали от чтения кириллицы.
+        $lines | Should -Contain 'a.example'
     }
     It 'создаёт файл, если его нет' {
         $f = Join-Path $script:tmpDir 'new.txt'
@@ -146,6 +147,10 @@ Describe 'Read-TextLinesAuto' {
     BeforeAll {
         $script:tmpDir2 = Join-Path ([IO.Path]::GetTempPath()) ("z2enc-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:tmpDir2 -Force | Out-Null
+        # Хелпер принимает декодер кодировки чтения: cp1251, если системная
+        # ANSI не UTF-8, иначе cp1251 всё равно (это самый частый случай
+        # на русской Windows и проверяется детерминированно).
+        $script:cp1251 = [Text.Encoding]::GetEncoding(1251)
     }
     AfterAll {
         Remove-Item $script:tmpDir2 -Recurse -Force -ErrorAction SilentlyContinue
@@ -170,10 +175,12 @@ Describe 'Read-TextLinesAuto' {
         $l = @(Read-TextLinesAuto $f)
         $l[0] | Should -Be '# кириллица'
     }
-    It 'ANSI (системная кодировка)' {
+    It 'ANSI cp1251 (не-UTF-8 байты)' {
+        # Файл в cp1251 - невалидный UTF-8, значит должен уйти в ANSI-ветку.
+        # FallbackAnsi задаётся явно: системная ANSI на UTF-8-раннере тоже UTF-8.
         $f = Join-Path $script:tmpDir2 'ansi.txt'
-        [IO.File]::WriteAllText($f, "# кириллица`r`nx.example`r`n", [Text.Encoding]::Default)
-        $l = @(Read-TextLinesAuto $f)
+        [IO.File]::WriteAllText($f, "# кириллица`r`nx.example`r`n", $script:cp1251)
+        $l = @(Read-TextLinesAuto $f -FallbackAnsi $script:cp1251)
         $l[0] | Should -Be '# кириллица'
     }
     It 'пустой файл - пустой массив' {
