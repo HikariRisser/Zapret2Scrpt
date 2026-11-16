@@ -3822,6 +3822,23 @@ function Show-SettingsMenu {
         '4' { Remove-All; Read-Host '  Нажмите Enter' }
     }
 }
+function Get-StrategyLines {
+    # Применённые сейчас параметры обхода (winws2.args): по строке на профиль.
+    # Пути к спискам и lua-файлам не выводятся - только сам набор параметров.
+    $cfg=Join-Path $script:TrustedRuntime 'winws2.args'
+    if(-not (Test-Path -LiteralPath $cfg)){ return @() }
+    $profiles=New-Object System.Collections.Generic.List[string]
+    $cur=New-Object System.Collections.Generic.List[string]
+    foreach($a in @(Get-Content -LiteralPath $cfg -Encoding UTF8)){
+        if($a -eq '--new'){ if($cur.Count){ $profiles.Add(($cur -join ' ')) }; $cur.Clear(); continue }
+        if($a -match '^--(hostlist|ipset|lua-init|wf-)'){ continue }
+        $cur.Add($a)
+    }
+    if($cur.Count){ $profiles.Add(($cur -join ' ')) }
+    $lines=@('  Стратегия: circular - автоперебор стратегий на каждый домен (после 2 сбоев - следующая)')
+    for($i=0; $i -lt $profiles.Count; $i++){ $lines+=("    профиль $($i+1): " + $profiles[$i]) }
+    return $lines
+}
 function Show-Menu {
     # Почти все пункты требуют прав администратора: запрашиваем их сразу, а
     # не на первом выбранном пункте (иначе выбор терялся бы при перезапуске).
