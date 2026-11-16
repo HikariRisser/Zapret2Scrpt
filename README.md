@@ -222,8 +222,9 @@ Hyper-V, WSL2, VirtualBox and third-party VPN clients.
 
 ## Troubleshooting
 
-- **Linux:** `sh zapret2-linux.sh report` writes a report to `/tmp` (no keys or
-  passwords). Tunnel log: `journalctl -u zapret2win-tunnel`.
+- **Linux:** `sh zapret2-linux.sh report` writes a report to `/tmp` with mode
+  600 (it may name servers, though no keys or passwords). Tunnel log:
+  `journalctl -u zapret2win-tunnel`.
 - **Windows:** the launcher keeps the window open on errors. `windivert: error
   opening filter: Access is denied` means missing rights or an antivirus block.
   Tunnel logs: `logs\sing-box*.log`.

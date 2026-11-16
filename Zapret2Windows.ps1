@@ -3751,6 +3751,10 @@ $script:DohProviders=@(
     'https://dns.quad9.net/dns-query'
 )
 
+# Кэш ответов Resolve-DohName на время работы процесса: www.X -> X и
+# повторные вызовы одного имени бьют в сеть один раз, а не на каждый домен.
+$script:DohCache=@{}
+
 function Resolve-DohName {
     <#
       Собирает A-записи домена со ВСЕХ DoH-провайдеров, а не с первого
@@ -3758,21 +3762,49 @@ function Resolve-DohName {
       CDN отдают разные адреса, и среди них бывает мёртвый (типично для
       Meta/Instagram: 31.13.72.174 не работает, 57.145.12.34 работает).
       Если вернуть только первый ответ, рабочий адрес потеряется.
+
+      Провайдеры опрашиваются ПАРАЛЛЕЛЬНО (HttpClient): последовательные
+      Invoke-RestMethod с таймаутом 6 с каждый могли держать пользователя
+      десятки секунд на один недоступный провайдер. Результат кэшируется.
     #>
     param([string]$Name,[int]$TimeoutSec=6,[switch]$FirstProviderOnly)
-    $all=New-Object System.Collections.Generic.List[string]
+    $key=$Name.ToLowerInvariant()
+    if($script:DohCache.ContainsKey($key)){ return @($script:DohCache[$key]) }
+
+    Add-Type -AssemblyName System.Net.Http
+    $proto=[Net.SecurityProtocolType]::Tls12
+    try { $proto=$proto -bor [Net.SecurityProtocolType]'Tls13' } catch {}
+    [Net.ServicePointManager]::SecurityProtocol=$proto
+
+    $h=New-Object System.Net.Http.HttpClientHandler
+    $h.UseProxy=$false
+    $c=New-Object System.Net.Http.HttpClient($h)
+    $c.Timeout=[TimeSpan]::FromSeconds([Math]::Max(2,$TimeoutSec))
+    [void]$c.DefaultRequestHeaders.TryAddWithoutValidation('accept','application/dns-json')
+    $tasks=@()
     foreach($p in $script:DohProviders){
         try {
             $sep=if($p -match '\?'){'&'}else{'?'}
-            $u="$p${sep}name=$Name&type=A"
-            $r=Invoke-RestMethod -Uri $u -Headers @{accept='application/dns-json'} -TimeoutSec $TimeoutSec -ErrorAction Stop
-            foreach($ip in @($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data } |
+            $tasks+=$c.GetStringAsync("$p${sep}name=$Name&type=A")
+        } catch {}
+    }
+    $all=New-Object System.Collections.Generic.List[string]
+    try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks,
+            ([int]($TimeoutSec*1000)+500)) } catch {}
+    foreach($t in $tasks){
+        if($t.Status -ne 'RanToCompletion'){ continue }
+        try {
+            $r=$t.Result | ConvertFrom-Json
+            foreach($ip in @($r.Answer | Where-Object { $_.type -eq 1 } |
+                              ForEach-Object { $_.data } |
                               Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })){
                 if(-not $all.Contains($ip)){ $all.Add($ip) }
             }
             if($FirstProviderOnly -and $all.Count){ break }
         } catch {}
     }
+    $c.Dispose()
+    $script:DohCache[$key]=@($all)
     return @($all)
 }
 
@@ -3790,16 +3822,37 @@ function Test-TcpQuick {
 
 function Resolve-DohCname {
     param([string]$Name,[int]$TimeoutSec=5)
+    $key="cname:" + $Name.ToLowerInvariant()
+    if($script:DohCache.ContainsKey($key)){ return @($script:DohCache[$key]) }
+
+    Add-Type -AssemblyName System.Net.Http
+    $h=New-Object System.Net.Http.HttpClientHandler
+    $h.UseProxy=$false
+    $c=New-Object System.Net.Http.HttpClient($h)
+    $c.Timeout=[TimeSpan]::FromSeconds([Math]::Max(2,$TimeoutSec))
+    [void]$c.DefaultRequestHeaders.TryAddWithoutValidation('accept','application/dns-json')
+    $tasks=@()
     foreach($p in $script:DohProviders){
         try {
             $sep=if($p -match '\?'){'&'}else{'?'}
-            $r=Invoke-RestMethod -Uri "$p${sep}name=$Name&type=CNAME" `
-                 -Headers @{accept='application/dns-json'} -TimeoutSec $TimeoutSec -ErrorAction Stop
-            $c=@($r.Answer | Where-Object { $_.type -eq 5 } | ForEach-Object { $_.data -replace '\.$','' })
-            if($c.Count){ return $c }
+            $tasks+=$c.GetStringAsync("$p${sep}name=$Name&type=CNAME")
         } catch {}
     }
-    return @()
+    $out=@()
+    try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks,
+            ([int]($TimeoutSec*1000)+500)) } catch {}
+    foreach($t in $tasks){
+        if($t.Status -ne 'RanToCompletion'){ continue }
+        try {
+            $r=$t.Result | ConvertFrom-Json
+            $cn=@($r.Answer | Where-Object { $_.type -eq 5 } |
+                  ForEach-Object { $_.data -replace '\.$','' })
+            if($cn.Count){ $out=$cn; break }
+        } catch {}
+    }
+    $c.Dispose()
+    $script:DohCache[$key]=@($out)
+    return @($out)
 }
 
 function Get-WorkingIPFor {

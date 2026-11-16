@@ -3,9 +3,18 @@
 //  2) WebSocket voice-шлюз (wss://gateway.discord.gg) - по нему идёт voice state/update
 //  3) UDP-медиапуть: STUN binding (NAT traversal, тот же класс, что и discord_ip_discovery)
 //  4) UDP-доступность диапазонов портов голоса Discord (50000-50099, 19294-19344)
+//
+// Флаги:
+//   --strict      ненулевой код выхода, если хоть одна проверка провалилась
+//   --verify-tls  строгая проверка сертификата HTTPS/WSS (по умолчанию выключена)
 const dgram = require('dgram');
 const crypto = require('crypto');
 const https = require('https');
+
+const cliArgs = process.argv.slice(2);
+const STRICT = cliArgs.includes('--strict');
+const VERIFY_TLS = cliArgs.includes('--verify-tls');
+let failures = 0;
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const VOICE_UDP_PORTS = [50000, 50050, 19294, 19344];
@@ -15,7 +24,7 @@ function httpsGet(url, timeoutMs = 12000) {
     const t0 = Date.now();
     const req = https.request(url, {
       method: 'GET', headers: { 'user-agent': UA, accept: 'application/json' },
-      rejectUnauthorized: false,
+      rejectUnauthorized: VERIFY_TLS,
     }, (res) => {
       let bytes = 0;
       res.on('data', (c) => { bytes += c.length; });
@@ -108,17 +117,20 @@ function discordIpDiscovery(host, port, timeoutMs = 6000) {
   for (const u of ['https://discord.com/api/v9/gateway', 'https://discord.com/api/v9/voice/regions']) {
     const r = await httpsGet(u);
     const ok = r.status >= 200 && r.status < 500;
+    if (!ok) failures++;
     console.log(`  ${u.replace('https://discord.com', '').padEnd(28)} ${ok ? 'OK ' + r.status : 'FAIL ' + (r.err || r.status)} ${r.bytes || 0}б`);
   }
 
   console.log('=== 2) WebSocket voice-шлюз (WSS, TCP/443) ===');
   const w = await wssHello('wss://gateway.discord.gg/?v=10&encoding=json');
+  if (w.op !== 10) failures++;
   console.log(`  gateway.discord.gg           ${w.op === 10 ? 'OK Hello(op=10), heartbeat=' + w.hasHeartbeat : 'FAIL ' + (w.err || ('op=' + w.op))}`);
 
   console.log('=== 3) UDP-медиапуть: STUN binding (NAT traversal) ===');
   for (const [h, p] of [['stun.l.google.com', 19302], ['stun.cloudflare.com', 3478]]) {
     const s = await stunBinding(h, p);
     const ok = s.type === '0x0101' || s.type === '0x0111';
+    if (!ok) failures++;
     console.log(`  ${h.padEnd(28)} ${ok ? 'OK ' + s.type + ' mapped=' + s.mapped : 'FAIL ' + (s.err || s.type)}`);
   }
 
@@ -126,6 +138,12 @@ function discordIpDiscovery(host, port, timeoutMs = 6000) {
   const host = 'discord.com';
   for (const p of VOICE_UDP_PORTS) {
     const d = await discordIpDiscovery(host, p);
+    if (!d.reply) failures++;
     console.log(`  ${(host + ':' + p).padEnd(28)} ${d.reply ? 'OK ответ ' + d.reply + 'б' : (d.err || 'no reply')}`);
+  }
+
+  if (STRICT) {
+    console.log(failures ? `\nПровалов: ${failures}` : '\nВсе проверки пройдены.');
+    process.exitCode = failures ? 1 : 0;
   }
 })();

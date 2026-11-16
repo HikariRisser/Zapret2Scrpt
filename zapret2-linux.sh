@@ -434,11 +434,13 @@ def ok(msg):
 
 
 def warn(msg):
-    print(_c(C.YELLOW, "  ! " + msg))
+    # Предупреждения и ошибки - в stderr: stdout остаётся чистым для
+    # перенаправления (report > file), в интерактиве оба видны в терминале.
+    print(_c(C.YELLOW, "  ! " + msg), file=sys.stderr)
 
 
 def err(msg):
-    print(_c(C.RED, "  ✘ " + msg))
+    print(_c(C.RED, "  ✘ " + msg), file=sys.stderr)
 
 
 def info(msg):
@@ -447,6 +449,14 @@ def info(msg):
 
 def head(msg):
     print(_c(C.CYAN, "  " + msg))
+
+
+def clear_screen():
+    """Очистка экрана ANSI-последовательностью, без os.system/shell."""
+    if not os.environ.get("TERM"):
+        return
+    sys.stdout.write("\033[2J\033[3J\033[H")
+    sys.stdout.flush()
 
 
 # ----------------------------------------------------------------------------
@@ -461,6 +471,10 @@ def run(cmd, check=False, capture=True, timeout=120):
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
             text=True,
+            # Явная кодировка: при LC_ALL=C text=True по умолчанию берёт
+            # locale-кодировку и падает на кириллице в выводе.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         out = (p.stdout or "").strip() if capture else ""
@@ -482,6 +496,32 @@ def run(cmd, check=False, capture=True, timeout=120):
 
 def which(name):
     return shutil.which(name)
+
+
+def atomic_write(path, data, mode=None):
+    """
+    Атомарная запись файла: сначала во временный файл в том же каталоге
+    (fsync), затем os.replace. Падение процесса не оставляет полузаписанный
+    файл - критично для /etc/hosts, config и profiles.json с ключами.
+    mode задаётся ДО записи: секреты не должны даже мгновение быть
+    читаемыми всеми (umask при open() даёт 0644).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".zapret2-", dir=directory)
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ----------------------------------------------------------------------------
@@ -607,9 +647,16 @@ def kill_by_cmdline(*prefixes, wait=4.0):
     time.sleep(0.3)
 
 
+def nfqws2_pids():
+    """PID'ы процессов nfqws2. Совпадение - только с начала командной
+    строки (и путь экранируется): иначе pgrep -f ловит любой процесс,
+    в аргументах которого встречается этот путь (редактор, less, grep)."""
+    rc, out, _ = run(["pgrep", "-f", "^" + re.escape(nfqws2_path())], timeout=10)
+    return out.split() if rc == 0 else []
+
+
 def nfqws2_running():
-    rc, out, _ = run(["pgrep", "-f", nfqws2_path()])
-    return rc == 0 and bool(out.strip())
+    return bool(nfqws2_pids())
 
 
 def service_enabled():
@@ -636,19 +683,42 @@ def learned_domains():
 #  Скачивание
 # ----------------------------------------------------------------------------
 
-def http_get(url, timeout=30):
-    req = urllib.request.Request(
-        url, headers={"User-Agent": f"zapret2-linux/{VERSION}", "Accept": "*/*"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+def http_get(url, timeout=30, retries=3):
+    """GET с ретраями: обрыв сети не должен валить установку целиком."""
+    last = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"zapret2-linux/{VERSION}", "Accept": "*/*"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:  # noqa: BLE001 - ретраим любые сетевые сбои
+            last = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise RuntimeError(f"не удалось скачать {url}: {last}")
 
 
-def download(url, dest, timeout=300):
-    data = http_get(url, timeout=timeout)
-    with open(dest, "wb") as f:
-        f.write(data)
-    return len(data)
+def download(url, dest, timeout=300, retries=3):
+    """Стриминговое скачивание в dest.part с атомарной подменой."""
+    last = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"zapret2-linux/{VERSION}", "Accept": "*/*"}
+        )
+        try:
+            part = dest + ".part"
+            with urllib.request.urlopen(req, timeout=timeout) as resp, \
+                    open(part, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            os.replace(part, dest)
+            return os.path.getsize(dest)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise RuntimeError(f"не удалось скачать {url}: {last}")
 
 
 def get_release():
@@ -891,9 +961,7 @@ def merge_list_file(path, seed):
             lines.append(item)
             added += 1
     if added or not os.path.isfile(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        os.chmod(path, 0o644)
+        atomic_write(path, "\n".join(lines) + "\n", mode=0o644)
     return added
 
 
@@ -947,9 +1015,7 @@ def toggle_circular_reset():
 
 
 def write_config():
-    with open(config_path(), "w", encoding="utf-8") as f:
-        f.write(build_config())
-    os.chmod(config_path(), 0o644)
+    atomic_write(config_path(), build_config() + "\n", mode=0o644)
 
 
 def install_runtime():
@@ -1453,25 +1519,36 @@ def read_hosts():
 
 
 def strip_marked_block(lines):
-    """Удаляет только размеченные блоки (наш и прежней версии проекта)."""
+    """
+    Удаляет только размеченные блоки (наш и прежней версии проекта).
+    Если begin есть, а end потерян (файл был оборван при записи), хвост
+    НЕ стирается до конца файла: это защитило бы системные записи ниже.
+    """
     out = []
     skip = False
     removed = 0
     begin_re = re.compile(r"^\s*#\s*-+\s*Zapret2(?:Windows|Win)?\s*(?:TUI)?\s*DoH\s*begin\s*-+", re.I)
     end_re = re.compile(r"^\s*#\s*-+\s*Zapret2(?:Windows|Win)?\s*(?:TUI)?\s*DoH\s*end\s*-+", re.I)
+    saw_begin = False
+    saw_end = False
     for ln in lines:
         if begin_re.match(ln):
             skip = True
+            saw_begin = True
             removed += 1
             continue
         if end_re.match(ln):
             skip = False
+            saw_end = True
             removed += 1
             continue
         if skip:
             removed += 1
             continue
         out.append(ln)
+    if saw_begin and not saw_end:
+        warn("в hosts найден незакрытый блок DoH (нет end-маркера); "
+             "хвост файла сохранён, проверьте его вручную")
     return out, removed
 
 
@@ -1479,8 +1556,7 @@ def write_hosts(lines):
     if os.path.isfile(HOSTS_PATH) and not os.path.isfile(HOSTS_BACKUP):
         shutil.copy2(HOSTS_PATH, HOSTS_BACKUP)
         info(f"резервная копия: {HOSTS_BACKUP}")
-    with open(HOSTS_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    atomic_write(HOSTS_PATH, "\n".join(lines) + "\n", mode=0o644)
 
 
 def count_marked():
@@ -1526,23 +1602,38 @@ def doh_update():
         flush_dns()
 
     head(f"Разрешение {len(targets)} имён с проверкой рабочего IP...")
-    resolved = []
+    resolved_by_domain = {}
     failed = []
     sys_ok = []
-    for i, d in enumerate(targets, 1):
-        sys.stdout.write(f"    [{i}/{len(targets)}] {d:<38} ")
-        sys.stdout.flush()
-        if system_dns_ok(d):
-            sys_ok.append(d)
-            print(_c(C.GRAY, "системный DNS в порядке"))
-            continue
-        ip = working_ip(d)
-        if ip:
-            resolved.append((ip, d))
-            print(_c(C.GREEN, ip))
-        else:
-            failed.append(d)
-            print(_c(C.GRAY, "нет рабочего IP"))
+
+    def _resolve_one(domain):
+        """Возвращает (domain, результат): 'sys' | ip-строка | None."""
+        if system_dns_ok(domain):
+            return domain, "sys"
+        return domain, working_ip(domain)
+
+    # Домены независимы, каждый тянет несколько таймаутов (DoH-провайдеры,
+    # TLS-проверки кандидатов) - разрешаем пулом потоков, а не по одному:
+    # десятки минут последовательных ожиданий сжимаются в несколько.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_resolve_one, d) for d in targets]
+        for fut in as_completed(futures):
+            domain, res = fut.result()
+            done += 1
+            sys.stdout.write(f"\r    [{done}/{len(targets)}] разрешено      ")
+            sys.stdout.flush()
+            if res == "sys":
+                sys_ok.append(domain)
+            elif res:
+                resolved_by_domain[domain] = res
+            else:
+                failed.append(domain)
+    print("\r" + " " * 60 + "\r", end="")
+    # Порядок записей в hosts - как в списке доменов (детерминированно).
+    resolved = [(resolved_by_domain[d], d) for d in targets if d in resolved_by_domain]
 
     lines, _ = strip_marked_block(read_hosts())
     while lines and not lines[-1].strip():
@@ -1783,9 +1874,11 @@ def collect_report():
 
     # Проверка сайтов с отладочным журналом nfqws2: перезапускаем nfqws2 с
     # теми же параметрами + --debug, правила перехвата остаются на месте.
-    debug_log = "/tmp/zapret2-nfqws2-debug.log"
-    rc, pids, _ = run(["pgrep", "-f", nfqws2_path()])
-    pid = pids.split()[0] if rc == 0 and pids.strip() else None
+    # Лог пишется в root-only каталог /opt/zapret2: предсказуемое имя в /tmp
+    # открыло бы symlink-атаку на чужой файл.
+    debug_log = os.path.join(ZAPRET_TARGET, "nfqws2-debug.log")
+    pids = nfqws2_pids()
+    pid = pids[0] if pids else None
     args = None
     if pid:
         try:
@@ -1809,40 +1902,42 @@ def collect_report():
         time.sleep(1.5)
 
     sec("Проверка сайтов (" + ("через nfqws2 с отладкой" if dbg_proc else "nfqws2 НЕ запущен") + ")")
-    for host in REPORT_TARGETS:
-        for fam in (4, 6):
-            res = _probe_tls(host, fam)
-            lines.append(f"IPv{fam} {host:<38} {res}")
-        # Тот же сайт по адресу из DoH: отделяет подмену DNS от проблемы DPI.
-        doh_ips = doh_query(host, "A", timeout=5)
-        if doh_ips:
-            lines.append(f"DoH  {host:<38} {_probe_tls(host, 4, ip=doh_ips[0])}")
-        else:
-            lines.append(f"DoH  {host:<38} DoH не ответил")
-            sys.stdout.write(".")
-            sys.stdout.flush()
-    print()
-
-    if dbg_proc:
-        dbg_proc.terminate()
-        try:
-            dbg_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            dbg_proc.kill()
-        info("Возврат nfqws2 в обычный режим...")
-        run_init("stop")
-        run_init("start")
-        sec("Отладочный журнал nfqws2 (последние 600 строк)")
-        lines.extend(file_tail(debug_log, 600) or ["<пусто>"])
+    try:
+        for host in REPORT_TARGETS:
+            for fam in (4, 6):
+                res = _probe_tls(host, fam)
+                lines.append(f"IPv{fam} {host:<38} {res}")
+            # Тот же сайт по адресу из DoH: отделяет подмену DNS от проблемы DPI.
+            doh_ips = doh_query(host, "A", timeout=5)
+            if doh_ips:
+                lines.append(f"DoH  {host:<38} {_probe_tls(host, 4, ip=doh_ips[0])}")
+            else:
+                lines.append(f"DoH  {host:<38} DoH не ответил")
+                sys.stdout.write(".")
+                sys.stdout.flush()
+        print()
+    finally:
+        # Восстановление обязательно даже при Ctrl-C/исключении: иначе
+        # nfqws2 остаётся убитым, а отладочный процесс - осиротевшим.
+        if dbg_proc:
+            dbg_proc.terminate()
+            try:
+                dbg_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                dbg_proc.kill()
+            info("Возврат nfqws2 в обычный режим...")
+            run_init("stop")
+            run_init("start")
+            sec("Отладочный журнал nfqws2 (последние 600 строк)")
+            lines.extend(file_tail(debug_log, 600) or ["<пусто>"])
 
     sec("Отладочный журнал: сводка")
     tail = file_tail(debug_log, 100000) if dbg_proc else []
     for pat in ("desync profile", "hostname", "lua_desync", "rawsend", "ERROR", "error"):
         lines.append(f"{pat}: {sum(1 for ln in tail if pat in ln)}")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o644)
+    # Отчёт содержит адреса серверов профилей - только root (0600).
+    atomic_write(path, "\n".join(lines) + "\n", mode=0o600)
     ok(f"Отчёт сохранён: {path}")
     info("Пришлите этот файл — по нему видно, на каком этапе ломается доступ.")
     info("Личных данных в нём нет: только конфигурация, правила и результаты проверок.")
@@ -1893,7 +1988,7 @@ def fetch_remote_script():
     )
 
 
-def script_update(assume_yes=False):
+def script_update(assume_yes=False, force=False):
     self_path = os.path.abspath(__file__)
     print()
     head("Обновление скрипта")
@@ -1942,11 +2037,20 @@ def script_update(assume_yes=False):
         err("Скорее всего это старая копия: замена может откатить скрипт.")
         verdict = "unversioned"
 
-    if not assume_yes:
-        prompt = ("    Установить обновление? (y/N) " if verdict == "update"
-                  else "    Всё равно заменить локальный файл? (y/N) ")
+    if verdict in ("downgrade", "unversioned") and not force:
+        # Откат версии или файл без маркера: --yes НЕ подтверждает замену -
+        # тихий автоматический откат недопустим, нужно явное «y» или --force.
         try:
-            ans = input(prompt).strip().lower()
+            ans = input("    Всё равно заменить локальный файл? (y/N) ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes", "д", "да"):
+            warn("Отменено")
+            print()
+            return
+    elif not assume_yes:
+        try:
+            ans = input("    Установить обновление? (y/N) ").strip().lower()
         except EOFError:
             ans = ""
         if ans not in ("y", "yes", "д", "да"):
@@ -1959,21 +2063,41 @@ def script_update(assume_yes=False):
     shutil.copy2(self_path, backup)
     info(f"резервная копия: {os.path.basename(backup)}")
 
+    # Синтаксис проверяем ДО замены рабочего файла: падение между open("w")
+    # и записью оставило бы обрезанный скрипт (atomic_write страхует и это,
+    # но порядок «сначала проверь, потом пиши» дешевле отката).
+    tmp_new = self_path + ".new"
     try:
-        with open(self_path, "w", encoding="utf-8") as f:
+        with open(tmp_new, "w", encoding="utf-8") as f:
             f.write(remote)
-        os.chmod(self_path, 0o755)
     except OSError as e:
-        shutil.copy2(backup, self_path)
-        err(f"не удалось записать обновление, копия восстановлена: {e}")
+        try:
+            os.remove(tmp_new)
+        except OSError:
+            pass
+        err(f"не удалось записать обновление: {e}")
         return
-
-    # Проверка синтаксиса нового файла
-    rc, _, errout = run([sys.executable, "-m", "py_compile", self_path], timeout=60)
+    rc, _, errout = run([sys.executable, "-c",
+                         "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())",
+                         tmp_new], timeout=60)
     if rc != 0:
-        shutil.copy2(backup, self_path)
-        err("Скачанный скрипт содержит синтаксические ошибки, копия восстановлена.")
+        try:
+            os.remove(tmp_new)
+        except OSError:
+            pass
+        err("Скачанный скрипт содержит синтаксические ошибки, обновление отменено.")
         info(errout[:400])
+        return
+    try:
+        os.chmod(tmp_new, 0o755)
+        os.replace(tmp_new, self_path)
+    except OSError as e:
+        try:
+            os.remove(tmp_new)
+        except OSError:
+            pass
+        shutil.copy2(backup, self_path)
+        err(f"не удалось заменить файл, копия восстановлена: {e}")
         return
 
     print()
@@ -2066,11 +2190,22 @@ def uninstall(assume_yes=False):
     rc_nft = 1
     if which("nft"):
         rc_nft, _, _ = run(["nft", "list", "table", "inet", "zapret2"], timeout=15)
+    # zapret2 init работает и через iptables (системы без nftables) -
+    # проверяем и его правила, иначе отчёт об удалении был бы ложно-чистым.
+    fw_left = rc_nft == 0
+    if not fw_left:
+        for saver in ("iptables-save", "ip6tables-save"):
+            if not which(saver):
+                continue
+            rc_sv, out_sv, _ = run([saver], timeout=15)
+            if rc_sv == 0 and re.search(r"NFQUEUE|zapret", out_sv, re.I):
+                fw_left = True
+                break
     checks = [
         ("процесс nfqws2", not nfqws2_running()),
         ("процессы туннеля", not cmdline_running(f"{singbox_path()} run")
                              and not cmdline_running(f"{xray_path()} run")),
-        ("правила файрвола", rc_nft != 0),
+        ("правила файрвола", not fw_left),
         ("службы systemd", not service_enabled() and not any(os.path.isfile(u) for u in units)),
         ("каталог среды", not os.path.isdir(ZAPRET_TARGET)),
         ("записи hosts", count_marked() == 0 and not os.path.isfile(HOSTS_BACKUP)),
@@ -2213,9 +2348,7 @@ def read_json(path):
 
 
 def write_json(path, obj, mode=0o600):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.chmod(path, mode)
+    atomic_write(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode=mode)
 
 
 def list_entries(path):
@@ -2990,9 +3123,8 @@ def update_tunnel_servers(profiles):
             if ip not in ips:
                 ips.append(ip)
     os.makedirs(ipset_dir(), exist_ok=True)
-    with open(tunnel_servers_path(), "w", encoding="utf-8") as f:
-        f.write("\n".join(tunnel_ipset_header() + ips) + "\n")
-    os.chmod(tunnel_servers_path(), 0o644)
+    atomic_write(tunnel_servers_path(),
+                 "\n".join(tunnel_ipset_header() + ips) + "\n", mode=0o644)
 
 
 def tunnel_wg_ports():
@@ -3358,8 +3490,8 @@ def write_tunnel_rules():
     write_json(tunnel_path("rules.json"),
                {"version": 2, "rules": [{"domain_suffix": doms}]}, mode=0o644)
     # Полный перечень доменов для скрипта DNS (свой список + внешний).
-    with open(tunnel_path("domains.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(tunnel_domains()) + "\n")
+    atomic_write(tunnel_path("domains.txt"),
+                 "\n".join(tunnel_domains()) + "\n", mode=0o644)
     write_tunnel_dns_script()
     if tunnel_tun_exists():
         apply_tunnel_dns()
@@ -3861,8 +3993,7 @@ def tunnel_geo():
     """Проверка сайтов с региональными ограничениями через работающий туннель."""
     merge_list_file(geo_list_path(), SEED_GEO)
     if not tunnel_running():
-        err("Туннель не запущен")
-        return
+        raise RuntimeError("Туннель не запущен")
     head("Проверка региональных ограничений через активный профиль...")
     geo = geo_check(TUNNEL_MIXED_PORT)
     for d, v in geo.items():
@@ -3941,9 +4072,9 @@ def set_tunnel_error(message, details=()):
         print(_c(C.GRAY, f"    {ln}"))
     try:
         os.makedirs(tunnel_dir(), exist_ok=True)
-        with open(tunnel_path("last-error.txt"), "w", encoding="utf-8") as f:
-            f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
-            f.write("\n".join(details) + "\n")
+        atomic_write(tunnel_path("last-error.txt"),
+                     f"{datetime.now().isoformat(timespec='seconds')} {message}\n"
+                     + "\n".join(details) + "\n", mode=0o644)
     except OSError:
         pass
 
@@ -4155,8 +4286,9 @@ def enable_tunnel(assume_yes=False):
     merge_list_file(tunnel_list_path(), SEED_TUNNEL)
     merge_list_file(geo_list_path(), SEED_GEO)
     if not load_profiles():
-        err("Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3]).")
-        return
+        raise RuntimeError(
+            "Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3])."
+        )
     with open(tunnel_path("enabled"), "w") as f:
         f.write("1")
     sync_geolist()
@@ -4353,8 +4485,7 @@ def update_tunnel_routes():
     """Туннель там, где не справляется zapret: сайты и трансляции Discord."""
     ensure_root(sys.argv)
     if not tunnel_running():
-        err("Туннель не запущен")
-        return
+        raise RuntimeError("Туннель не запущен")
     _update_tunnel_sites()
     print()
     check_discord_streams()
@@ -4407,8 +4538,7 @@ def tunnel_test(domains=None):
     """Проверка сайтов из списка туннеля так, как их видит браузер (через DNS и TUN)."""
     ensure_root(sys.argv)
     if not tunnel_running():
-        err("Туннель не запущен")
-        return
+        raise RuntimeError("Туннель не запущен")
     # Внешний список большой - проверяем свой, а из внешнего берём несколько для примера.
     doms = domains or (list_entries(tunnel_list_path()) + geolist_entries()[:5])
     if not doms:
@@ -4613,7 +4743,7 @@ def menu():
             missing = [r for r in reqs if r["status"] == "FAIL" and r["fixable"]]
             hard = [r for r in reqs if r["status"] == "FAIL" and not r["fixable"]]
             if missing or hard:
-                os.system("clear" if os.environ.get("TERM") else "")
+                clear_screen()
                 print()
                 warn("Обнаружены отсутствующие зависимости")
                 print()
@@ -4638,7 +4768,7 @@ def menu():
                 except EOFError:
                     pass
 
-        os.system("clear" if os.environ.get("TERM") else "")
+        clear_screen()
         show_status_block()
         running = nfqws2_running()
         installed = runtime_installed()
@@ -4775,6 +4905,34 @@ ACTIONS = {
 }
 
 
+def acquire_lock(shared=False):
+    """
+    Не даёт двум экземплярам одновременно писать hosts/config/profiles.json.
+    Читающие действия (status, check) берут общий lock, меняющие -
+    эксклюзивный. Возвращает открытый файл-лок (держать до конца работы).
+    """
+    import fcntl
+
+    lock_path = "/var/lock/zapret2win.lock"
+    try:
+        os.makedirs("/var/lock", exist_ok=True)
+        lock_file = open(lock_path, "a+")
+    except OSError:
+        return None  # без /var/lock работаем как раньше
+    flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    try:
+        fcntl.flock(lock_file.fileno(), flags | fcntl.LOCK_NB)
+        return lock_file
+    except OSError:
+        lock_file.close()
+        # Сообщение - в stderr: это ошибка, а не полезный вывод.
+        print(_c(C.RED, "  Другой экземпляр zapret2-linux уже работает."),
+              file=sys.stderr)
+        print("  Дождитесь его завершения (или закройте второе окно) и повторите.",
+              file=sys.stderr)
+        sys.exit(3)
+
+
 def main():
     if sys.platform != "linux":
         print(_c(C.RED, f"  Этот скрипт предназначен для Linux (текущая платформа: {sys.platform})."))
@@ -4832,11 +4990,16 @@ def main():
     parser.add_argument("--proton", action="store_true", help="tunnel-import: это конфиг Proton VPN Free")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="не задавать вопросов подтверждения")
+    parser.add_argument("--force", action="store_true",
+                        help="update: подтвердить замену даже при откате версии")
     parser.add_argument("--version", "-V", action="version",
                         version=f"zapret2-linux {VERSION}")
     args = parser.parse_args()
 
     action = args.action
+
+    # Читающие действия идут под общим локом, меняющие - под эксклюзивным.
+    _lock = acquire_lock(shared=action in ("status", "check", "tunnel-list"))
 
     if action == "menu":
         ensure_root(sys.argv)
@@ -4883,7 +5046,9 @@ def main():
 
     func = ACTIONS[action]
     try:
-        if action in ("update", "uninstall", "deps"):
+        if action == "update":
+            func(assume_yes=args.yes, force=args.force)
+        elif action in ("uninstall", "deps"):
             func(assume_yes=args.yes)
         else:
             func()
