@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.8.9"
+VERSION = "1.8.10"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"

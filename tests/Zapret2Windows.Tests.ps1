@@ -310,6 +310,39 @@ Describe 'Закреплённые версии и SHA-256 (из файла ск
     }
 }
 
+Describe 'catch: имена типов резолвятся (регрессия 1.8.9)' {
+    # 1.8.9 падала при любом запуске: catch [UnauthorizedAccessException],
+    # [IOException] - короткое имя IOException не резолвится (его нет в
+    # наборе автоматически доступных имён типов), и скрипт не запускался
+    # вообще с "unable to find type [IOException]". Проверяем статически,
+    # что каждый тип в catch-списке приводится к [type] без ошибок.
+    BeforeAll {
+        $text = [IO.File]::ReadAllText($env:Z2_PS1_PATH)
+    }
+    It 'все типы в catch [...] резолвятся' {
+        # catch [T1],[T2] { - ловим список целиком, затем каждый тип в
+        # скобках. Резолвим тем же приведением [type], каким пользуется
+        # PowerShell: оно учитывает акселераторы и известные пространства
+        # имён (Net.WebException, UnauthorizedAccessException), а
+        # несуществующее имя (IOException) даёт ошибку. Регрессия 1.8.9:
+        # неразрешимое имя в catch делает скрипт невыполнимым целиком.
+        $bad = @()
+        $clauses = [regex]::Matches($text, 'catch\s*((?:\[[^\]]+\]\s*)(?:,\s*\[[^\]]+\]\s*)*)')
+        foreach ($m in $clauses) {
+            foreach ($t in [regex]::Matches($m.Groups[1].Value, '\[([^\]]+)\]')) {
+                $name = $t.Groups[1].Value.Trim()
+                if (-not $name) { continue }
+                try { $null = [type]$name } catch { $bad += $name }
+            }
+        }
+        ($clauses.Count) | Should -BeGreaterThan 0 -Because 'в скрипте есть catch-блоки'
+        $bad | Should -BeNullOrEmpty -Because ("не резолвятся типы в catch: " + ($bad -join ', '))
+    }
+    It 'короткое имя IOException само по себе не резолвится (фиксируем причину)' {
+        { [type]'IOException' } | Should -Throw
+    }
+}
+
 Describe 'Test-LaunchArgSafe (валидация параметров до UAC-перезапуска)' {
     It 'обычные пути проходят - включая кириллицу и буквы r/n' {
         # Регрессия: прежняя проверка '["`r`n]' в одинарных кавычках давала
