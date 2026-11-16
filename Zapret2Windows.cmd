@@ -520,22 +520,28 @@ function Protect-Directory {
     #>
     param([string]$Path,[switch]$HideFromUsers)
     if(-not (Test-Path -LiteralPath $Path)){ return }
-    # /T: права применяются и к уже существующим дочерним файлам - они могли
-    # быть созданы раньше с наследованием от System32.
-    $icaclsArgs=@($Path,'/T','/inheritance:r',
-                  '/grant:r','*S-1-5-18:(OI)(CI)F',
-                  '/grant:r','*S-1-5-32-544:(OI)(CI)F')
-    # Без /deny: deny для группы Users заблокировал бы и администраторов -
-    # они тоже члены Users. Отсутствие grant даёт тот же эффект безопасно.
-    if(-not $HideFromUsers){ $icaclsArgs+=@('/grant:r','*S-1-5-32-545:(OI)(CI)RX') }
+    # Сначала дочерние файлы сбрасываются на наследование: icacls /grant с
+    # флагами наследования (OI)(CI) на ФАЙЛЕ молча игнорируется (код 0,
+    # "успешно обработано", но ACE не добавляется). Поэтому вариант
+    # "icacls $Path /T /inheritance:r /grant:r ...:(OI)(CI)F" оставлял все
+    # ранее существовавшие файлы с ПУСТЫМ DACL: не могли читать и писать
+    # даже администраторы - "Access to the path is denied".
+    $null=(& icacls.exe $Path '/reset' '/T' '/C' 2>&1)
+    # Grants задаются только на сам каталог: (OI)(CI) валидны для каталогов,
+    # а дети получают их наследованием (проверено: у файлов появляются
+    # ACE-ы с флагом (I)). /inheritance:r на каталоге не даёт наследовать
+    # права от System32.
+    $grants=@('*S-1-5-18:(OI)(CI)F','*S-1-5-32-544:(OI)(CI)F')
+    if(-not $HideFromUsers){ $grants+='*S-1-5-32-545:(OI)(CI)RX' }
+    $icaclsArgs=@($Path,'/inheritance:r')
+    foreach($g in $grants){ $icaclsArgs+=@('/grant:r',$g) }
     $out=(& icacls.exe @icaclsArgs 2>&1 | Out-String)
     if($LASTEXITCODE -ne 0){
         # Двухпроходный вариант для старых сборок icacls, где к нескольким
         # /grant:r в одной команде относится только последний grant:
         # на таком icacls первый вызов вернёт 0, но применит не все права.
-        foreach($g in @('*S-1-5-18:(OI)(CI)F','*S-1-5-32-544:(OI)(CI)F',
-                        $(if(-not $HideFromUsers){'*S-1-5-32-545:(OI)(CI)RX'}))){
-            if($g){ & icacls.exe $Path '/grant:r' $g 2>&1 | Out-Null }
+        foreach($g in $grants){
+            & icacls.exe $Path '/grant:r' $g 2>&1 | Out-Null
         }
         # Перечитываем фактические права: важнее кода возврата.
         $acl=$null
