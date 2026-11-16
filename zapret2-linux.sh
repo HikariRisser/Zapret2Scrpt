@@ -229,6 +229,10 @@ SEED_DOMAINS = [
     "archive.org", "cdn-telegram.org", "cdninstagram.com", "cloudflare-dns.com",
     "cloudflare-ech.com", "cloudflare.com", "dis.gd", "discord-attachments-uploads-prd.storage.googleapis.com",
     "discord.co", "discord.com", "discord.dev", "discord.gg",
+    "discord.app", "discord.design", "discord.status", "discord.store",
+    "discord-activities.com", "discordactivities.com", "discordmerch.com", "discordpartygames.com",
+    "discordsays.com", "discordsez.com", "frankerfacez.com", "ffzap.com",
+    "betterttv.net", "7tv.app", "7tv.io",
     "discord.gift", "discord.media", "discord.new", "discordapp.com",
     "discordapp.net", "discordcdn.com", "discordstatus.com", "facebook.com",
     "facebook.net", "fb.com", "fb.me", "fbcdn.net",
@@ -3946,7 +3950,7 @@ def select_profile(skip=(), autostart=True):
     profiles = load_profiles()
     merge_list_file(geo_list_path(), SEED_GEO)
     if not profiles:
-        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.")
+        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг своего сервера.")
         return None
     was_running = tunnel_running()
     stop_tunnel(quiet=True)
@@ -4199,7 +4203,7 @@ def start_tunnel():
         set_tunnel_error("Для туннеля нужен systemd (sing-box запускается как служба).")
         return
     if not load_profiles():
-        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг Proton VPN Free или своего сервера.")
+        set_tunnel_error("Нет ни одного профиля: импортируйте конфиг своего сервера.")
         return
     try:
         if not os.access(singbox_path(), os.X_OK):
@@ -4221,7 +4225,7 @@ def start_tunnel():
     r = start_tunnel_process(profile)
     if r == "notunnel" and st.get("pinned"):
         warn("Профиль выбран вручную, поэтому на другой не переключаюсь. "
-             "Автовыбор: меню туннеля, пункт [5].")
+             "Автовыбор: меню туннеля, пункт [4].")
     elif r == "notunnel" and len(load_profiles()) > 1:
         warn("Профиль не отвечает, проверяю остальные...")
         stop_tunnel(quiet=True)
@@ -4323,7 +4327,7 @@ def enable_tunnel(assume_yes=False):
     merge_list_file(geo_list_path(), SEED_GEO)
     if not load_profiles():
         raise RuntimeError(
-            "Сначала добавьте профиль: Proton VPN Free (пункт [2]) или свой сервер (пункт [3])."
+            "Сначала добавьте профиль: свой сервер (пункт [2] меню туннеля)."
         )
     with open(tunnel_path("enabled"), "w") as f:
         f.write("1")
@@ -4600,17 +4604,6 @@ def tunnel_test(domains=None):
 
 # --- меню ---------------------------------------------------------------------
 
-PROTON_HELP = """
-  Proton VPN Free — бесплатный тариф без ограничения трафика.
-    1. Зарегистрируйтесь на https://account.protonvpn.com (нужна почта).
-    2. Раздел «Downloads» -> «WireGuard configuration».
-    3. Платформа: Router (или GNU/Linux). Protocol: WireGuard.
-    4. Выберите бесплатный сервер (Free). Для Дальнего Востока ближе Япония (JP).
-    5. Нажмите «Create» и скачайте файл .conf.
-  Можно импортировать несколько файлов (разные страны) — скрипт выберет лучший.
-  Если сайт Proton не открывается, зайдите на него с телефона (мобильный интернет).
-"""
-
 CUSTOM_HELP = f"""
   Свой сервер (VPS). Вставьте ссылку, путь к файлу или адрес подписки.
   Поддерживается: {SUPPORTED_FORMATS}.
@@ -4675,17 +4668,16 @@ def tunnel_menu():
                 for ln in le:
                     print(_c(C.GRAY, f"    {ln}"))
         print(f"  [1] {'Выключить' if en else 'Включить'} туннель")
-        print("  [2] Proton VPN Free: импортировать конфиг WireGuard")
-        print("  [3] Свой сервер: импортировать конфиг, ссылку или подписку")
-        print("  [4] Выбрать профиль вручную")
-        print("  [5] Проверить профили и выбрать лучший автоматически")
-        print("  [6] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель")
-        print("  [7] Добавить домен в туннель вручную")
-        print("  [8] Проверить сайты из списка туннеля (как в браузере)")
-        print("  [9] Профили: показать / удалить")
-        print("  [10] Региональные ограничения: проверить сайты через активный профиль")
-        print(f"  [11] Внешний список сайтов с региональными ограничениями: обновить сейчас ({geolist_status()})")
-        print("  [12] Внешний список: " + ("выключить" if geolist_enabled() else "включить"))
+        print("  [2] Свой сервер: импортировать конфиг, ссылку или подписку")
+        print("  [3] Выбрать профиль вручную")
+        print("  [4] Проверить профили и выбрать лучший автоматически")
+        print("  [5] Проверить сайты и трансляции Discord; что не работает через zapret - в туннель")
+        print("  [6] Добавить домен в туннель вручную")
+        print("  [7] Проверить сайты из списка туннеля (как в браузере)")
+        print("  [8] Профили: показать / удалить")
+        print("  [9] Региональные ограничения: проверить сайты через активный профиль")
+        print(f"  [10] Внешний список сайтов с региональными ограничениями: обновить сейчас ({geolist_status()})")
+        print("  [11] Внешний список: " + ("выключить" if geolist_enabled() else "включить"))
         print("  [0] Назад")
         try:
             ch = input("\n  Выбор: ").strip()
@@ -4705,31 +4697,30 @@ def tunnel_menu_action(ch, en):
     """Одно действие меню туннеля; исключения перехватывает tunnel_menu."""
     if ch == "1":
         disable_tunnel() if en else enable_tunnel()
-    elif ch in ("2", "3"):
-        print(PROTON_HELP if ch == "2" else CUSTOM_HELP)
-        value = input("  Путь к файлу .conf: " if ch == "2"
-                      else "  Ссылка, путь к файлу или адрес подписки: ").strip()
+    elif ch == "2":
+        print(CUSTOM_HELP)
+        value = input("  Ссылка, путь к файлу или адрес подписки: ").strip()
         if not value:
             return
-        import_profiles(read_user_input(value), "proton" if ch == "2" else "custom")
+        import_profiles(read_user_input(value), "custom")
         select_profile()
-    elif ch == "4":
+    elif ch == "3":
         if not show_profiles():
             return
         n = input("  Номер профиля (a — выбрать автоматически, Enter — отмена): ").strip()
         if n:
             use_profile("auto" if n.lower() in ("a", "а") else n)
-    elif ch == "5":
+    elif ch == "4":
         select_profile()
-    elif ch == "6":
+    elif ch == "5":
         update_tunnel_routes()
-    elif ch == "11":
-        geolist_action()
-    elif ch == "12":
-        toggle_geolist()
     elif ch == "10":
+        geolist_action()
+    elif ch == "11":
+        toggle_geolist()
+    elif ch == "9":
         tunnel_geo()
-    elif ch == "7":
+    elif ch == "6":
         d = input("  Домен (например, example.com): ").strip().lower()
         if re.fullmatch(r"[a-z0-9.-]+\.[a-z0-9-]+", d):
             add_tunnel_domains([d])
@@ -4739,9 +4730,9 @@ def tunnel_menu_action(ch, en):
                 tunnel_test([d])
         else:
             err("Некорректный домен")
-    elif ch == "8":
+    elif ch == "7":
         tunnel_test()
-    elif ch == "9":
+    elif ch == "8":
         profiles = show_profiles()
         if not profiles:
             return
@@ -4764,9 +4755,38 @@ def tunnel_menu_action(ch, en):
 #  Меню
 # ----------------------------------------------------------------------------
 
+def strategy_lines():
+    """Применённые сейчас параметры обхода (NFQWS2_OPT из config): по строке на профиль."""
+    try:
+        with open(config_path(), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    m = re.search(r'NFQWS2_OPT="\n(.*?)\n"', text, re.S)
+    if not m:
+        return []
+    profiles, cur = [], []
+    for tok in m.group(1).split():
+        if tok == "--new":
+            if cur:
+                profiles.append(" ".join(cur))
+            cur = []
+            continue
+        if tok.startswith(("--hostlist", "--ipset", "--lua-init")):
+            continue
+        cur.append(tok)
+    if cur:
+        profiles.append(" ".join(cur))
+    lines = ["  Стратегия: circular — автоперебор стратегий на каждый домен (после 2 сбоев — следующая)"]
+    lines += [f"    профиль {i}: {p}" for i, p in enumerate(profiles, 1)]
+    return lines
+
+
 def show_status_block():
     print(f"  Zapret2 Linux — системная DPI-десинхронизация")
     print(_c(C.GRAY, f"  Версия {VERSION} | zapret2 {ZAPRET_VERSION} | nfqws2 + nftables"))
+    for line in strategy_lines():
+        print(_c(C.GRAY, line))
     status_line()
 
 
@@ -4820,7 +4840,7 @@ def menu():
         print("  [8] Выученные домены и журналы")
         print(f"  [9] Обновить скрипт (у вас {VERSION})")
         print(_c(C.YELLOW, "  [10] Удалить из системы"))
-        print("  [11] Туннель для сайтов, которые не открывает zapret (Proton VPN Free / свой сервер)")
+        print("  [11] Туннель для сайтов, которые не открывает zapret (свой сервер)")
         print("  [12] Быстрый подбор стратегий (обрыв зависших соединений): "
               + ("выключить" if circular_reset_enabled() else "включить"))
         print("  [0] Выход")
