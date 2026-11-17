@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -1909,9 +1909,11 @@ def collect_report():
     sec("Проверка сайтов (" + ("через nfqws2 с отладкой" if dbg_proc else "nfqws2 НЕ запущен") + ")")
     try:
         for host in REPORT_TARGETS:
-            for fam in (4, 6):
-                res = _probe_tls(host, fam)
-                lines.append(f"IPv{fam} {host:<38} {res}")
+            # ipv4_only в DNS туннеля: реальные AAAA-адреса сайтов не
+            # маршрутизируются. Проверять IPv6 было бы бесполезно и写明
+            # как «СБОЙ», хотя браузер работает по IPv4.
+            lines.append(f"IPv4 {host:<38} {_probe_tls(host, 4)}")
+            lines.append(f"IPv6 {host:<38} не проверяется (DNS ipv4_only)")
             # Тот же сайт по адресу из DoH: отделяет подмену DNS от проблемы DPI.
             doh_ips = doh_query(host, "A", timeout=5)
             if doh_ips:
