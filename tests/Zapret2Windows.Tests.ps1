@@ -442,3 +442,20 @@ Describe 'DNS туннеля: ipv4_only (Cloudflare и недоступный IP
         (Get-Content -LiteralPath $sh -Raw -Encoding UTF8) | Should -Match '"strategy": "ipv4_only"'
     }
 }
+
+Describe 'Таймеры Linux: ожидание блокировки' {
+    BeforeAll {
+        $sh = Join-Path (Split-Path -Parent $env:Z2_PS1_PATH) 'zapret2-linux.sh'
+        $script:src = Get-Content -LiteralPath $sh -Raw -Encoding UTF8
+    }
+    It 'acquire_lock принимает wait и ждёт освобождения' {
+        $script:src | Should -Match 'def acquire_lock\(shared=False, wait=0\.0\):'
+        $script:src | Should -Match 'time\.sleep\(0\.5\)'
+    }
+    It 'фоновые действия ждут до 120 секунд' {
+        $script:src | Should -Match 'wait=120\.0 if action in \('
+    }
+    It 'юнит geolist имеет TimeoutStartSec (иначе systemd убьёт во время ожидания)' {
+        $script:src | Should -Match '(?s)Type=oneshot\s*TimeoutStartSec=15min\s*ExecStart=\{sys\.executable\} \{copy\} --action tunnel-geolist-auto'
+    }
+}

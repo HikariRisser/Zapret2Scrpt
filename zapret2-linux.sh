@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -3451,6 +3451,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=15min
 ExecStart={sys.executable} {copy} --action tunnel-geolist-auto
 """)
     with open(GEOLIST_TIMER_PATH, "w", encoding="utf-8") as f:
@@ -5225,11 +5226,16 @@ ACTIONS = {
 }
 
 
-def acquire_lock(shared=False):
+def acquire_lock(shared=False, wait=0.0):
     """
     Не даёт двум экземплярам одновременно писать hosts/config/profiles.json.
     Читающие действия (status, check) берут общий lock, меняющие -
     эксклюзивный. Возвращает открытый файл-лок (держать до конца работы).
+
+    wait>0 - ждать до wait секунд, пока lock освободится. Нужно фоновым
+    действиям (таймеры обучения и обновления внешнего списка): интерактивное
+    меню держит lock весь сеанс, и без ожидания таймеры падали каждые 5 минут
+    с кодом 3. За это время меню успевает выполнить команду и освободить lock.
     """
     import fcntl
 
@@ -5240,17 +5246,21 @@ def acquire_lock(shared=False):
     except OSError:
         return None  # без /var/lock работаем как раньше
     flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-    try:
-        fcntl.flock(lock_file.fileno(), flags | fcntl.LOCK_NB)
-        return lock_file
-    except OSError:
-        lock_file.close()
-        # Сообщение - в stderr: это ошибка, а не полезный вывод.
-        print(_c(C.RED, "  Другой экземпляр zapret2-linux уже работает."),
-              file=sys.stderr)
-        print("  Дождитесь его завершения (или закройте второе окно) и повторите.",
-              file=sys.stderr)
-        sys.exit(3)
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), flags | fcntl.LOCK_NB)
+            return lock_file
+        except OSError:
+            if time.monotonic() >= deadline:
+                lock_file.close()
+                # Сообщение - в stderr: это ошибка, а не полезный вывод.
+                print(_c(C.RED, "  Другой экземпляр zapret2-linux уже работает."),
+                      file=sys.stderr)
+                print("  Дождитесь его завершения (или закройте второе окно) и повторите.",
+                      file=sys.stderr)
+                sys.exit(3)
+            time.sleep(0.5)
 
 
 def main():
@@ -5320,7 +5330,11 @@ def main():
     action = args.action
 
     # Читающие действия идут под общим локом, меняющие - под эксклюзивным.
-    _lock = acquire_lock(shared=action in ("status", "check", "tunnel-list"))
+    # Фоновые действия (таймеры) ждут освобождения: интерактивное меню держит
+    # lock, пока пользователь в нём находится.
+    _lock = acquire_lock(
+        shared=action in ("status", "check", "tunnel-list"),
+        wait=120.0 if action in ("tunnel-learn-auto", "tunnel-geolist-auto", "tunnel-start") else 0.0)
 
     if action == "menu":
         ensure_root(sys.argv)
