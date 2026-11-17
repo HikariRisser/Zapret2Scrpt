@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -3699,6 +3699,12 @@ def build_tunnel_config(profile):
             "rules": [{"domain": [DOH_CANARY], "action": "predefined", "rcode": "NXDOMAIN"},
                       {"inbound": ["tun-in"], "rule_set": ["tunnel-domains"],
                        "query_type": ["A", "AAAA"], "server": "fakeip"}],
+            #只有 IPv4: real IPv6 addresses of sites on Cloudflare and other
+            # networks are not routed (Network is unreachable), and sing-box
+            # returned them through `local` -> browser failed to open the site.
+            # FakeIP6 for tunnel domains continues to work (it is returned by
+            # the fakeip server rule above, not by `local`).
+            "strategy": "ipv4_only",
             "final": "local",
         },
         "inbounds": [
