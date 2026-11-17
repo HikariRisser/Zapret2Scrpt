@@ -424,3 +424,12 @@ Describe 'Автообучение туннеля: отбор доменов и 
         $left | Should -Be @('nonexistent-zapret-test.invalid')
     }
 }
+
+Describe 'Стартовый список туннеля: домены ресурсов сайтов' {
+    It 'домен ресурсов protondb есть в SeedTunnel' {
+        $text = [IO.File]::ReadAllText($env:Z2_PS1_PATH)
+        $text | Should -Match "'head\.protondb\.pages\.dev'"
+        $sh = Join-Path (Split-Path -Parent $env:Z2_PS1_PATH) 'zapret2-linux.sh'
+        (Get-Content -LiteralPath $sh -Raw -Encoding UTF8) | Should -Match '"head\.protondb\.pages\.dev"'
+    }
+}

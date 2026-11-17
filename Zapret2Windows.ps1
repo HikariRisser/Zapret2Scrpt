@@ -91,7 +91,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.9.1'
+$script:ScriptVersion='1.9.2'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -151,7 +151,11 @@ $script:SeedDomains=@(
 $script:SeedExclude=@('localhost','local','example.com')
 $script:SeedTunnel=@(
     '# Сайты, которые открываются через туннель (sing-box), а не через zapret.',
-    '# Пополняется автоматически (меню туннеля) или вручную, по домену в строке.'
+    '# Пополняется автоматически (меню туннеля) или вручную, по домену в строке.',
+    '# Ресурсы сайтов на других доменах: protondb.com грузит JS/CSS с',
+    '# head.protondb.pages.dev - без него страница открывается «пустой»/',
+    '# как будто мимо туннеля (домен режется системным DNS провайдера).',
+    'head.protondb.pages.dev'
 )
 
 # Подсети хостингов, которые ТСПУ режет "по 16 КБ". Для них работает
@@ -808,7 +812,9 @@ function Write-LaunchConfig {
     $hosting=Join-Path $lists 'ipset-hosting.txt'
     # Домены, переведённые в туннель, zapret не трогает: их трафик идёт на сервер.
     $warpList=Join-Path $lists 'tunnel.txt'
-    if(-not (Test-Path -LiteralPath $warpList)){ $null=Merge-ListFile $warpList $script:SeedTunnel }
+    # Дописываем seed и в существующий файл: новые домены ресурсов сайтов
+    # должны появляться и при обновлении, а не только при первой установке.
+    if((Merge-ListFile $warpList $script:SeedTunnel) -and (Get-TunnelStatus).Running){ Write-TunnelRules }
     # Соединение с самим сервером туннеля zapret тоже не трогает.
     $tunnelServers=Join-Path $lists 'ipset-tunnel-servers.txt'
     # Туда же входит диапазон FakeIP: трафик, идущий в туннель, zapret не трогает.

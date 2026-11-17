@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -2278,6 +2278,13 @@ TUNNEL_SERVERS_FILE = "zapret2win-ip-tunnel.txt"
 SEED_TUNNEL = [
     "# Сайты, которые открываются через туннель (sing-box), а не через zapret.",
     "# Пополняется автоматически (меню туннеля) или вручную, по домену в строке.",
+    # Помимо основного домена, в туннель должны попадать и домены, откуда
+    # сайт грузит скрипты/API. Иначе браузер получает каркас страницы, но не
+    # может загрузить ресурсы, и сайт выглядит как работающий мимо туннеля.
+    # Пример: protondb.com грузит JS/CSS с head.protondb.pages.dev - этот
+    # домен у части провайдеров не резолвится системным DNS (NXDOMAIN), а
+    # через туннель работает.
+    "head.protondb.pages.dev",
 ]
 BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
@@ -3584,11 +3591,16 @@ def apply_tunnel_dns():
         run(["/bin/sh", tunnel_dns_script_path()], timeout=40)
 
 
-def firefox_doh_forced():
+def firefox_doh_state():
     """
-    True, если в Firefox DNS через HTTPS включён вручную (network.trr.mode
-    2 или 3): тогда Firefox не слушает системный DNS и сайты из списка
-    туннеля идут мимо него. Включённый по умолчанию DoH отключается сам.
+    Возвращает (включён, причина) для DNS через HTTPS в Firefox.
+
+    Важно: Firefox включает DoH не только через network.trr.mode.Practically
+    часто включается его же «doh-rollout»: doh-rollout.mode=1 или
+    doh-rollout.self-enabled=true. Такой DoH НЕ отключается canary-доменом,
+    потому что Firefox шлёт запрос к canary через свой DoH-сервер и получает
+    обычный ответ. В итоге Firefox узнаёт реальный IP сайта (а не FakeIP
+    туннеля) и идёт мимо туннеля, хотя системный DNS настроен правильно.
     """
     import glob
     import pwd
@@ -3599,23 +3611,38 @@ def firefox_doh_forced():
                 homes.add(pwd.getpwnam(name).pw_dir)
         except KeyError:
             pass
+    reason = None
     for home in homes:
         for base in (".mozilla/firefox", "snap/firefox/common/.mozilla/firefox",
                      ".var/app/org.mozilla.firefox/.mozilla/firefox"):
             for prefs in glob.glob(os.path.join(home, base, "*", "prefs.js")):
                 try:
                     with open(prefs, encoding="utf-8", errors="replace") as f:
-                        if re.search(r'user_pref\("network\.trr\.mode",\s*[23]\)', f.read()):
-                            return True
+                        text = f.read()
                 except OSError:
-                    pass
-    return False
+                    continue
+                m = re.search(r'user_pref\("network\.trr\.mode",\s*([0-9])\)', text)
+                if m and int(m.group(1)) in (2, 3, 5):
+                    reason = f"network.trr.mode={m.group(1)} ({prefs})"
+                elif re.search(r'user_pref\("doh-rollout\.self-enabled",\s*true\)', text):
+                    reason = f"doh-rollout.self-enabled=true ({prefs})"
+                elif re.search(r'user_pref\("doh-rollout\.mode",\s*1\)', text):
+                    reason = f"doh-rollout.mode=1 ({prefs})"
+    return (reason is not None, reason)
+
+
+def firefox_doh_forced():
+    """True, если в Firefox включён DNS через HTTPS (см. firefox_doh_state)."""
+    return firefox_doh_state()[0]
 
 
 def warn_browser_dns():
-    if firefox_doh_forced():
-        warn("В Firefox вручную включён «DNS через HTTPS»: он узнаёт адреса сайтов мимо туннеля.")
-        info("Настройки Firefox -> Приватность и защита -> DNS через HTTPS -> «Отключено», затем перезапустите Firefox.")
+    enabled, reason = firefox_doh_state()
+    if enabled:
+        warn("В Firefox включён «DNS через HTTPS»: он узнаёт адреса сайтов мимо туннеля "
+             f"и открывает их по реальному IP ({reason}).")
+        info("Отключите в Firefox: Настройки -> Приватность и защита -> "
+             "DNS через HTTPS -> «Отключено», затем перезапустите Firefox.")
     else:
         info("Браузер нужно перезапустить: он помнит прежние адреса сайтов. Если в браузере вручную "
              "включён «Безопасный DNS» (DNS через HTTPS), отключите его.")
@@ -4334,7 +4361,10 @@ def enable_tunnel(assume_yes=False):
     cleanup_legacy_warp()
     os.makedirs(tunnel_dir(), exist_ok=True)
     os.makedirs(ipset_dir(), exist_ok=True)
-    merge_list_file(tunnel_list_path(), SEED_TUNNEL)
+    if merge_list_file(tunnel_list_path(), SEED_TUNNEL):
+        # Новые записи seed (например, домены ресурсов сайтов) должны
+        # примениться и к уже работающему туннелю, без ручного перезапуска.
+        write_tunnel_rules()
     merge_list_file(geo_list_path(), SEED_GEO)
     if not load_profiles():
         raise RuntimeError(
@@ -4651,7 +4681,8 @@ def _update_tunnel_sites():
             info("Обычно это проходит за секунду; если нет — «Сайты» → [3] покажет состояние.")
         info("Firefox: откройте сайт заново (обновление страницы не сбрасывает его DNS-кэш).")
         if firefox_doh_forced():
-            warn("В Firefox вручную включён «DNS через HTTPS»: он обходит туннель. "
+            _, reason = firefox_doh_state()
+            warn(f"В Firefox включён «DNS через HTTPS» ({reason}): он обходит туннель. "
                  "Отключите его в настройках (раздел DNS через HTTPS).")
     if dead:
         info("Не открываются и через туннель (нет сайта на корне домена или сбой): "
@@ -4678,7 +4709,8 @@ def tunnel_learn_auto():
         if not_ready:
             print(f"DNS ещё не перешёл в туннель: {', '.join(not_ready)}")
         if firefox_doh_forced():
-            print("Firefox: вручную включён DNS через HTTPS, он обходит туннель")
+            _, reason = firefox_doh_state()
+            print(f"Firefox: включён DNS через HTTPS ({reason}), он обходит туннель")
 
 
 def install_learn_timer():
