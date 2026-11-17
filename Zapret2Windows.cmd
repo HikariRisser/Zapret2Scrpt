@@ -126,7 +126,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.9.2'
+$script:ScriptVersion='1.9.3'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -2846,6 +2846,11 @@ function Write-TunnelConfig {
                 [ordered]@{ domain=@($script:DohCanary); action='predefined'; rcode='NXDOMAIN' },
                 [ordered]@{ inbound=@('tun-in'); rule_set=@('tunnel-domains'); query_type=@('A','AAAA'); server='fakeip' }
             )
+            # Только IPv4: реальные IPv6-адреса сайтов (Cloudflare и др.) не
+            # имеют маршрута (Network is unreachable), и браузер не открывает
+            # сайт. FakeIP6 для доменов туннеля продолжает работать - его
+            # выдаёт правило fakeip выше, а не `local`.
+            strategy='ipv4_only'
             final='local'
         }
         inbounds=@(

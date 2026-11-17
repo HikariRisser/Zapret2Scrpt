@@ -433,3 +433,12 @@ Describe 'Стартовый список туннеля: домены ресу�
         (Get-Content -LiteralPath $sh -Raw -Encoding UTF8) | Should -Match '"head\.protondb\.pages\.dev"'
     }
 }
+
+Describe 'DNS туннеля: ipv4_only (Cloudflare и недоступный IPv6)' {
+    It 'в конфиге DNS включён ipv4_only' {
+        $text = [IO.File]::ReadAllText($env:Z2_PS1_PATH)
+        $text | Should -Match "strategy='ipv4_only'"
+        $sh = Join-Path (Split-Path -Parent $env:Z2_PS1_PATH) 'zapret2-linux.sh'
+        (Get-Content -LiteralPath $sh -Raw -Encoding UTF8) | Should -Match '"strategy": "ipv4_only"'
+    }
+}
