@@ -145,6 +145,11 @@ is validated by its engine before it is saved.
   tunnel those that fail directly but open through it. A domain is not re-checked
   for 24 h; at most 60 per run. The Sites submenu, item 1, checks everything at once.
   Adding a domain by hand (Sites submenu, item 2) takes effect at once, no tunnel restart.
+- A site also needs the domains it loads scripts/data from in the tunnel list,
+  not just its own domain; otherwise the page opens but looks broken or as if it
+  bypassed the tunnel. For example, `protondb.com` loads its UI from
+  `head.protondb.pages.dev`, which is in the seed list since 1.9.2. Some ISPs
+  return NXDOMAIN for such domains in the system DNS.
 - DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
   routing domains on Linux, an NRPT rule on Windows) and get FakeIP addresses.
 - zapret leaves tunnel-bound traffic and the connection to the server alone.
