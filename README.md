@@ -139,6 +139,12 @@ is validated by its engine before it is saved.
   The Sites submenu (tunnel item [4]) tests this (an IP discovery packet, ~3 s of traffic,
   another IP discovery packet) and, if the server stops answering, routes UDP to
   these addresses through the tunnel (TCP still goes direct through zapret).
+- Automatic learning (since 1.9.1): while the tunnel is on, a timer (Linux,
+  `zapret2-tunnel-learn`) or a scheduled task (Windows, `Zapret2WindowsLearn`)
+  runs every 5 minutes, checks domains zapret marked as blocked and moves to the
+  tunnel those that fail directly but open through it. A domain is not re-checked
+  for 24 h; at most 60 per run. The Sites submenu, item 1, checks everything at once.
+  Adding a domain by hand (Sites submenu, item 2) takes effect at once, no tunnel restart.
 - DNS queries for tunnel-list domains are sent to sing-box (systemd-resolved
   routing domains on Linux, an NRPT rule on Windows) and get FakeIP addresses.
 - zapret leaves tunnel-bound traffic and the connection to the server alone.
