@@ -390,3 +390,37 @@ Describe 'Discord-медиа: паритет Linux и Windows' {
         $script:shText  | Should -Match 'DISCORD_MEDIA_PORTS = \[\(19294, 19344\), \(50000, 50099\)\]'
     }
 }
+
+Describe 'Автообучение туннеля: отбор доменов и перенос' {
+    It 'перенос: не открылся напрямую дважды, но открылся через туннель' {
+        $move = Select-LearnMove -Failed @('b.test','c.test','d.test') `
+            -Via @{ 'b.test'=$true; 'c.test'=$false; 'd.test'=$true } `
+            -Again @{ 'b.test'=$false; 'c.test'=$false; 'd.test'=$true }
+        $move | Should -Be @('b.test')
+    }
+    It 'авто: домены, проверенные недавно, пропускаются' {
+        $now = 1000000.0
+        $checked = @{ 'old.test' = ($now - 100) }
+        $c = Select-LearnCandidates -Candidates @('a.test','old.test') -Checked $checked -Now $now -RecheckSec 86400 -Max 60 -Auto
+        $c | Should -Be @('a.test')
+    }
+    It 'авто: проверенные давно снова попадают в проверку' {
+        $now = 1000000.0
+        $checked = @{ 'old.test' = ($now - 90000) }
+        $c = Select-LearnCandidates -Candidates @('old.test') -Checked $checked -Now $now -RecheckSec 86400 -Max 60 -Auto
+        $c | Should -Be @('old.test')
+    }
+    It 'авто: не больше Max за запуск' {
+        $c = Select-LearnCandidates -Candidates @('a','b','c','d') -Now 1000000.0 -RecheckSec 86400 -Max 2 -Auto
+        @($c).Count | Should -Be 2
+    }
+    It 'ручной режим: все кандидаты, без учёта истории' {
+        $checked = @{ 'a.test' = 999999.0 }
+        $c = Select-LearnCandidates -Candidates @('a.test','b.test') -Checked $checked -Now 1000000.0 -RecheckSec 86400
+        $c | Should -Be @('a.test','b.test')
+    }
+    It 'ожидание DNS: домен, не перешедший в туннель, возвращается по таймауту' {
+        $left = Wait-TunnelDns -Domains @('nonexistent-zapret-test.invalid') -TimeoutSec 1
+        $left | Should -Be @('nonexistent-zapret-test.invalid')
+    }
+}

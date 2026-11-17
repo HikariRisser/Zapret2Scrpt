@@ -202,7 +202,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 UPDATE_REPO = "HikariRisser/Zapret2Scrpt"
 UPDATE_FILE = "zapret2-linux.sh"
 UPDATE_BRANCH = "main"
@@ -2190,7 +2190,8 @@ def uninstall(assume_yes=False):
 
     print()
     head("Проверка результата:")
-    units = [UNIT_PATH, TUNNEL_UNIT_PATH, XRAY_UNIT_PATH, GEOLIST_UNIT_PATH, GEOLIST_TIMER_PATH] + \
+    units = [UNIT_PATH, TUNNEL_UNIT_PATH, XRAY_UNIT_PATH, GEOLIST_UNIT_PATH, GEOLIST_TIMER_PATH,
+             LEARN_UNIT_PATH, LEARN_TIMER_PATH] + \
             [f"/etc/systemd/system/{u}.service" for u in LEGACY_WARP_UNITS]
     rc_nft = 1
     if which("nft"):
@@ -3308,6 +3309,15 @@ GEOLIST_SERVICE = "zapret2win-geolist"
 GEOLIST_UNIT_PATH = f"/etc/systemd/system/{GEOLIST_SERVICE}.service"
 GEOLIST_TIMER_PATH = f"/etc/systemd/system/{GEOLIST_SERVICE}.timer"
 GEOLIST_MAX_AGE = 24 * 3600
+# Автообучение туннеля: таймер проверяет новые домены, которые zapret
+# пометил как заблокированные (zapret-hosts-auto/user). Уже проверенные за
+# LEARN_RECHECK_SEC домены не трогаются; за один запуск - не больше LEARN_AUTO_MAX.
+LEARN_SERVICE = "zapret2-tunnel-learn"
+LEARN_UNIT_PATH = f"/etc/systemd/system/{LEARN_SERVICE}.service"
+LEARN_TIMER_PATH = f"/etc/systemd/system/{LEARN_SERVICE}.timer"
+LEARN_RECHECK_SEC = 24 * 3600
+LEARN_AUTO_MAX = 60
+LEARN_STATE_FILE = "learn-state.json"
 # systemd-resolved принимает не больше 1024 доменов на интерфейс.
 TUNNEL_DOMAINS_MAX = 1000
 _DOMAIN_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?\.)+[a-z0-9-]{2,}$")
@@ -4333,6 +4343,7 @@ def enable_tunnel(assume_yes=False):
     with open(tunnel_path("enabled"), "w") as f:
         f.write("1")
     sync_geolist()
+    sync_learn_timer()
     start_tunnel()
     if tunnel_running():
         ans = "y"
@@ -4354,6 +4365,7 @@ def disable_tunnel():
         pass
     stop_tunnel()
     remove_geolist_timer()
+    remove_learn_timer()
     if os.path.isfile(TUNNEL_UNIT_PATH):
         run(["systemctl", "disable", TUNNEL_SERVICE], timeout=60)
     flush_dns()
@@ -4532,10 +4544,11 @@ def update_tunnel_routes():
     check_discord_streams()
 
 
-def _update_tunnel_sites():
-    """Перенос в туннель сайтов, которые не открываются через zapret."""
-    if not nfqws2_running():
-        warn("zapret не запущен — в туннель попадут и сайты, которые zapret открыл бы сам")
+def learn_candidates(auto=False):
+    """
+    Домены для проверки: списки zapret без уже перенесённых и исключённых.
+    auto=True - только те, что не проверялись за последние LEARN_RECHECK_SEC.
+    """
     in_tunnel = set(tunnel_domains())
     excl = set(list_entries(os.path.join(ipset_dir(), "zapret-hosts-user-exclude.txt")))
     cands = []
@@ -4543,36 +4556,197 @@ def _update_tunnel_sites():
         for d in list_entries(os.path.join(ipset_dir(), name)):
             if d not in in_tunnel and d not in excl and d not in cands:
                 cands.append(d)
+    if auto:
+        checked = (read_json(tunnel_path(LEARN_STATE_FILE)) or {}).get("checked", {})
+        now = time.time()
+        cands = [d for d in cands if now - float(checked.get(d, 0)) >= LEARN_RECHECK_SEC]
+        cands = cands[:LEARN_AUTO_MAX]
+    return cands
+
+
+def select_learn_move(failed, via, again):
+    """
+    Переносим в туннель домен, который не открылся напрямую дважды, но
+    открылся через туннель. Один неудачный прямой запрос - случайный сбой.
+    """
+    return [d for d in failed if via.get(d) and not again.get(d)]
+
+
+def learn_sites(cands):
+    """
+    Проверка кандидатов: напрямую, затем для не открывшихся - через туннель
+    и повторно напрямую одновременно (фаза на время самой медленной из них).
+    Возвращает (перенести, не открылись нигде, сколько открылись напрямую).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    direct = https_batch(cands)
+    failed = [d for d in cands if not direct[d]]
+    via, again = {}, {}
+    if failed:
+        proxy = f"http://127.0.0.1:{TUNNEL_MIXED_PORT}"
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            fv = {d: ex.submit(https_probe, d, proxy) for d in failed}
+            fd = {d: ex.submit(https_probe, d) for d in failed}
+            via = {d: f.result() for d, f in fv.items()}
+            again = {d: f.result() for d, f in fd.items()}
+    move = select_learn_move(failed, via, again)
+    dead = [d for d in failed if not via.get(d) and not again.get(d)]
+    state = read_json(tunnel_path(LEARN_STATE_FILE)) or {}
+    checked = state.get("checked", {})
+    now = time.time()
+    for d in cands:
+        checked[d] = now
+    write_json(tunnel_path(LEARN_STATE_FILE), {"checked": checked}, mode=0o644)
+    return move, dead, len(cands) - len(failed)
+
+
+def wait_tunnel_dns(domains, timeout=6.0):
+    """
+    Ждём, пока DNS доменов начнёт отдавать адреса туннеля (FakeIP). Вместо
+    фиксированной паузы: sing-box подхватывает список за доли секунды, но
+    systemd-resolved и маршрутизация DNS применяются с задержкой.
+    Возвращает домены, которые так и не перешли в туннель.
+    """
+    pending = set(domains)
+    deadline = time.monotonic() + timeout
+    while pending:
+        for d in list(pending):
+            try:
+                ips = {i[4][0] for i in socket.getaddrinfo(d, 443, socket.AF_INET, socket.SOCK_STREAM)}
+            except OSError:
+                ips = set()
+            if any(ip.startswith(TUNNEL_FAKE4_PREFIX) for ip in ips):
+                pending.discard(d)
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    return sorted(pending)
+
+
+def move_to_tunnel(move):
+    add_tunnel_domains(move)
+    return wait_tunnel_dns(move)
+
+
+def _update_tunnel_sites():
+    """Перенос в туннель сайтов, которые не открываются через zapret («Сайты» → [1])."""
+    if not nfqws2_running():
+        warn("zapret не запущен — в туннель попадут и сайты, которые zapret открыл бы сам")
+    cands = learn_candidates()
     if not cands:
         info("Нечего проверять")
         return
     head(f"Проверка {len(cands)} сайтов через zapret...")
-    direct = https_batch(cands)
-    failed = [d for d in cands if not direct[d]]
-    if failed:
-        # Вторая попытка: случайный сбой не должен навсегда увести сайт в туннель
-        # (домены из списка туннеля zapret больше не обрабатывает).
-        again = https_batch(failed)
-        failed = [d for d in failed if not again[d]]
-    info(f"открываются через zapret: {len(cands) - len(failed)}, не открываются: {len(failed)}")
-    if not failed:
+    move, dead, ok_direct = learn_sites(cands)
+    info(f"открываются через zapret: {ok_direct}, не открываются: {len(cands) - ok_direct}")
+    if not move and not dead:
         ok("Туннель не нужен ни одному сайту из списков")
         return
     head("Проверка неоткрывшихся через туннель...")
-    via = https_batch(failed, proxy=f"http://127.0.0.1:{TUNNEL_MIXED_PORT}")
-    move = [d for d in failed if via[d]]
-    dead = [d for d in failed if not via[d]]
     if move:
-        add_tunnel_domains(move)
+        not_ready = move_to_tunnel(move)
         ok("Перенесено в туннель: " + ", ".join(move))
-        time.sleep(1)   # sing-box перечитывает список
-        check_tunnel_dns()
-        info("Перезапустите браузер: он помнит старые адреса сайтов. Если в браузере включён "
-             "«Безопасный DNS» (DNS через HTTPS), отключите его — иначе он обходит туннель.")
+        if not_ready:
+            warn("DNS ещё не переведён в туннель для: " + ", ".join(not_ready))
+            info("Обычно это проходит за секунду; если нет — «Сайты» → [3] покажет состояние.")
+        info("Firefox: откройте сайт заново (обновление страницы не сбрасывает его DNS-кэш).")
+        if firefox_doh_forced():
+            warn("В Firefox вручную включён «DNS через HTTPS»: он обходит туннель. "
+                 "Отключите его в настройках (раздел DNS через HTTPS).")
     if dead:
         info("Не открываются и через туннель (нет сайта на корне домена или сбой): "
              + ", ".join(dead))
     info(f"Список туннеля: {tunnel_list_path()} (можно править вручную)")
+
+
+def tunnel_learn_auto():
+    """
+    Таймер: переносит в туннель новые заблокированные домены без участия
+    пользователя. Работает только при запущенных туннеле и zapret.
+    Результат - в журнале: journalctl -u zapret2-tunnel-learn
+    """
+    ensure_root(sys.argv)
+    if not tunnel_enabled() or not tunnel_running() or not nfqws2_running():
+        return
+    cands = learn_candidates(auto=True)
+    if not cands:
+        return
+    move, dead, _ = learn_sites(cands)
+    if move:
+        not_ready = move_to_tunnel(move)
+        print(f"перенесено в туннель: {', '.join(move)}")
+        if not_ready:
+            print(f"DNS ещё не перешёл в туннель: {', '.join(not_ready)}")
+        if firefox_doh_forced():
+            print("Firefox: вручную включён DNS через HTTPS, он обходит туннель")
+
+
+def install_learn_timer():
+    if not which("systemctl"):
+        return
+    copy = tunnel_path("zapret2-linux.sh")
+    try:
+        if os.path.abspath(__file__) != copy:
+            shutil.copy2(os.path.abspath(__file__), copy)
+            os.chmod(copy, 0o755)
+    except OSError:
+        return
+    unit = f"""[Unit]
+Description=Zapret2: move newly blocked sites into the tunnel
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=15min
+ExecStart={sys.executable} {copy} --action tunnel-learn-auto
+"""
+    timer = f"""[Unit]
+Description=Zapret2: check new blocked sites for the tunnel
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target
+"""
+    changed = False
+    for path, text in ((LEARN_UNIT_PATH, unit), (LEARN_TIMER_PATH, timer)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                same = f.read() == text
+        except OSError:
+            same = False
+        if not same:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            changed = True
+    if changed:
+        run(["systemctl", "daemon-reload"], timeout=60)
+    run(["systemctl", "enable", "--now", f"{LEARN_SERVICE}.timer"], timeout=60)
+
+
+def remove_learn_timer():
+    if which("systemctl"):
+        run(["systemctl", "disable", "--now", f"{LEARN_SERVICE}.timer"], timeout=60)
+    removed = False
+    for unit in (LEARN_TIMER_PATH, LEARN_UNIT_PATH):
+        try:
+            os.remove(unit)
+            removed = True
+        except OSError:
+            pass
+    if removed and which("systemctl"):
+        run(["systemctl", "daemon-reload"], timeout=60)
+
+
+def sync_learn_timer():
+    """Таймер обучения есть, пока включён туннель."""
+    if tunnel_enabled():
+        install_learn_timer()
+    else:
+        remove_learn_timer()
 
 
 def tunnel_test(domains=None):
@@ -4701,7 +4875,8 @@ def tunnel_sites_menu():
             add_tunnel_domains([d])
             ok(f"{d} добавлен в туннель")
             if tunnel_running():
-                time.sleep(1)
+                if wait_tunnel_dns([d]):
+                    warn(f"DNS для {d} ещё не перешёл в туннель; проверьте через «Сайты» → [3] через несколько секунд")
                 tunnel_test([d])
         else:
             err("Некорректный домен")
@@ -5005,6 +5180,7 @@ ACTIONS = {
     "tunnel-geolist": None,
     "tunnel-geolist-auto": None,
     "tunnel-routes": None,
+    "tunnel-learn-auto": None,
     "tunnel-test": None,
     "tunnel-list": None,
     "tunnel-start": None,
@@ -5076,6 +5252,7 @@ def main():
   tunnel-geo     проверить сайты с региональными ограничениями через активный профиль
   tunnel-geolist обновить внешний список сайтов с региональными ограничениями
   tunnel-routes  проверить сайты и перенести неоткрывающиеся в туннель
+  tunnel-learn-auto  то же без участия человека (запускает таймер раз в 5 минут)
   tunnel-test    проверить сайты из списка туннеля так, как их видит браузер
   tunnel-list    показать профили
   tunnel-start   запустить туннель, если он включён (так обход запускает его следом)
@@ -5137,6 +5314,7 @@ def main():
         "tunnel-geolist": geolist_action,
         "tunnel-geolist-auto": lambda: geolist_action(force=False),
         "tunnel-routes": update_tunnel_routes,
+        "tunnel-learn-auto": tunnel_learn_auto,
         "tunnel-test": tunnel_test,
         "tunnel-list": show_profiles,
         "tunnel-start": lambda: (ensure_root(sys.argv), tunnel_start_action()),

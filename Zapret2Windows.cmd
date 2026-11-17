@@ -57,7 +57,7 @@ endlocal & exit /b %RC%
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelGeoList','TunnelGeoListAuto','TunnelRoutes','TunnelTest','TunnelList','TunnelStart')]
+    [ValidateSet('Menu','Install','Start','Stop','Status','Diagnose','Check','Deps','DohHosts','Update','Uninstall','Purge','TunnelOn','TunnelOff','TunnelImport','TunnelSelect','TunnelUse','TunnelGeo','TunnelGeoList','TunnelGeoListAuto','TunnelRoutes','TunnelLearnAuto','TunnelTest','TunnelList','TunnelStart')]
     [string]$Action='Menu',
     [string]$ZapretRoot = '',
     [switch]$NoAutostart,
@@ -126,7 +126,7 @@ $script:Arch=$null
 # Версия скрипта и репозиторий для самообновления (пункт [9] меню).
 # Версию меняйте при каждом значимом изменении: по ней сравнивается
 # локальная копия с удалённой.
-$script:ScriptVersion='1.9.0'
+$script:ScriptVersion='1.9.1'
 $script:UpdateRepo='HikariRisser/Zapret2Scrpt'
 $script:UpdateBranch='main'
 
@@ -1742,6 +1742,7 @@ $script:GeoLabel=@{ ok='открывается'; challenge='отвечает (п
 # туннеля и обновляется раз в сутки. Свой список туннеля при этом не меняется.
 $script:GeoListUrl='https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst'
 $script:GeoListTask='Zapret2WindowsGeoList'
+$script:LearnTask='Zapret2WindowsLearn'
 $script:TunnelDomainsMax=1000
 $script:TunnelTraceLast=''       # чем закончилась последняя проверка туннеля
 $script:TunnelExit=@{}           # откуда туннель выходит в интернет: loc, ip
@@ -3398,6 +3399,7 @@ function Enable-Tunnel {
     }
     [IO.File]::WriteAllText($p.Enabled,'1',[Text.Encoding]::ASCII)
     Sync-GeoList
+    Sync-LearnTask
     Start-Tunnel
     if((Get-TunnelStatus).Running){
         $a='y'
@@ -3411,16 +3413,17 @@ function Disable-Tunnel {
     Remove-Item $p.Enabled -Force -ErrorAction SilentlyContinue
     Stop-Tunnel
     Remove-GeoListTask
+    Remove-LearnTask
     & ipconfig.exe /flushdns | Out-Null
 }
 
 # --- распределение сайтов ------------------------------------------------------
 
-function Test-HttpsBatch {
+function Start-HttpsProbe {
     <#
-      Параллельная проверка https://<домен>/ . Успех - получен HTTP-ответ и
-      прочитано 64 КБ тела (или оно кончилось раньше): так ловится и обрыв
-      "16 КБ", а не только недоступность. Код ответа не важен.
+      Запускает параллельную проверку https://<домен>/ без ожидания (см.
+      Complete-HttpsProbe). Две проверки можно запустить одна за другой и
+      дождаться обеих: так прямая проверка и проверка через туннель идут одновременно.
     #>
     param([string[]]$Domains,[string]$Proxy)
     Add-Type -AssemblyName System.Net.Http
@@ -3458,8 +3461,45 @@ function Test-HttpsBatch {
         }
         $res[$d]=$ok
     }
-    $c.Dispose()
+    return [pscustomobject]@{ Client=$c; Tasks=$tasks; Domains=$Domains }
+}
+
+function Complete-HttpsProbe {
+    param($Probe)
+    $tasks=$Probe.Tasks
+    try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($tasks.Values),15000) } catch {}
+    $res=@{}
+    foreach($d in $Probe.Domains){
+        $t=$tasks[$d]; $ok=$false
+        if($t.Status -eq 'RanToCompletion'){
+            try {
+                $s=$t.Result.Content.ReadAsStreamAsync().Result
+                $buf=New-Object byte[] 16384; $total=0
+                while($total -lt 65536){
+                    $rt=$s.ReadAsync($buf,0,$buf.Length)
+                    if(-not $rt.Wait(5000)){ break }
+                    if($rt.Result -le 0){ $ok=$true; break }
+                    $total+=$rt.Result
+                }
+                if($total -ge 65536){ $ok=$true }
+                $s.Dispose()
+            } catch {}
+            try { $t.Result.Dispose() } catch {}
+        }
+        $res[$d]=$ok
+    }
+    try { $Probe.Client.Dispose() } catch {}
     return $res
+}
+
+function Test-HttpsBatch {
+    <#
+      Параллельная проверка https://<домен>/ . Успех - получен HTTP-ответ и
+      прочитано 64 КБ тела (или оно кончилось раньше): так ловится и обрыв
+      "16 КБ", а не только недоступность. Код ответа не важен.
+    #>
+    param([string[]]$Domains,[string]$Proxy)
+    return (Complete-HttpsProbe (Start-HttpsProbe -Domains $Domains -Proxy $Proxy))
 }
 
 function Remove-HostsDomains {
@@ -3610,48 +3650,142 @@ function Update-TunnelRoutes {
     Test-DiscordStreams
 }
 
+function Select-LearnCandidates {
+    <#
+      Домены для проверки. Для автоматического режима - только те, что не
+      проверялись за RecheckSec секунд, и не больше Max за запуск.
+    #>
+    param([string[]]$Candidates,[hashtable]$Checked=@{},[double]$Now,[int]$RecheckSec,[int]$Max=0,[switch]$Auto)
+    if(-not $Auto){ return @($Candidates) }
+    $out=@($Candidates | Where-Object { $Now - [double]$Checked[$_] -ge $RecheckSec })
+    if($Max -gt 0){ $out=@($out | Select-Object -First $Max) }
+    return $out
+}
+
+function Select-LearnMove {
+    # Переносим домен, который не открылся напрямую дважды, но открылся через
+    # туннель. Один неудачный прямой запрос - случайный сбой.
+    param([string[]]$Failed,[hashtable]$Via,[hashtable]$Again)
+    return @($Failed | Where-Object { $Via[$_] -and -not $Again[$_] })
+}
+
+function Wait-TunnelDns {
+    <#
+      Ждёт, пока все домены начнут получать адрес туннеля (FakeIP). Возвращает
+      домены, которые так и не перешли. Вместо фиксированной паузы: sing-box
+      подхватывает список за доли секунды, а DNS-клиент Windows - с задержкой.
+    #>
+    param([string[]]$Domains,[int]$TimeoutSec=6)
+    $pending=New-Object System.Collections.Generic.List[string]
+    foreach($d in $Domains){ [void]$pending.Add($d) }
+    $deadline=(Get-Date).AddSeconds($TimeoutSec)
+    while($pending.Count -gt 0){
+        foreach($d in @($pending)){
+            $ips=@()
+            try { $ips=@(Resolve-DnsName -Name $d -Type A -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) } catch {}
+            if(@($ips | Where-Object { $_.StartsWith($script:TunnelFake4Prefix) }).Count){ [void]$pending.Remove($d) }
+        }
+        if($pending.Count -eq 0 -or (Get-Date) -ge $deadline){ break }
+        Start-Sleep -Milliseconds 500
+    }
+    return @($pending)
+}
+
+function Get-LearnState {
+    # Когда домен последний раз проверялся: $h[домен] = unix-время.
+    $h=@{}
+    $j=Read-JsonFile (Join-Path (Get-TunnelPaths).Dir 'learn-state.json')
+    if($j -and $j.checked){ foreach($pr in $j.checked.PSObject.Properties){ $h[$pr.Name]=[double]$pr.Value } }
+    return $h
+}
+
+function Save-LearnState {
+    param([hashtable]$State)
+    Write-JsonFile (Join-Path (Get-TunnelPaths).Dir 'learn-state.json') ([ordered]@{ checked=$State })
+}
+
+function Invoke-LearnSites {
+    # Прямая проверка; не открывшиеся - через туннель и повторно напрямую одновременно.
+    param([string[]]$Cands)
+    $direct=Test-HttpsBatch -Domains $Cands
+    $failed=@($Cands | Where-Object { -not $direct[$_] })
+    $via=@{}; $again=@{}
+    if($failed.Count){
+        $pv=Start-HttpsProbe -Domains $failed -Proxy "http://127.0.0.1:$($script:TunnelMixedPort)"
+        $pd=Start-HttpsProbe -Domains $failed
+        $via=Complete-HttpsProbe $pv
+        $again=Complete-HttpsProbe $pd
+    }
+    return [pscustomobject]@{
+        Move=@(Select-LearnMove -Failed $failed -Via $via -Again $again)
+        Dead=@($failed | Where-Object { -not $via[$_] -and -not $again[$_] })
+        OkDirect=($Cands.Count-$failed.Count)
+    }
+}
+
 function Update-TunnelSites {
     <#
       Проверяем домены из списков zapret напрямую; не открывшиеся проверяем
-      через туннель и, если там они работают, переносим в lists\tunnel.txt.
+      через туннель и переносим в lists\tunnel.txt. -Auto - режим планировщика:
+      без вывода на экран и только новые домены (см. Install-LearnTask).
     #>
+    param([switch]$Auto)
     $p=Get-TunnelPaths
-    if(-not (Get-Status).Running){
+    if($Auto -and (-not (Get-TunnelStatus).Running -or -not (Get-Status).Running)){ return }
+    if(-not $Auto -and -not (Get-Status).Running){
         Write-Host '  Внимание: zapret не запущен - в туннель попадут и сайты, которые zapret открыл бы сам.' -ForegroundColor Yellow
     }
     $lists=Join-Path $script:TrustedRuntime 'lists'
     $inTunnel=@(Get-TunnelDomains)
     $excl=@(Get-ListEntries (Join-Path $lists 'exclude.txt'))
-    $cands=@(@(Get-ListEntries (Join-Path $lists 'blocked.txt')) + @(Get-ListEntries (Join-Path $lists 'autohostlist.txt')) |
+    $all=@(@(Get-ListEntries (Join-Path $lists 'blocked.txt')) + @(Get-ListEntries (Join-Path $lists 'autohostlist.txt')) |
              Select-Object -Unique | Where-Object { $inTunnel -notcontains $_ -and $excl -notcontains $_ })
-    if(-not $cands.Count){ Write-Host '  Нечего проверять.' -ForegroundColor DarkGray; return }
-    Write-Host ("  Проверка {0} сайтов через zapret..." -f $cands.Count) -ForegroundColor Yellow
-    $direct=Test-HttpsBatch -Domains $cands
-    $failed=@($cands | Where-Object { -not $direct[$_] })
-    if($failed.Count){
-        # Вторая попытка: случайный сбой не должен навсегда увести сайт в туннель
-        # (домены из списка туннеля zapret больше не обрабатывает).
-        $again=Test-HttpsBatch -Domains $failed
-        $failed=@($failed | Where-Object { -not $again[$_] })
+    $state=Get-LearnState
+    $now=[double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $cands=@(Select-LearnCandidates -Candidates $all -Checked $state -Now $now -RecheckSec 86400 -Max $(if($Auto){60}else{0}) -Auto:$Auto)
+    if(-not $cands.Count){ if(-not $Auto){ Write-Host '  Нечего проверять.' -ForegroundColor DarkGray }; return }
+    if(-not $Auto){ Write-Host ("  Проверка {0} сайтов через zapret..." -f $cands.Count) -ForegroundColor Yellow }
+    $r=Invoke-LearnSites -Cands $cands
+    foreach($d in $cands){ $state[$d]=$now }
+    Save-LearnState $state
+    if(-not $Auto){ Write-Host ("  Открываются через zapret: {0}, не открываются: {1}" -f $r.OkDirect,($cands.Count-$r.OkDirect)) -ForegroundColor DarkGray }
+    if(-not $r.Move.Count -and -not $r.Dead.Count){
+        if(-not $Auto){ Write-Host '  Туннель не нужен ни одному сайту из списков.' -ForegroundColor Green }
+        return
     }
-    Write-Host ("  Открываются через zapret: {0}, не открываются: {1}" -f ($cands.Count-$failed.Count),$failed.Count) -ForegroundColor DarkGray
-    if(-not $failed.Count){ Write-Host '  Туннель не нужен ни одному сайту из списков.' -ForegroundColor Green; return }
-    Write-Host '  Проверка неоткрывшихся через туннель...' -ForegroundColor Yellow
-    $via=Test-HttpsBatch -Domains $failed -Proxy "http://127.0.0.1:$($script:TunnelMixedPort)"
-    $move=@($failed | Where-Object { $via[$_] })
-    $dead=@($failed | Where-Object { -not $via[$_] })
-    if($move.Count){
-        Add-TunnelDomains $move
-        Write-Host ("  Перенесено в туннель: {0}" -f ($move -join ', ')) -ForegroundColor Green
-        Start-Sleep -Seconds 1
-        Test-TunnelDns
-        Write-Host '  Перезапустите браузер: он помнит старые адреса сайтов. Если в браузере включён' -ForegroundColor DarkGray
-        Write-Host '  "Безопасный DNS" (DNS через HTTPS), отключите его - иначе он обходит туннель.' -ForegroundColor DarkGray
+    if($r.Move.Count){
+        Add-TunnelDomains $r.Move
+        $notReady=@(Wait-TunnelDns $r.Move)
+        Write-Host ("  Перенесено в туннель: {0}" -f ($r.Move -join ', ')) -ForegroundColor Green
+        if($notReady.Count){ Write-Host ("  ! DNS ещё не перешёл в туннель: {0}" -f ($notReady -join ', ')) -ForegroundColor Yellow }
+        if(-not $Auto){
+            Write-Host '  Откройте сайт заново. Firefox: обновление страницы не сбрасывает его DNS-кэш; если не помогло - перезапустите Firefox.' -ForegroundColor DarkGray
+            Write-Host '  Если в браузере включён DNS через HTTPS вручную, он обходит туннель - отключите его.' -ForegroundColor DarkGray
+        }
     }
-    if($dead.Count){
-        Write-Host ("  Не открываются и через туннель (нет сайта на корне домена или сбой): {0}" -f ($dead -join ', ')) -ForegroundColor DarkGray
+    if($r.Dead.Count -and -not $Auto){
+        Write-Host ("  Не открываются и через туннель (нет сайта на корне домена или сбой): {0}" -f ($r.Dead -join ', ')) -ForegroundColor DarkGray
     }
-    Write-Host "  Список туннеля: $($p.List) (можно править вручную)." -ForegroundColor DarkGray
+    if(-not $Auto){ Write-Host "  Список туннеля: $($p.List) (можно править вручную)." -ForegroundColor DarkGray }
+}
+
+function Install-LearnTask {
+    # Автообучение туннеля каждые 5 минут (как задача геолиста, F-05 - защищённая копия).
+    $l=Get-TrustedLaunch @('-Action','TunnelLearnAuto') -Hidden
+    $act=New-ScheduledTaskAction -Execute $l.File -Argument $l.Args
+    $trg=New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $pr=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    Register-ScheduledTask -TaskName $script:LearnTask -Action $act -Trigger $trg -Principal $pr -Settings $set -Force | Out-Null
+}
+
+function Remove-LearnTask {
+    Unregister-ScheduledTask -TaskName $script:LearnTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Sync-LearnTask {
+    # Задача обучения есть, пока включён туннель.
+    if(Test-Path -LiteralPath (Get-TunnelPaths).Enabled){ Install-LearnTask } else { Remove-LearnTask }
 }
 
 function Test-TunnelSites {
@@ -3739,7 +3873,10 @@ function Show-TunnelSitesMenu {
             if($d -match '^[a-z0-9.-]+\.[a-z0-9-]+$'){
                 Add-TunnelDomains @($d)
                 Write-Host "  $d добавлен в туннель." -ForegroundColor Green
-                if((Get-TunnelStatus).Running){ Start-Sleep -Seconds 1; Test-TunnelSites @($d) }
+                if((Get-TunnelStatus).Running){
+                    if(@(Wait-TunnelDns @($d)).Count){ Write-Host "  ! DNS для $d ещё не перешёл в туннель; проверьте через «Сайты» → [3] через несколько секунд." -ForegroundColor Yellow }
+                    Test-TunnelSites @($d)
+                }
             } else { Write-Host '  Некорректный домен.' -ForegroundColor Red }
         }
         '3' { Test-TunnelSites }
@@ -4414,6 +4551,7 @@ function Remove-All {
     Write-Host '  [2/5] Удаление задач планировщика...' -ForegroundColor Yellow
     Remove-Autostart
     Remove-GeoListTask
+    Remove-LearnTask
 
     # 3) служба ядра WinDivert
     Write-Host '  [3/5] Удаление службы драйвера WinDivert...' -ForegroundColor Yellow
@@ -4522,6 +4660,7 @@ switch($Action){
     'TunnelGeoList' {Ensure-Admin; [void](Update-GeoList -Force)}
     'TunnelGeoListAuto' {Ensure-Admin; [void](Update-GeoList)}
     'TunnelRoutes' {Update-TunnelRoutes}
+    'TunnelLearnAuto' {Ensure-Admin; Update-TunnelSites -Auto}
     'TunnelTest' {Test-TunnelSites}
     'TunnelList' {[void](Show-TunnelProfiles)}
     'TunnelStart' {Ensure-Admin; Invoke-TunnelStartAction}
